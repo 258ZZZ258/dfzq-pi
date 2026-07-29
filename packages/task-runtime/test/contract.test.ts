@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import type { Runtime, RunResult } from "../src/runtime/contract.ts";
+import type { RunResult, Runtime } from "../src/runtime/contract.ts";
 
 describe("runtime contract", () => {
 	it("a minimal object satisfies Runtime", async () => {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { profileRoles, type ProviderProfile, requireApiKey, resolveRole } from "../src/env/provider-profile.ts";
+import { type ProviderProfile, profileRoles, requireApiKey, resolveRole } from "../src/env/provider-profile.ts";
 
 const profile: ProviderProfile = {
 	id: "vllm-intranet",
@@ -7,7 +7,14 @@ const profile: ProviderProfile = {
 	apiKeyEnv: "DFZQ_LLM_KEY",
 	api: "openai-completions",
 	roles: {
-		main: { provider: "dfzq-gateway", modelId: "qwen3-32b", contextWindow: 131072, maxTokens: 8192 },
+		main: {
+			provider: "dfzq-gateway",
+			modelId: "qwen3-32b",
+			contextWindow: 131072,
+			maxTokens: 8192,
+			reasoning: true,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		},
 	},
 };
 

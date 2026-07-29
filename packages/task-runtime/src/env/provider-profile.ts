@@ -3,6 +3,16 @@
  * 同一份 spec 在内网 vLLM 与云端之间切换,只换 profile。
  */
 
+/**
+ * $/百万 token。镜像 pi-ai 的 ModelCost 形状(不含分档定价,本层暂不建模)。
+ */
+export interface RoleBindingCost {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
 export interface RoleBinding {
 	/** 注册进 ModelRuntime 的 provider id */
 	provider: string;
@@ -10,6 +20,18 @@ export interface RoleBinding {
 	/** pi 探测不了自建 provider 的元数据,必须手工填 */
 	contextWindow: number;
 	maxTokens: number;
+	/**
+	 * 该模型是否支持扩展推理档位。pi 的 getSupportedThinkingLevels() 在 reasoning:false 时
+	 * 只放行 "off"——不填/填错会让 RuntimeSpec.thinkingLevel 声明的档位被静默钳成 "off",
+	 * 不抛错也不告警。必填,不给默认值:是否支持推理是环境事实,必须由 profile 作者显式声明,
+	 * 不能由装配器替其决定。
+	 */
+	reasoning: boolean;
+	/**
+	 * 计费费率。RuntimeLimits.maxCostUsd 依赖它才能生效。必填,不给默认值:内网网关确实不计费,
+	 * 就显式填全 0——那是 profile 作者的选择,不是装配器悄悄替其做的决定。
+	 */
+	cost: RoleBindingCost;
 }
 
 export interface ProviderProfile {

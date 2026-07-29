@@ -36,6 +36,10 @@ export interface Assembled {
 	dispose: () => Promise<void>;
 }
 
+function formatNames(names: readonly string[]): string {
+	return names.length > 0 ? names.map((name) => `"${name}"`).join(", ") : "(none)";
+}
+
 export async function assemble(options: AssembleOptions): Promise<Assembled> {
 	const { spec, profile, registry, toolsets, cwd, agentDir } = options;
 
@@ -57,56 +61,89 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 		},
 	});
 
-	const tools = await toolsets.resolve(spec.toolset);
+	// resolve() 打开的句柄(比如 MCP 子进程)从这里开始是本次 run 独占的:谁开的谁关,
+	// 装配失败也不能让它泄漏(下面的 try/catch)。Registry 本身不再追踪它——见
+	// toolsets/registry.ts 的改动说明。
+	const { tools, dispose: disposeToolset } = await toolsets.resolve(spec.toolset);
 
-	const pluginRefs: PluginRef[] = [
-		...(options.builtinPlugins ?? []),
-		...(spec.contextStrategy ? [spec.contextStrategy] : []),
-		...(spec.stopPolicy ? [spec.stopPolicy] : []),
-		...(spec.resultPolicy ? [spec.resultPolicy] : []),
-		...(spec.approvalPolicy ? [spec.approvalPolicy] : []),
-		...(spec.extraPlugins ?? []),
-	];
-	const extensionFactories = registry.resolveAll(pluginRefs);
+	// 装配期失败要早:pi 的 setActiveToolsByName 对不认识的工具名是静默丢弃,不抛错
+	// (agent-session.ts),所以这里必须自己做交叉校验,不能指望 createAgentSession 帮忙。
+	const availableToolNames = new Set(tools.map((tool) => tool.name));
+	const unknownTools = spec.tools.filter((name) => !availableToolNames.has(name));
+	if (unknownTools.length > 0) {
+		throw new Error(
+			`RuntimeSpec "${spec.id}": tools whitelist references unknown tool(s) ${formatNames(unknownTools)} ` +
+				`from toolset "${spec.toolset}" (available: ${formatNames([...availableToolNames])})`,
+		);
+	}
+	const unknownExcludedTools = (spec.excludeTools ?? []).filter((name) => !availableToolNames.has(name));
+	if (unknownExcludedTools.length > 0) {
+		throw new Error(
+			`RuntimeSpec "${spec.id}": excludeTools references unknown tool(s) ${formatNames(unknownExcludedTools)} ` +
+				`from toolset "${spec.toolset}" (available: ${formatNames([...availableToolNames])})`,
+		);
+	}
 
-	const resourceLoader = new DefaultResourceLoader({
-		cwd,
-		agentDir,
-		settingsManager,
-		// 剥光通用能力(照抄 packages/evals/src/pi-harness.ts)
-		noExtensions: true, // 只过滤磁盘扫描,不影响 extensionFactories
-		noSkills: true,
-		noPromptTemplates: true,
-		noThemes: true,
-		noContextFiles: true, // 安全项:阻止 AGENTS.md / CLAUDE.md 被加载(prompt injection 直通车)
-		systemPrompt: spec.systemPrompt,
-		extensionFactories,
-	});
-	await resourceLoader.reload();
+	try {
+		const pluginRefs: PluginRef[] = [
+			...(options.builtinPlugins ?? []),
+			...(spec.contextStrategy ? [spec.contextStrategy] : []),
+			...(spec.stopPolicy ? [spec.stopPolicy] : []),
+			...(spec.resultPolicy ? [spec.resultPolicy] : []),
+			...(spec.approvalPolicy ? [spec.approvalPolicy] : []),
+			...(spec.extraPlugins ?? []),
+		];
+		const extensionFactories = registry.resolveAll(pluginRefs);
 
-	const { session } = await createAgentSession({
-		cwd,
-		agentDir,
-		model,
-		modelRuntime,
-		thinkingLevel: spec.thinkingLevel ?? "off",
-		noTools: "all",
-		customTools: tools,
-		tools: spec.tools, // 必填 —— 省略等于工具全关
-		excludeTools: spec.excludeTools,
-		resourceLoader,
-		settingsManager,
-		sessionManager: SessionManager.inMemory(cwd),
-	});
+		const resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			// 剥光通用能力(照抄 packages/evals/src/pi-harness.ts)
+			noExtensions: true, // 只过滤磁盘扫描,不影响 extensionFactories
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true, // 安全项:阻止 AGENTS.md / CLAUDE.md 被加载(prompt injection 直通车)
+			systemPrompt: spec.systemPrompt,
+			extensionFactories,
+		});
+		await resourceLoader.reload();
 
-	return {
-		session,
-		specId: spec.id,
-		dispose: async () => {
-			session.dispose();
-			await toolsets.disposeAll();
-		},
-	};
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			model,
+			modelRuntime,
+			thinkingLevel: spec.thinkingLevel ?? "off",
+			noTools: "all",
+			customTools: tools,
+			tools: spec.tools, // 必填 —— 省略等于工具全关
+			excludeTools: spec.excludeTools,
+			resourceLoader,
+			settingsManager,
+			sessionManager: SessionManager.inMemory(cwd),
+		});
+
+		return {
+			session,
+			specId: spec.id,
+			dispose: async () => {
+				session.dispose();
+				await disposeToolset();
+			},
+		};
+	} catch (error) {
+		// createAgentSession (or anything above it in this block) threw before the caller
+		// ever got an Assembled.dispose() to call -- release the toolset handle ourselves
+		// so a mid-assembly failure can't leak it (e.g. an MCP child process).
+		try {
+			await disposeToolset();
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "Assembly failed and toolset disposal also failed");
+		}
+		throw error;
+	}
 }
 
 async function resolveModel(spec: RuntimeSpec, profile: ProviderProfile, agentDir: string) {
@@ -127,14 +164,16 @@ async function resolveModel(spec: RuntimeSpec, profile: ProviderProfile, agentDi
 			{
 				id: binding.modelId,
 				name: binding.modelId,
-				// ProviderProfile/RoleBinding 不携带这三项(pi 探测不了自建网关的元数据),
-				// 用保守的静态默认值填充,而不是断言掉类型检查:
-				// - reasoning: false —— 没有信息证明该模型支持扩展推理,保守关闭
-				// - input: ["text"] —— 本层暂不支持多模态角色绑定
-				// - cost: 全 0 —— 内网 vLLM/自建网关通常不计费,真实计费应在 ProviderProfile 里补建字段再传入
-				reasoning: false,
+				// reasoning/cost come from RoleBinding, not a hardcoded default: pi's
+				// getSupportedThinkingLevels() collapses to ["off"] when reasoning is false
+				// (silently clamping RuntimeSpec.thinkingLevel), and session cost stats stay
+				// at 0 when cost is 0 (silently defeating RuntimeLimits.maxCostUsd). Both are
+				// environment facts the ProviderProfile author must declare explicitly.
+				reasoning: binding.reasoning,
+				// 本层暂不支持多模态角色绑定,也没有对应的 RuntimeSpec 字段声明这项能力,
+				// 所以留作固定默认值(不是 review 要求整改的范围)。
 				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				cost: binding.cost,
 				contextWindow: binding.contextWindow,
 				maxTokens: binding.maxTokens,
 			},

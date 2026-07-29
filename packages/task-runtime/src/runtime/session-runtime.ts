@@ -29,7 +29,23 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 
 	assembled = await assemble({ ...options, builtinPlugins: [LIMITS_PLUGIN_NAME] });
 	const session = assembled.session;
-	abortFn = () => void session.abort();
+	// abortFn is invoked from two synchronous callbacks -- the limits plugin's `turn_end`
+	// hook and the runTimeoutMs setTimeout below -- neither of which can be made to `await`
+	// this. session.abort() is async and can reject; left unhandled that becomes an
+	// unhandled promise rejection, which modern Node treats as fatal (crashes the process).
+	// This path is best-effort cleanup, not the public Runtime.abort() contract (see below),
+	// so a failed abort here is swallowed after logging rather than propagated.
+	abortFn = () => {
+		void session.abort().catch((error: unknown) => {
+			// `specId` is a `const` declared further down this function -- referencing it here
+			// (rather than `assembled.specId`, which is already assigned by this point) would
+			// hit the same TS2448 "used before its declaration" issue documented on `assembled` above.
+			console.error(
+				`[SessionRuntime] abort() triggered by a limit/timeout failed for spec "${assembled.specId}"`,
+				error,
+			);
+		});
+	};
 
 	const id = randomUUID();
 	const specId = assembled.specId;
@@ -113,9 +129,15 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		specId,
 		sessionId: session.sessionId,
 		run,
-		steer: async (text: string) => void session.steer(text),
-		followUp: async (text: string) => void session.followUp(text),
-		abort: async () => void session.abort(),
+		// Return the underlying promise directly (not `void`-wrapped): callers `await` these
+		// per the Runtime contract expecting the operation to have actually finished --
+		// session.abort() in particular awaits waitForIdle() internally (agent-session.ts),
+		// so swallowing that promise here would let `await runtime.abort()` resolve before
+		// the session has actually stopped. A rejection here is a genuine caller-visible
+		// failure (unlike abortFn's fire-and-forget cleanup path above), so it propagates.
+		steer: (text: string) => session.steer(text),
+		followUp: (text: string) => session.followUp(text),
+		abort: () => session.abort(),
 		waitForIdle: () => session.waitForIdle(),
 		subscribe: (listener: (event: RuntimeEvent) => void) => {
 			listeners.add(listener);

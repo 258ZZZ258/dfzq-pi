@@ -1,5 +1,6 @@
+import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import { PluginRegistry } from "../src/runtime/plugin-registry.ts";
 import { createSessionRuntime } from "../src/runtime/session-runtime.ts";
@@ -47,6 +48,17 @@ afterEach(async () => {
 	for (const fn of cleanups.reverse()) await fn();
 	cleanups = [];
 });
+
+/** Polls `predicate` until it's true, sleeping `stepMs` between checks. Throws after `timeoutMs`
+ *  so a stuck condition fails fast with a clear message instead of hanging until vitest's
+ *  own test timeout. */
+async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`waitUntil: condition not met within ${timeoutMs}ms`);
+		await new Promise((resolve) => setTimeout(resolve, stepMs));
+	}
+}
 
 async function build(limits: RuntimeSpec["limits"], responses: unknown[]) {
 	const harness = await createFauxHarness();
@@ -113,5 +125,80 @@ describe("SessionRuntime", () => {
 	it("exposes a snapshot with the session id", async () => {
 		const runtime = await build({ maxTurns: 5 }, [fauxAssistantMessage("done")]);
 		expect(runtime.snapshot().sessionId).toBe(runtime.sessionId);
+	});
+
+	// Regression lock (fix round 1): the original `abort: async () => void session.abort()`
+	// discarded the underlying promise instead of returning it. session.abort() awaits
+	// waitForIdle() internally (agent-session.ts:1542-1546), so a caller doing
+	// `await runtime.abort()` must only observe the session as stopped, not mid-flight.
+	it("abort() resolves only after the session has actually stopped, and reports status=aborted", async () => {
+		const runtime = await build({ maxTurns: 5 }, [
+			() =>
+				new Promise((resolve) => {
+					setTimeout(() => resolve(fauxAssistantMessage("late")), 150);
+				}),
+		]);
+		const runPromise = runtime.run("hello");
+		// Wait for the run to genuinely be in flight before aborting -- otherwise abort() would
+		// be a same-tick no-op and wouldn't exercise the "wait for real stop" guarantee.
+		await waitUntil(() => !runtime.isIdle);
+
+		await runtime.abort();
+		expect(runtime.isIdle).toBe(true);
+
+		const result = await runPromise;
+		expect(result.status).toBe("aborted");
+		expect(result.stopReason).toBe("aborted");
+	});
+
+	// Regression lock for the two `classify()` stopReason branches the review flagged as
+	// untouched by any test (only "completed" and the tripped-limit path were covered).
+	it("reports status=error when the assistant message stops with a non-retryable error", async () => {
+		// "boom" matches none of pi's retryable-error text patterns (packages/ai/src/utils/retry.ts),
+		// so this settles directly instead of looping through AgentSession's auto-retry.
+		const runtime = await build({ maxTurns: 5 }, [
+			fauxAssistantMessage("boom", { stopReason: "error", errorMessage: "boom" }),
+		]);
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("error");
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("boom");
+	});
+
+	// Regression lock (review Minor #1): run() must reset LimitState.turns/tripped on every
+	// call. With maxTurns:2 and a single-turn reply each time, a leaked turn count from the
+	// first run would push the second run's count to 2 and falsely trip maxTurns.
+	it("resets LimitState between successive run() calls on the same runtime", async () => {
+		const runtime = await build({ maxTurns: 2 }, [fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+
+		const first = await runtime.run("hello");
+		expect(first.status).toBe("completed");
+		expect(first.turns).toBe(1);
+
+		const second = await runtime.run("hello again");
+		expect(second.status).toBe("completed");
+		expect(second.turns).toBe(1);
+	});
+});
+
+describe("SessionRuntime - abortFn rejection handling", () => {
+	// Regression lock (fix round 1): abortFn (used by the limits plugin's turn_end hook and by
+	// the runTimeoutMs setTimeout) is a synchronous callback that cannot `await` session.abort().
+	// If that promise rejects and nothing catches it, it becomes an unhandled rejection -- fatal
+	// in modern Node. This forces that rejection via a prototype spy (mirrors the
+	// ModelRuntime.prototype.getModel spy pattern in assembler.test.ts) and asserts the run still
+	// settles normally instead of crashing the process/test worker.
+	it("swallows a rejection from the internal abort triggered by a tripped limit", async () => {
+		const abortSpy = vi.spyOn(AgentSession.prototype, "abort").mockRejectedValueOnce(new Error("abort boom"));
+		cleanups.push(async () => {
+			abortSpy.mockRestore();
+		});
+
+		const runtime = await build({ maxTurns: 1 }, [fauxAssistantMessage("done")]);
+		const result = await runtime.run("hello");
+
+		expect(abortSpy).toHaveBeenCalledTimes(1);
+		expect(result.status).toBe("limit_exceeded");
+		expect(result.limit).toBe("maxTurns");
 	});
 });

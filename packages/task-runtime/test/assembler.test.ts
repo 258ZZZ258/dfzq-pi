@@ -158,6 +158,48 @@ describe("assemble - tool whitelist cross-validation", () => {
 			}),
 		).rejects.toThrow(/excludeTools references unknown tool\(s\) "typo"/);
 	});
+
+	// Regression lock for fix round 2: these throws used to sit between
+	// toolsets.resolve() and the try/catch that releases the toolset handle, so a
+	// tools/excludeTools typo -- the exact case this validation exists to catch --
+	// leaked whatever resolve() had opened (e.g. an MCP child process). The throw
+	// must land inside the try so it goes through the same cleanup as every other
+	// post-resolve() failure.
+	it("still releases the toolset handle when spec.tools references an unknown tool", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const disposeSpy = vi.fn(async () => {});
+		await expect(
+			assemble({
+				spec: spec({ tools: ["echo", "typo"] }),
+				profile,
+				registry: new PluginRegistry(),
+				toolsets: toolsetsWithDispose(disposeSpy),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			}),
+		).rejects.toThrow(/tools whitelist references unknown tool\(s\) "typo"/);
+		expect(disposeSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("still releases the toolset handle when spec.excludeTools references an unknown tool", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const disposeSpy = vi.fn(async () => {});
+		await expect(
+			assemble({
+				spec: spec({ excludeTools: ["typo"] }),
+				profile,
+				registry: new PluginRegistry(),
+				toolsets: toolsetsWithDispose(disposeSpy),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			}),
+		).rejects.toThrow(/excludeTools references unknown tool\(s\) "typo"/);
+		expect(disposeSpy).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("assemble - resolveModel (no modelOverride)", () => {

@@ -63,28 +63,30 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 
 	// resolve() 打开的句柄(比如 MCP 子进程)从这里开始是本次 run 独占的:谁开的谁关,
 	// 装配失败也不能让它泄漏(下面的 try/catch)。Registry 本身不再追踪它——见
-	// toolsets/registry.ts 的改动说明。
+	// toolsets/registry.ts 的改动说明。这条不变量覆盖 resolve() 成功之后到 return 之前
+	// 的*所有*代码,所以下面的工具名交叉校验也必须在 try 块里——它和 createAgentSession
+	// 一样是"resolve() 之后才可能失败的东西",挪出 try 块就是又复现一次 handle 泄漏。
 	const { tools, dispose: disposeToolset } = await toolsets.resolve(spec.toolset);
 
-	// 装配期失败要早:pi 的 setActiveToolsByName 对不认识的工具名是静默丢弃,不抛错
-	// (agent-session.ts),所以这里必须自己做交叉校验,不能指望 createAgentSession 帮忙。
-	const availableToolNames = new Set(tools.map((tool) => tool.name));
-	const unknownTools = spec.tools.filter((name) => !availableToolNames.has(name));
-	if (unknownTools.length > 0) {
-		throw new Error(
-			`RuntimeSpec "${spec.id}": tools whitelist references unknown tool(s) ${formatNames(unknownTools)} ` +
-				`from toolset "${spec.toolset}" (available: ${formatNames([...availableToolNames])})`,
-		);
-	}
-	const unknownExcludedTools = (spec.excludeTools ?? []).filter((name) => !availableToolNames.has(name));
-	if (unknownExcludedTools.length > 0) {
-		throw new Error(
-			`RuntimeSpec "${spec.id}": excludeTools references unknown tool(s) ${formatNames(unknownExcludedTools)} ` +
-				`from toolset "${spec.toolset}" (available: ${formatNames([...availableToolNames])})`,
-		);
-	}
-
 	try {
+		// 装配期失败要早:pi 的 setActiveToolsByName 对不认识的工具名是静默丢弃,不抛错
+		// (agent-session.ts),所以这里必须自己做交叉校验,不能指望 createAgentSession 帮忙。
+		const availableToolNames = new Set(tools.map((tool) => tool.name));
+		const unknownTools = spec.tools.filter((name) => !availableToolNames.has(name));
+		if (unknownTools.length > 0) {
+			throw new Error(
+				`RuntimeSpec "${spec.id}": tools whitelist references unknown tool(s) ${formatNames(unknownTools)} ` +
+					`from toolset "${spec.toolset}" (available: ${formatNames([...availableToolNames])})`,
+			);
+		}
+		const unknownExcludedTools = (spec.excludeTools ?? []).filter((name) => !availableToolNames.has(name));
+		if (unknownExcludedTools.length > 0) {
+			throw new Error(
+				`RuntimeSpec "${spec.id}": excludeTools references unknown tool(s) ${formatNames(unknownExcludedTools)} ` +
+					`from toolset "${spec.toolset}" (available: ${formatNames([...availableToolNames])})`,
+			);
+		}
+
 		const pluginRefs: PluginRef[] = [
 			...(options.builtinPlugins ?? []),
 			...(spec.contextStrategy ? [spec.contextStrategy] : []),

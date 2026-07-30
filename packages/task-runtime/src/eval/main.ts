@@ -8,6 +8,7 @@ import { DEFAULT_CASE_IDS, loadFormalCases, selectCases } from "./cases.ts";
 import { discoverTools } from "./discover-tools.ts";
 import { type CaseOutcome, judge, renderSummary, runCase } from "./drive.ts";
 import { evaluateProbe, judgeProbes, PROBES, type ProbeOutcome, renderProbeSummary } from "./limits-probe.ts";
+import { resolveMode } from "./mode.ts";
 
 const TASK_TIMEOUT_MS = 900_000; // 对齐 eval_config.yaml 的 task_timeout_seconds: 900
 
@@ -85,6 +86,10 @@ async function main(): Promise<void> {
 			probes: { type: "boolean" },
 		},
 	});
+	// --discover 与 --probes 互斥(见 mode.ts):同传时直接报错退出,不能静默丢弃其中一个 ——
+	// 那会让调用方只查 exit code 就误以为判据③已经跑过。
+	const mode = resolveMode({ discover: values.discover, probes: values.probes });
+
 	if (!values["eval-root"]) throw new Error("--eval-root is required");
 	const evalRoot = resolve(values["eval-root"] as string);
 	const specSource = resolve(values.spec ?? "packages/task-runtime/specs/blackbox-eval.json");
@@ -97,7 +102,7 @@ async function main(): Promise<void> {
 		server.args = server.args.map((arg) => (arg.startsWith("/") ? arg : join(evalRoot, arg)));
 	}
 
-	if (values.discover) {
+	if (mode === "discover") {
 		// 只做 initialize + tools/list,不跑用例、不调模型 —— 换 fixture 时用来核对工具名单。
 		const discovered = await discoverTools(spec.mcpServers ?? []);
 		process.stdout.write(`${JSON.stringify(discovered, null, 2)}\n`);
@@ -108,7 +113,7 @@ async function main(): Promise<void> {
 	const outDir = resolve(values.out as string);
 	await mkdir(outDir, { recursive: true });
 
-	if (values.probes) {
+	if (mode === "probes") {
 		await runProbes({ spec, evalRoot, outDir, profilePath });
 		return;
 	}
@@ -119,7 +124,9 @@ async function main(): Promise<void> {
 	// 摘要措辞跟着实际调用方式走(见 drive.ts 的 CaseSelection):传了 --all 就是「15 题全集」,
 	// 传了 --cases 就是「自定义」,两者都没传才是默认的 5 题子集。判断依据是「传了哪个 flag」,
 	// 不是「结果凑巧等于哪个集合」——否则自定义参数刚好传出默认 5 题时,措辞会认错范围。
-	const mode: "default" | "all" | "custom" = values.all ? "all" : values.cases ? "custom" : "default";
+	// 命名为 selectionMode 而不是 mode,避免跟上面 resolveMode() 产出的 EvalMode 撞名 ——
+	// 两者是完全不同的两层概念(前者是 discover/probes/batch 三选一,后者是批跑范围)。
+	const selectionMode: "default" | "all" | "custom" = values.all ? "all" : values.cases ? "custom" : "default";
 	const all = await loadFormalCases(evalRoot);
 	const ids = values.all ? all.map((c) => c.id) : (values.cases?.split(",").map((s) => s.trim()) ?? DEFAULT_CASE_IDS);
 	const cases = selectCases(all, ids);
@@ -144,7 +151,7 @@ async function main(): Promise<void> {
 
 	const verdict = judge(outcomes);
 	await writeFile(join(outDir, "summary.json"), `${JSON.stringify({ outcomes, verdict }, null, 2)}\n`);
-	await writeFile(join(outDir, "summary.md"), renderSummary(outcomes, verdict, { mode }));
+	await writeFile(join(outDir, "summary.md"), renderSummary(outcomes, verdict, { mode: selectionMode }));
 	process.stderr.write(
 		`[eval] 判据① ${verdict.criterion1.pass ? "pass" : "FAIL"} / 判据② ${verdict.criterion2.pass ? "pass" : "FAIL"}\n`,
 	);

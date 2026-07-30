@@ -100,8 +100,8 @@ describe("concurrent runtimes", () => {
 		const a = await createFauxHarness();
 		const b = await createFauxHarness();
 		cleanups.push(a.cleanup, b.cleanup);
-		a.faux.setResponses([fauxAssistantMessage("A")]);
-		b.faux.setResponses([fauxAssistantMessage("B")]);
+		a.faux.setResponses([fauxAssistantMessage("ALPHA-EVENT-ONLY")]);
+		b.faux.setResponses([fauxAssistantMessage("BETA-EVENT-ONLY")]);
 
 		const runtimeA = await createSessionRuntime({
 			spec: spec("alpha", "A"),
@@ -125,11 +125,31 @@ describe("concurrent runtimes", () => {
 
 		const specIdsA = new Set<string>();
 		const specIdsB = new Set<string>();
-		runtimeA.subscribe((event) => specIdsA.add(event.specId));
-		runtimeB.subscribe((event) => specIdsB.add(event.specId));
+		// event.specId (session-runtime.ts) is a per-runtime closure constant -- it stays
+		// "alpha"/"beta" even if the underlying event's *content* leaked in from the other
+		// runtime (e.g. a provider-registration collision routing B's queued response into
+		// A's stream). Collect the serialized payloads too, so a content-level leak fails
+		// this test instead of only a specId-tagging leak going undetected.
+		const payloadsA: string[] = [];
+		const payloadsB: string[] = [];
+		runtimeA.subscribe((event) => {
+			specIdsA.add(event.specId);
+			payloadsA.push(JSON.stringify(event.payload));
+		});
+		runtimeB.subscribe((event) => {
+			specIdsB.add(event.specId);
+			payloadsB.push(JSON.stringify(event.payload));
+		});
 		await Promise.all([runtimeA.run("go"), runtimeB.run("go")]);
 
 		expect([...specIdsA]).toEqual(["alpha"]);
 		expect([...specIdsB]).toEqual(["beta"]);
+
+		const serializedA = payloadsA.join("\n");
+		const serializedB = payloadsB.join("\n");
+		expect(serializedA).toContain("ALPHA-EVENT-ONLY");
+		expect(serializedA).not.toContain("BETA-EVENT-ONLY");
+		expect(serializedB).toContain("BETA-EVENT-ONLY");
+		expect(serializedB).not.toContain("ALPHA-EVENT-ONLY");
 	});
 });

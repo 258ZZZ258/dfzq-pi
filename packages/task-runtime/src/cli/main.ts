@@ -9,6 +9,7 @@ import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
+import { cleanupAfterRun } from "./cleanup.ts";
 
 /** spec 文件在 RuntimeSpec 之外多带一个 mcpServers,用于把 toolset 落到具体进程。 */
 interface SpecFile extends RuntimeSpec {
@@ -69,8 +70,8 @@ async function main(): Promise<void> {
 		process.stdout.write(`${JSON.stringify(result)}\n`);
 		if (result.status !== "completed") process.exitCode = 2;
 	} finally {
-		if (detach) await detach();
-		await runtime.dispose();
+		// 清理失败只记日志,不改退出码 —— 见 cleanup.ts 的说明。
+		await cleanupAfterRun(detach, runtime);
 	}
 }
 

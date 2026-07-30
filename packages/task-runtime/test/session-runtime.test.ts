@@ -84,6 +84,11 @@ describe("SessionRuntime", () => {
 		expect(result.status).toBe("completed");
 		expect(result.output).toContain("done");
 		expect(result.runId).toMatch(/.+/);
+		// RunResult carries specId alongside RuntimeEvent (final fix round, finding 4): the
+		// runs table and the S3 pool's get(specId, sessionId?) both correlate on it, and it
+		// must agree with the Runtime and with the event envelopes.
+		expect(result.specId).toBe("demo");
+		expect(result.specId).toBe(runtime.specId);
 		expect(result.turns).toBeGreaterThanOrEqual(1);
 		expect(result.durationMs).toBeGreaterThanOrEqual(0);
 		expect(result.usage.total).toBeGreaterThanOrEqual(0);

@@ -126,6 +126,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 
 		return {
 			runId,
+			specId,
 			status: classify(state.tripped, assistant?.stopReason, thrown),
 			output: session.getLastAssistantText() ?? undefined,
 			errorMessage: thrown instanceof Error ? thrown.message : assistant?.errorMessage,

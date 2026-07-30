@@ -161,6 +161,7 @@ describe("cli", () => {
 		expect(result.status).toBe("completed");
 		expect(typeof result.runId).toBe("string");
 		expect(result.runId.length).toBeGreaterThan(0);
+		expect(result.specId).toBe("demo");
 		for (const key of ["input", "output", "cacheRead", "cacheWrite", "total", "cost"] as const) {
 			expect(typeof result.usage[key]).toBe("number");
 		}

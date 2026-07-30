@@ -7,6 +7,7 @@ describe("runtime contract", () => {
 	it("a minimal object satisfies Runtime", async () => {
 		const result: RunResult = {
 			runId: "r1",
+			specId: "spec1",
 			status: "completed",
 			usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3, cost: 0 },
 			turns: 1,

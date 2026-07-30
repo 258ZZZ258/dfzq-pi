@@ -18,6 +18,9 @@ export interface RunUsage {
 
 export interface RunResult {
 	runId: string;
+	/** 产生本次 run 的 RuntimeSpec.id。与 RuntimeEvent.specId 同源,让结果与事件流对得上;
+	 *  设计文档的 runs 表和 S3 池的 get(specId, sessionId?) 都靠它关联。 */
+	specId: string;
 	status: RunStatus;
 	output?: string;
 	errorMessage?: string;

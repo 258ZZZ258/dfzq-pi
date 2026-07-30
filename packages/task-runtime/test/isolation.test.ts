@@ -94,6 +94,10 @@ describe("concurrent runtimes", () => {
 		expect(runtimeA.sessionId).not.toBe(runtimeB.sessionId);
 		expect(runtimeA.specId).toBe("alpha");
 		expect(runtimeB.specId).toBe("beta");
+		// RunResult.specId must tag each result with its own spec, so two interleaved runs
+		// stay attributable without a side channel (final fix round, finding 4).
+		expect(resultA.specId).toBe("alpha");
+		expect(resultB.specId).toBe("beta");
 	});
 
 	it("keeps event streams separate per runtime", async () => {

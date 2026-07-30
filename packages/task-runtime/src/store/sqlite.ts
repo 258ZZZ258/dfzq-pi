@@ -150,30 +150,53 @@ export function createSqliteRunStore(path: string): RunStore {
 			return row ? toRecord(row) : undefined;
 		},
 		markRunning(runId: string, startedAt: number) {
-			setRunning.run(startedAt, runId);
+			// changes === 0 说明 runId 不存在,响亮失败而不是静默 no-op
+			// (与 insertQueued 的「读不到行就抛」同一哲学;RunManager 会真的传坏 runId 进来)。
+			const changes = Number(setRunning.run(startedAt, runId).changes);
+			if (changes === 0) throw new Error(`markRunning: run "${runId}" not found`);
 		},
 		finish(runId: string, result: RunResult, finishedAt: number) {
-			setFinished.run(
-				result.status,
-				result.output ?? null,
-				result.errorMessage ?? null,
-				result.stopReason ?? null,
-				result.limit ?? null,
-				JSON.stringify(result.usage),
-				result.turns,
-				finishedAt,
-				runId,
+			const changes = Number(
+				setFinished.run(
+					result.status,
+					result.output ?? null,
+					result.errorMessage ?? null,
+					result.stopReason ?? null,
+					result.limit ?? null,
+					JSON.stringify(result.usage),
+					result.turns,
+					finishedAt,
+					runId,
+				).changes,
 			);
+			if (changes === 0) throw new Error(`finish: run "${runId}" not found`);
 		},
 		markError(runId: string, message: string, finishedAt: number) {
-			setError.run(message, finishedAt, runId);
+			const changes = Number(setError.run(message, finishedAt, runId).changes);
+			if (changes === 0) throw new Error(`markError: run "${runId}" not found`);
 		},
 		recoverStaleRuns(now: number) {
 			return Number(recover.run(now).changes);
 		},
 		appendEvents(runId: string, events: StoredEvent[]) {
-			for (const event of events) {
-				insertEvent.run(runId, event.seq, event.ts, event.type, event.payload);
+			// 显式事务:要么整批落盘,要么一条都不落。node:sqlite 的 DatabaseSync 没有
+			// better-sqlite3 那种 db.transaction() 帮手,得手写 BEGIN/COMMIT/ROLLBACK。
+			// 撞 (run_id, seq) 主键时,SQLite 默认的 ABORT 冲突解决策略只撤销那一条语句,
+			// 不会自动撤销同一事务里已经执行成功的前面几条 —— 所以必须显式 ROLLBACK。
+			db.exec("BEGIN");
+			try {
+				for (const event of events) {
+					insertEvent.run(runId, event.seq, event.ts, event.type, event.payload);
+				}
+				db.exec("COMMIT");
+			} catch (err) {
+				try {
+					db.exec("ROLLBACK");
+				} catch {
+					// ROLLBACK 自己也可能抛(比如事务已被驱动自动回滚掉了)。
+					// 吞掉这个次生异常,不能让它盖过下面要抛给调用方的原始错误。
+				}
+				throw err;
 			}
 		},
 		close() {

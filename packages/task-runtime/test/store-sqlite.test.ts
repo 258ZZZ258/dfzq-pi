@@ -131,4 +131,42 @@ describe("sqlite run store", () => {
 		expect(reopened.findByRunId("run-1")?.status).toBe("queued");
 		reopened.close();
 	});
+
+	it("appendEvents is all-or-nothing: a mid-batch primary key collision leaves no partial rows", () => {
+		store.insertQueued(newRun());
+		store.appendEvents("run-1", [{ seq: 1, ts: 10, type: "turn_end", payload: "{}" }]);
+
+		// 批里第二条(seq:1)撞已存在的行,第一条(seq:2)和第三条(seq:3)本身都不冲突。
+		// 若实现是「逐条 run() 没有事务」,seq:2 会先落盘,再遇到 seq:1 冲突才抛;
+		// 若实现是「整批一个事务」,抛错时 seq:2 应该也被回滚掉、什么都没留下。
+		expect(() =>
+			store.appendEvents("run-1", [
+				{ seq: 2, ts: 20, type: "agent_end", payload: "{}" },
+				{ seq: 1, ts: 30, type: "turn_end", payload: "{}" }, // 撞 (run-1, 1)
+				{ seq: 3, ts: 40, type: "agent_end", payload: "{}" },
+			]),
+		).toThrow();
+
+		// 用「重新插入同样的 seq」代替直接查 run_events 表:
+		// 如果上一批的 seq:2 / seq:3 已经残留落盘,这里会因为主键冲突再次抛错;
+		// 不抛就证明上一批被完整回滚,没有部分成功。
+		expect(() =>
+			store.appendEvents("run-1", [
+				{ seq: 2, ts: 999, type: "agent_end", payload: "{}" },
+				{ seq: 3, ts: 999, type: "agent_end", payload: "{}" },
+			]),
+		).not.toThrow();
+	});
+
+	it("markRunning throws for an unknown runId instead of a silent no-op", () => {
+		expect(() => store.markRunning("no-such-run", 1000)).toThrow(/no-such-run/);
+	});
+
+	it("finish throws for an unknown runId instead of a silent no-op", () => {
+		expect(() => store.finish("no-such-run", result(), 1200)).toThrow(/no-such-run/);
+	});
+
+	it("markError throws for an unknown runId instead of a silent no-op", () => {
+		expect(() => store.markError("no-such-run", "boom", 1300)).toThrow(/no-such-run/);
+	});
 });

@@ -44,13 +44,6 @@ interface LiveRun {
 	completion: Promise<RunResult>;
 	runtime?: Runtime;
 	cancelRequested: boolean;
-	/**
-	 * 准入那一刻是否走了排队路径,只在创建时写一次、之后不再更新 —— 与首个 submit() 返回的
-	 * SubmitOutcome.queued 是同一个快照语义(那个字段返回后同样不会被后续状态变化更新)。
-	 * 同键并发去重(submit() 命中既有 live 项)时要把这个字段带出去,不存起来编译期就会
-	 * 缺字段(SubmitOutcome.accepted.queued 是必填)。
-	 */
-	queued: boolean;
 }
 
 /**
@@ -104,11 +97,18 @@ export class RunManager {
 			const existing = this.live.get(created.run.runId);
 			// 同键并发:既有 run 还在跑就把同一个 promise 交出去,别让调用方以为已终态。
 			if (existing) {
+				// queued 必须读「此刻」的状态,不能是创建时的快照:命中这条分支的时机可以晚于
+				// 准入判定任意久 —— 典型场景就是客户端超时后的重试。如果这里报的是创建时是否
+				// 走过排队路径,一个「B 排队时进来、随后早就转正在跑」的重试会被误报成
+				// queued:true,而 SubmitOutcome.queued 的唯一用途是让 HTTP 层决定 202 的
+				// status 怎么报 —— 报错就会让已经在跑的 run 被客户端当成还没排上号。
+				// entry.runtime 只在装配成功后才赋值,赋值前(不管是在排队还是在装配中)都
+				// 应该算「此刻还没开始跑」。
 				return {
 					kind: "accepted",
 					runId: created.run.runId,
 					completion: existing.completion,
-					queued: existing.queued,
+					queued: existing.runtime === undefined,
 				};
 			}
 			return { kind: "idempotent", runId: created.run.runId, status: created.run.status };
@@ -130,7 +130,7 @@ export class RunManager {
 		const ticketPromise = admission.kind === "admitted" ? Promise.resolve(admission.ticket) : admission.ticket;
 
 		const queued = admission.kind === "queued";
-		const entry: LiveRun = { completion: undefined as unknown as Promise<RunResult>, cancelRequested: false, queued };
+		const entry: LiveRun = { completion: undefined as unknown as Promise<RunResult>, cancelRequested: false };
 		this.live.set(runId, entry);
 		entry.completion = this.admitAndDrive(runId, req, ticketPromise, entry);
 		return { kind: "accepted", runId, completion: entry.completion, queued };
@@ -218,7 +218,19 @@ export class RunManager {
 			// 置标志再 abort:排队中的 run 还没有 runtime,标志让 admitAndDrive 在拿到票后
 			// 直接放弃入场。已在跑的 run 两条都生效(abort 立即起作用)。
 			entry.cancelRequested = true;
-			if (entry.runtime) await entry.runtime.abort();
+			if (entry.runtime) {
+				// cancelRequested 在 abort() 之前已经置位 —— 取消意图已经记下了。真实的
+				// SessionRuntime.abort() 可能抛(stub 不会),抛错不能让 cancel() 返回的
+				// Promise<CancelOutcome> 变成 reject —— HTTP 层的契约是 202/404/409 三态
+				// 之一,不是 500。吞掉、打一行日志,仍报 "accepted":202 本来就只承诺
+				// 「取消请求已受理」,不保证 runtime 已经真正停下。
+				await entry.runtime.abort().catch((error: unknown) => {
+					console.error(
+						`[RunManager] abort() failed for run "${runId}"; cancellation intent already recorded`,
+						error,
+					);
+				});
+			}
 			return "accepted";
 		}
 		const row = this.store.findByRunId(runId);

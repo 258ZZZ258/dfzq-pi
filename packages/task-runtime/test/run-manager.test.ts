@@ -252,4 +252,90 @@ describe("run manager", () => {
 		// ★ 核心断言:B 从未装配 —— 排队中被取消不该起 MCP 子进程白费一次装配
 		expect(stubs).toHaveLength(1);
 	});
+
+	it("cancel() catches a throwing abort() and still reports accepted", async () => {
+		// stub 本身的 abort() 不抛;真实 SessionRuntime.abort() 可能抛(session.abort() 会
+		// 传播失败,见 session-runtime.ts 里的注释)。这里手搓一个会抛的 abort() 来复现那条路径。
+		const stub = createStubRuntime({ hang: true });
+		const throwingRuntime: Runtime = {
+			...stub,
+			abort: async () => {
+				throw new Error("session abort failed");
+			},
+		};
+		const rm = new RunManager({
+			store,
+			gate: new Gate({ maxConcurrent: 1 }),
+			runtimeFactory: async () => throwingRuntime,
+			now: () => 1000,
+			newRunId: () => "run-1",
+		});
+		const outcome = await rm.submit(request());
+		if (outcome.kind !== "accepted") throw new Error("expected accepted");
+
+		// abort() 会抛,但 cancel() 必须吞掉它、仍然报 "accepted"(不能变成 reject 的
+		// Promise —— HTTP 层的契约是 202/404/409 三态之一,不是 500)。
+		await expect(rm.cancel(outcome.runId)).resolves.toBe("accepted");
+
+		// throwingRuntime.abort() 被替换掉了,不会触发 stub 内部的 settle();手动放行
+		// 让 run() 落定,避免测试挂死,并确认不会产生 unhandled rejection。
+		stub.resolveNow();
+		await outcome.completion;
+	});
+
+	it("dedupe branch reports the current queued state, not a stale creation-time snapshot", async () => {
+		const stubs: StubRuntime[] = [];
+		const rm = new RunManager({
+			store,
+			gate: new Gate({ maxConcurrent: 1, maxQueueDepth: 2 }),
+			runtimeFactory: async (input) => {
+				// A 占住全局唯一名额并挂住;B 装配后用 delayMs 给 "running" 状态留一个可观察的窗口
+				// (而不是靠 resolveNow() 手动落定,这样才能在 B 转入 running 之后、完成之前插入
+				// 一次同键重试去观察 queued:false)。
+				const stub =
+					input.sessionId === "s1" ? createStubRuntime({ hang: true }) : createStubRuntime({ delayMs: 5 });
+				stubs.push(stub);
+				return stub;
+			},
+			now: () => 1000,
+			newRunId: (() => {
+				let n = 0;
+				return () => `run-${++n}`;
+			})(),
+		});
+
+		const a = await rm.submit(request({ sessionId: "s1" }));
+		if (a.kind !== "accepted") throw new Error("expected accepted");
+
+		const b = await rm.submit(request({ clientRequestId: "cli-2", sessionId: "s2" }));
+		if (b.kind !== "accepted") throw new Error("expected accepted");
+		expect(b.queued).toBe(true);
+
+		// B 还在排全局队(A 没让出名额,B 还没装配):同键重试应报 queued:true —— 此刻确实
+		// 还没开始跑。
+		const retryWhileQueued = await rm.submit(request({ clientRequestId: "cli-2", sessionId: "s2" }));
+		if (retryWhileQueued.kind !== "accepted") throw new Error("expected accepted");
+		expect(retryWhileQueued.runId).toBe(b.runId);
+		expect(retryWhileQueued.queued).toBe(true);
+
+		// 放行 A,B 拿到全局名额、装配、markRunning —— 转入 running。
+		stubs[0].resolveNow();
+		await a.completion;
+
+		// A 的释放到 B 的 markRunning 之间全是微任务(装配 runtimeFactory、赋值 entry.runtime、
+		// 写 store),没有真实定时器;一个 0ms 的宏任务 tick 足够把它们全部冲刷掉,同时 B 自己
+		// 那个 5ms 的 delayMs 定时器此刻还没到期 —— 这就是能观察到 "running" 的窗口。
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(store.findByRunId(b.runId)?.status).toBe("running");
+
+		// 现在同键重试应报 queued:false —— 已经在跑,不是"还在排队"。
+		const retryWhileRunning = await rm.submit(request({ clientRequestId: "cli-2", sessionId: "s2" }));
+		if (retryWhileRunning.kind !== "accepted") throw new Error("expected accepted");
+		expect(retryWhileRunning.runId).toBe(b.runId);
+		expect(retryWhileRunning.queued).toBe(false);
+
+		const resultB = await b.completion;
+		expect(resultB.status).toBe("completed");
+		expect(store.findByRunId(b.runId)?.status).toBe("completed");
+	});
 });

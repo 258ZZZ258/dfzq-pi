@@ -48,6 +48,12 @@ export interface RuntimeSpec {
 	approvalPolicy?: PluginRef;
 	extraPlugins?: PluginRef[];
 
+	/**
+	 * ⚠️ S0 未接线,S2 实现。装配期接受该字段但**不做任何事**,也不会报错 ——
+	 * 现在填它不会改变任何行为。S2 的事件管道/快照落盘落地时才会真正消费。
+	 * (S0 只把 appendSystemPrompt 这类"声明了却静默失效"的字段补齐;observability
+	 * 依赖 S2 才有的观测组件,所以显式标注而不是假装接上。)
+	 */
 	observability?: ObservabilitySpec;
 }
 

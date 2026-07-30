@@ -122,6 +122,11 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			noThemes: true,
 			noContextFiles: true, // 安全项:阻止 AGENTS.md / CLAUDE.md 被加载(prompt injection 直通车)
 			systemPrompt: spec.systemPrompt,
+			// 与 systemPrompt 同一条通路(DefaultResourceLoaderOptions.appendSystemPrompt,
+			// resource-loader.ts):每项要么是字面文本,要么是存在的文件路径。留空(undefined)
+			// 时 pi 退回磁盘发现 APPEND_SYSTEM.md —— 那两个候选路径都在本任务独占的
+			// cwd/agentDir 下,不会读到宿主的共享状态。
+			appendSystemPrompt: spec.appendSystemPrompt,
 			extensionFactories,
 		});
 		await resourceLoader.reload();

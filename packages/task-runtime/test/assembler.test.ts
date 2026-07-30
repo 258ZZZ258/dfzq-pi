@@ -105,6 +105,46 @@ describe("assemble", () => {
 		expect(assembled.session.getLastAssistantText()).toContain("hello from faux");
 	});
 
+	// Regression lock (final fix round, finding 2): RuntimeSpec.appendSystemPrompt was declared
+	// in spec/types.ts and documented in the design doc, but assemble() never passed it to
+	// DefaultResourceLoader -- a declared field that silently did nothing, which is the literal
+	// counterexample to this layer's "assembly-time failures must be loud and early" rule.
+	it("appends RuntimeSpec.appendSystemPrompt entries to the session system prompt", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			spec: spec({ appendSystemPrompt: ["DFZQ-APPENDED-ONE", "DFZQ-APPENDED-TWO"] }),
+			profile,
+			registry: new PluginRegistry(),
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+
+		const systemPrompt = assembled.session.systemPrompt;
+		expect(systemPrompt).toContain("You are a test agent."); // spec.systemPrompt still honored
+		expect(systemPrompt).toContain("DFZQ-APPENDED-ONE");
+		expect(systemPrompt).toContain("DFZQ-APPENDED-TWO");
+	});
+
+	it("leaves the system prompt free of appended text when appendSystemPrompt is omitted", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			spec: spec(),
+			profile,
+			registry: new PluginRegistry(),
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+		expect(assembled.session.systemPrompt).not.toContain("DFZQ-APPENDED-ONE");
+	});
+
 	it("fails at assembly time when the toolset is unknown", async () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);

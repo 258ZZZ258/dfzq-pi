@@ -23,11 +23,22 @@ function shouldRecord(type: string): boolean {
 export async function attachTrajectory(runtime: Runtime, filePath: string): Promise<() => Promise<void>> {
 	await mkdir(dirname(filePath), { recursive: true });
 	const stream: WriteStream = createWriteStream(filePath, { flags: "a" });
+	let hasError = false;
+	let isDetached = false;
+
+	stream.on("error", (err) => {
+		hasError = true;
+		console.error(`Trajectory write error: ${err.message}`);
+	});
+
 	const unsubscribe = runtime.subscribe((event) => {
 		if (!shouldRecord(event.type)) return;
+		if (hasError) return; // Don't write if stream has errored
 		stream.write(`${JSON.stringify(event)}\n`);
 	});
 	return async () => {
+		if (isDetached) return; // Already detached, avoid duplicate
+		isDetached = true;
 		unsubscribe();
 		stream.end();
 		await once(stream, "close");
@@ -36,8 +47,23 @@ export async function attachTrajectory(runtime: Runtime, filePath: string): Prom
 
 export async function readTrajectory(filePath: string): Promise<RuntimeEvent[]> {
 	const raw = await readFile(filePath, "utf8");
-	return raw
-		.split("\n")
-		.filter((line) => line.trim().length > 0)
-		.map((line) => JSON.parse(line) as RuntimeEvent);
+	const events: RuntimeEvent[] = [];
+	const lines = raw.split("\n");
+	let malformedCount = 0;
+
+	for (const line of lines) {
+		if (line.trim().length === 0) continue;
+		try {
+			events.push(JSON.parse(line) as RuntimeEvent);
+		} catch (_err) {
+			malformedCount++;
+			console.error(`Failed to parse trajectory line: ${line.substring(0, 100)}...`);
+		}
+	}
+
+	if (malformedCount > 0) {
+		console.error(`Trajectory file had ${malformedCount} malformed lines`);
+	}
+
+	return events;
 }

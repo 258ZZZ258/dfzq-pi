@@ -4,7 +4,7 @@ export interface StubRuntimeOptions {
 	specId?: string;
 	sessionId?: string;
 	result?: Partial<RunResult>;
-	/** 自动在这么久之后完成。与 hang 互斥。 */
+	/** 自动在这么久之后完成。与 hang 互斥 —— 两者同时传入会在 createStubRuntime() 里 throw。 */
 	delayMs?: number;
 	/** true 时 run() 永不自行完成,必须由 resolveNow() 推动 —— 用来测等待窗口超时。 */
 	hang?: boolean;
@@ -20,11 +20,16 @@ export interface StubRuntime extends Runtime {
 const ZERO_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
 
 export function createStubRuntime(options: StubRuntimeOptions = {}): StubRuntime {
+	if (options.hang && options.delayMs != null) {
+		throw new Error("createStubRuntime: hang 与 delayMs 互斥,不能同时传入");
+	}
 	const specId = options.specId ?? "demo";
 	const sessionId = options.sessionId ?? "sess-stub";
 	const listeners = new Set<(event: RuntimeEvent) => void>();
 	let runCalls = 0;
 	let aborted = false;
+	// 单槽位:同一时刻至多挂起一个 run()。见下方 run() 里的并发守卫 —— 这个槽位
+	// 一旦被第二次调用覆盖,第一次的 Promise 就会永久孤儿挂起(vitest 超时而非报错)。
 	let settle: (() => void) | undefined;
 
 	function buildResult(runId: string): RunResult {
@@ -33,7 +38,9 @@ export function createStubRuntime(options: StubRuntimeOptions = {}): StubRuntime
 			specId,
 			status: aborted ? "aborted" : "completed",
 			output: "stub output",
-			usage: ZERO_USAGE,
+			// 每次都构造新对象 —— ZERO_USAGE 是模块级单例,直接复用引用会让某个用例
+			// mutate 自己拿到的 usage 时,污染同文件里其他、逻辑上毫无关系的 stub 实例。
+			usage: { ...ZERO_USAGE },
 			turns: 1,
 			durationMs: 1,
 			...options.result,
@@ -56,9 +63,13 @@ export function createStubRuntime(options: StubRuntimeOptions = {}): StubRuntime
 			runCalls++;
 			const runId = opts?.runId ?? "run-stub";
 			if (options.hang) {
+				if (settle) {
+					throw new Error("stub runtime: 同一 stub 实例上已有挂起的 run(),不支持并发 run()");
+				}
 				await new Promise<void>((resolve) => {
 					settle = resolve;
 				});
+				settle = undefined;
 				return buildResult(runId);
 			}
 			if (options.delayMs) {

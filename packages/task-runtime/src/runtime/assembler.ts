@@ -12,7 +12,7 @@ import { type ProviderProfile, profileRoles, requireApiKey, resolveRole } from "
 import type { PluginRef, RuntimeSpec } from "../spec/types.ts";
 import { validateSpec } from "../spec/validate.ts";
 import type { ToolsetRegistry } from "../toolsets/registry.ts";
-import type { PluginRegistry } from "./plugin-registry.ts";
+import { instantiatePlugins, type PluginDescriptor, type PluginEntry, type PluginRegistry } from "./plugin-registry.ts";
 
 export interface AssembleOptions {
 	spec: RuntimeSpec;
@@ -21,8 +21,16 @@ export interface AssembleOptions {
 	toolsets: ToolsetRegistry;
 	cwd: string;
 	agentDir: string;
-	/** 本层注入的内置插件(limits / observability),先于 spec 声明的插件注册 */
-	builtinPlugins?: PluginRef[];
+	/**
+	 * 本层注入的 per-run 内置插件(limits / 将来的 observability),先于 spec 声明的插件挂载。
+	 *
+	 * 收的是 **PluginDescriptor 实例**而不是插件名:这些描述符的闭包捕获了本次 run 的状态
+	 * (LimitState、本次 session 的 abort 句柄),按名字走 `registry` 就等于把 per-run 状态
+	 * 写进进程级的 PluginRegistry —— 同一个 registry 第二次 assemble 会直接撞
+	 * "already registered",并发两次则互相串状态。见 plugin-registry.ts 的类注释。
+	 * 它们与 spec 声明的插件共用同一次替换型 hook 冲突校验(instantiatePlugins)。
+	 */
+	builtinPlugins?: readonly PluginDescriptor[];
 	/** 测试缝:绕过 ProviderProfile,直接用已注册的 faux 模型 */
 	modelOverride?: {
 		modelRuntime: ModelRuntime;
@@ -87,15 +95,21 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			);
 		}
 
-		const pluginRefs: PluginRef[] = [
-			...(options.builtinPlugins ?? []),
+		// spec 声明的插件是进程级的,照旧走 registry 解析;per-run 的内置插件由调用方直接
+		// 给实例。两边拼成一张表后交给 instantiatePlugins() 做**一次**冲突校验,这样绕过
+		// registry 的内置插件也照样受替换型 hook 保护。
+		const specPluginRefs: PluginRef[] = [
 			...(spec.contextStrategy ? [spec.contextStrategy] : []),
 			...(spec.stopPolicy ? [spec.stopPolicy] : []),
 			...(spec.resultPolicy ? [spec.resultPolicy] : []),
 			...(spec.approvalPolicy ? [spec.approvalPolicy] : []),
 			...(spec.extraPlugins ?? []),
 		];
-		const extensionFactories = registry.resolveAll(pluginRefs);
+		const pluginEntries: PluginEntry[] = [
+			...(options.builtinPlugins ?? []).map((descriptor) => ({ descriptor })),
+			...registry.lookupAll(specPluginRefs),
+		];
+		const extensionFactories = instantiatePlugins(pluginEntries);
 
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,

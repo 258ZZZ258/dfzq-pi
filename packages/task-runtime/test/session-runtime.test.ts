@@ -60,14 +60,14 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1)
 	}
 }
 
-async function build(limits: RuntimeSpec["limits"], responses: unknown[]) {
+async function build(limits: RuntimeSpec["limits"], responses: unknown[], registry = new PluginRegistry()) {
 	const harness = await createFauxHarness();
 	cleanups.push(harness.cleanup);
 	harness.faux.setResponses(responses as never);
 	const runtime = await createSessionRuntime({
 		spec: spec(limits),
 		profile,
-		registry: new PluginRegistry(),
+		registry,
 		toolsets: toolsets(),
 		cwd: harness.cwd,
 		agentDir: harness.agentDir,
@@ -178,6 +178,44 @@ describe("SessionRuntime", () => {
 		const second = await runtime.run("hello again");
 		expect(second.status).toBe("completed");
 		expect(second.turns).toBe(1);
+	});
+});
+
+describe("SessionRuntime - shared PluginRegistry", () => {
+	// Regression lock (final fix round, finding 1): createSessionRuntime() used to register
+	// the per-run limits descriptor into the caller's PluginRegistry. That made a shared
+	// registry single-use -- the second createSessionRuntime() threw
+	// `Plugin "limits" is already registered` -- which the whole tree hid by passing a fresh
+	// `new PluginRegistry()` at all 15 call sites. S1a (concurrent requests) and S3 (pooling
+	// by specId) both reuse one process-level registry, so this must hold.
+	it("creates two runtimes in sequence from one shared PluginRegistry", async () => {
+		const shared = new PluginRegistry();
+
+		const first = await build({ maxTurns: 5 }, [fauxAssistantMessage("first")], shared);
+		const firstResult = await first.run("hello");
+		expect(firstResult.status).toBe("completed");
+		expect(firstResult.output).toContain("first");
+
+		const second = await build({ maxTurns: 5 }, [fauxAssistantMessage("second")], shared);
+		const secondResult = await second.run("hello");
+		expect(secondResult.status).toBe("completed");
+		expect(secondResult.output).toContain("second");
+	});
+
+	// The per-run limits state must stay per-run even when the registry is shared: runtime A
+	// has maxTurns:1 (trips immediately) while runtime B has maxTurns:5 (must complete).
+	// A shared LimitState would show up as B inheriting A's tripped limit.
+	it("keeps per-run limit state isolated between two runtimes sharing one PluginRegistry", async () => {
+		const shared = new PluginRegistry();
+		const tripping = await build({ maxTurns: 1 }, [fauxAssistantMessage("a")], shared);
+		const roomy = await build({ maxTurns: 5 }, [fauxAssistantMessage("b")], shared);
+
+		const [trippedResult, roomyResult] = await Promise.all([tripping.run("hello"), roomy.run("hello")]);
+
+		expect(trippedResult.status).toBe("limit_exceeded");
+		expect(trippedResult.limit).toBe("maxTurns");
+		expect(roomyResult.status).toBe("completed");
+		expect(roomyResult.limit).toBeUndefined();
 	});
 });
 

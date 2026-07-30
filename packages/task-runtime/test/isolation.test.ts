@@ -152,4 +152,52 @@ describe("concurrent runtimes", () => {
 		expect(serializedB).toContain("BETA-EVENT-ONLY");
 		expect(serializedB).not.toContain("ALPHA-EVENT-ONLY");
 	});
+
+	// Regression lock (final fix round, finding 1): every other test in this file hands each
+	// runtime its own `new PluginRegistry()`, which is exactly what hid the per-run-state leak
+	// -- createSessionRuntime() registered the limits descriptor into the caller's registry, so
+	// the second call against a shared one threw `Plugin "limits" is already registered`. A
+	// PluginRegistry is process-level; two concurrent runtimes must be able to share one.
+	it("runs two runtimes concurrently off one shared PluginRegistry without interfering", async () => {
+		const a = await createFauxHarness();
+		const b = await createFauxHarness();
+		cleanups.push(a.cleanup, b.cleanup);
+		a.faux.setResponses([fauxAssistantMessage("ALPHA-SHARED-REGISTRY")]);
+		b.faux.setResponses([fauxAssistantMessage("BETA-SHARED-REGISTRY")]);
+
+		const shared = new PluginRegistry();
+		const [runtimeA, runtimeB] = await Promise.all([
+			createSessionRuntime({
+				spec: spec("alpha", "You are ALPHA."),
+				profile: profileFor("faux"),
+				registry: shared,
+				toolsets: toolsets(),
+				cwd: a.cwd,
+				agentDir: a.agentDir,
+				modelOverride: { modelRuntime: a.modelRuntime, model: a.model },
+			}),
+			createSessionRuntime({
+				spec: spec("beta", "You are BETA."),
+				profile: profileFor("faux"),
+				registry: shared,
+				toolsets: toolsets(),
+				cwd: b.cwd,
+				agentDir: b.agentDir,
+				modelOverride: { modelRuntime: b.modelRuntime, model: b.model },
+			}),
+		]);
+		cleanups.push(runtimeA.dispose, runtimeB.dispose);
+
+		const [resultA, resultB] = await Promise.all([runtimeA.run("go"), runtimeB.run("go")]);
+
+		expect(resultA.status).toBe("completed");
+		expect(resultB.status).toBe("completed");
+		expect(resultA.output).toContain("ALPHA-SHARED-REGISTRY");
+		expect(resultA.output).not.toContain("BETA-SHARED-REGISTRY");
+		expect(resultB.output).toContain("BETA-SHARED-REGISTRY");
+		expect(resultB.output).not.toContain("ALPHA-SHARED-REGISTRY");
+
+		// The shared registry stayed process-level: nothing per-run was written into it.
+		expect([...shared.names()]).toEqual([]);
+	});
 });

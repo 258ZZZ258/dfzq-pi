@@ -202,6 +202,58 @@ describe("assemble - tool whitelist cross-validation", () => {
 	});
 });
 
+describe("assemble - builtinPlugins", () => {
+	// Regression lock (final fix round, finding 1): builtinPlugins used to be plugin *names*
+	// resolved out of the shared PluginRegistry, which forced per-run descriptors into a
+	// process-level table. They are now descriptor instances that never touch the registry --
+	// but they must still take part in the same replacing-hook conflict check as spec plugins,
+	// otherwise bypassing the registry would silently drop that protection.
+	it("rejects a replacing-hook conflict between a builtin plugin and a spec-declared plugin", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const specPlugins = new PluginRegistry();
+		specPlugins.register({ name: "shaper", hooks: ["tool_result"], factory: () => ({}) as never });
+
+		await expect(
+			assemble({
+				spec: spec({ extraPlugins: ["shaper"] }),
+				profile,
+				registry: specPlugins,
+				toolsets: toolsets(),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+				builtinPlugins: [{ name: "builtin-shaper", hooks: ["tool_result"], factory: () => ({}) as never }],
+			}),
+		).rejects.toThrow(/replacing hook "tool_result".*builtin-shaper.*shaper/s);
+	});
+
+	// Observing hooks stack, and a builtin descriptor must never be written into the registry:
+	// the same descriptor instance can be passed to two assemble() calls off one registry.
+	it("does not write builtin plugin descriptors into the shared PluginRegistry", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const shared = new PluginRegistry();
+		const builtin = { name: "counter", hooks: ["turn_end"], factory: () => ({ name: "counter", factory: () => {} }) };
+
+		for (let i = 0; i < 2; i += 1) {
+			const assembled = await assemble({
+				spec: spec(),
+				profile,
+				registry: shared,
+				toolsets: toolsets(),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+				builtinPlugins: [builtin as never],
+			});
+			cleanups.push(assembled.dispose);
+		}
+
+		expect([...shared.names()]).toEqual([]);
+	});
+});
+
 describe("assemble - resolveModel (no modelOverride)", () => {
 	// The other tests all bypass resolveModel() via modelOverride; these exercise the
 	// real ProviderProfile -> ModelRuntime.registerProvider() -> getModel() path.

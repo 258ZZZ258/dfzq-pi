@@ -1,14 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { type Assembled, type AssembleOptions, assemble } from "./assembler.ts";
 import type { LimitKind, RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
-import { createLimitsDescriptor, LIMITS_PLUGIN_NAME, type LimitState } from "./plugins/limits.ts";
+import { createLimitsDescriptor, type LimitState } from "./plugins/limits.ts";
 
 export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "builtinPlugins">;
 
 export async function createSessionRuntime(options: CreateSessionRuntimeOptions): Promise<Runtime> {
 	const state: LimitState = { turns: 0 };
 	let abortFn: () => void = () => {};
-	// `assemble()` hasn't run yet when the limits descriptor is registered below, but the
+	// `assemble()` hasn't run yet when the limits descriptor is built below, but the
 	// descriptor's `getStats` closure is only ever invoked from a `turn_end` hook -- i.e.
 	// after `assemble()` has resolved and assigned this. Declared with `let ...!:` (definite
 	// assignment assertion) rather than reading `assembled` from the outer `const` declared
@@ -16,18 +16,22 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	// its declaration"), since the closure and the declaration live in the same function scope.
 	let assembled!: Assembled;
 
-	options.registry.register(
-		createLimitsDescriptor(state, {
-			limits: options.spec.limits,
-			getStats: () => {
-				const stats = assembled.session.getSessionStats();
-				return { totalTokens: stats.tokens.total, cost: stats.cost };
-			},
-			abort: () => abortFn(),
-		}),
-	);
+	// The limits descriptor closes over `state` / `abortFn` / this call's `assembled` -- all
+	// strictly per-run. It is handed to assemble() as an *instance* rather than registered
+	// into `options.registry` by name: PluginRegistry is process-level, and writing per-run
+	// state into it made a shared registry single-use (a second createSessionRuntime() threw
+	// `Plugin "limits" is already registered`) and concurrent runs cross-contaminating. Same
+	// invariant as ToolsetRegistry's `providers` -- see plugin-registry.ts / toolsets/registry.ts.
+	const limitsPlugin = createLimitsDescriptor(state, {
+		limits: options.spec.limits,
+		getStats: () => {
+			const stats = assembled.session.getSessionStats();
+			return { totalTokens: stats.tokens.total, cost: stats.cost };
+		},
+		abort: () => abortFn(),
+	});
 
-	assembled = await assemble({ ...options, builtinPlugins: [LIMITS_PLUGIN_NAME] });
+	assembled = await assemble({ ...options, builtinPlugins: [limitsPlugin] });
 	const session = assembled.session;
 	// abortFn is invoked from two synchronous callbacks -- the limits plugin's `turn_end`
 	// hook and the runTimeoutMs setTimeout below -- neither of which can be made to `await`

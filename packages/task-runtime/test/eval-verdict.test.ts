@@ -135,13 +135,23 @@ describe("renderSummary — scope note follows the actual selection mode", () =>
 });
 
 describe("renderSummary — never states a bare 判据①/判据② pass claim", () => {
-	// 只看「紧跟一个左括号」挡不住括号里塞结论词的伪造写法,例如
-	// 「判据①(已通过)」—— 紧邻字符检查对这种写法完全失明。
-	// 升级成:逐一找出全文每一处「判据①/②」,每处都必须紧跟 (...) 括号(裸出现依旧违规),
-	// 且括号内容不得含「通过/满足/达成」这类结论词 —— 唯一被认可的结论位置是
-	// 括号**外**、冒号后的那句(比如「**判据①(5 题子集全部 completed)**:通过 —— ...」),
-	// 这里的检查只看括号内,不会误伤那个位置。
-	const CONCLUSION_WORDS = ["通过", "满足", "达成"];
+	// 只看「紧跟一个左括号」挡不住括号里塞结论词的伪造写法,例如「判据①(已通过)」——
+	// 紧邻字符检查对这种写法完全失明。round 2 曾把检查升级成「括号内容不含黑名单结论词
+	// (通过/满足/达成)」,但「合格」「达标」「成立」这类同义词不在黑名单里,一样能绕过去
+	// (round 3 复审实测:「判据①(合格)和判据②(达标)……视为出口条件成立」16/16 全绿放行)。
+	//
+	// 中文结论同义词的黑名单没法穷尽,但白名单可以:合法的括号内容只有 renderSummary 自己
+	// 会产出的那几种范围标签(逐字对应 drive.ts 的 criterion1Label / 判据②固定文案,不是
+	// 凭记忆写的近似值)。所以反过来做白名单——凡不完整匹配下列合法形态之一,一律判违规。
+	//
+	// 这也是故意设的绊线:以后给 renderSummary 新增合法标签,这条断言会红,逼修改者
+	// 有意识地把新标签加进这份白名单并接受一次审视,而不是让白名单静默过期、形同虚设。
+	const ALLOWED_PAREN_CONTENTS: RegExp[] = [
+		/^\d+ 题子集全部 completed$/, // default / custom 的「N 题子集全部 completed」
+		/^自定义 \d+ 题全部 completed$/, // custom 的「自定义 N 题全部 completed」
+		/^15 题全集全部 completed$/, // all 的「15 题全集全部 completed」
+		/^工具调用与 EVAL_TASK_LOG 逐条对上$/, // 判据②在三种 mode 下都固定的文案
+	];
 
 	function assertNoBarePassClaim(text: string): void {
 		const pattern = /判据([①②])(\([^)]*\))?/g;
@@ -151,14 +161,15 @@ describe("renderSummary — never states a bare 判据①/判据② pass claim",
 			checked += 1;
 			const marker = `判据${match[1]}`;
 			const paren = match[2];
-			// 裸出现(后面没有紧跟括号):这本身就是违规,不用往下看括号内容。
+			// 裸出现(后面没有紧跟半角括号,含被换成全角括号的情况):这本身就是违规,
+			// 不用往下看括号内容。
 			expect(paren, `位置 ${match.index} 的「${marker}」未紧跟限定括号,是裸断言`).toBeDefined();
-			for (const word of CONCLUSION_WORDS) {
-				expect(
-					paren?.includes(word),
-					`位置 ${match.index} 的「${marker}${paren}」括号内含结论词「${word}」,疑似伪造的通过断言`,
-				).toBe(false);
-			}
+			const content = paren?.slice(1, -1) ?? "";
+			const allowed = ALLOWED_PAREN_CONTENTS.some((re) => re.test(content));
+			expect(
+				allowed,
+				`位置 ${match.index} 的「${marker}${paren}」括号内容不在合法标签白名单内,疑似伪造的通过断言`,
+			).toBe(true);
 			match = pattern.exec(text);
 		}
 		// 防止正则本身失效导致这条断言形同虚设——全文至少要出现过判据①和判据②各一次。

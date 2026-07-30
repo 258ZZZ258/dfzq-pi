@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { buildPrompt } from "../src/eval/build-prompt.ts";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { buildPrompt, loadPromptParts } from "../src/eval/build-prompt.ts";
 import type { EvalCase } from "../src/eval/cases.ts";
 
 const CASE: EvalCase = {
@@ -30,5 +33,30 @@ describe("buildPrompt", () => {
 
 	it("throws when the requested variant is absent", () => {
 		expect(() => buildPrompt(CASE, "loose", PARTS)).toThrow(/loose/);
+	});
+});
+
+describe("loadPromptParts", () => {
+	let root: string | undefined;
+
+	afterEach(async () => {
+		if (root) await rm(root, { recursive: true, force: true });
+		root = undefined;
+	});
+
+	// 回归用例:run_eval.py 的 read_text() 会 .strip() 文件内容,不 trim 会让 buildPrompt
+	// 拼出的 prompt 比 Python 基线多几行空行 —— 表面像同一条 prompt,实则不是同口径。
+	// 断言必须是严格相等(而非 toContain),否则 trim 被删掉也测不出来。
+	it("trims leading/trailing whitespace from the fixture files", async () => {
+		root = await mkdtemp(join(tmpdir(), "dfzq-prompt-parts-"));
+		const dir = join(root, "fixtures");
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, "audit_role_prompt.md"), "\n\n  ROLE BODY  \n\n");
+		await writeFile(join(dir, "output_contract.md"), "\n\n  CONTRACT BODY  \n\n");
+
+		const parts = await loadPromptParts(root);
+
+		expect(parts.rolePrompt).toBe("ROLE BODY");
+		expect(parts.outputContract).toBe("CONTRACT BODY");
 	});
 });

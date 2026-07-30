@@ -12,18 +12,6 @@ export interface McpServerSpec {
 	cwd?: string;
 }
 
-/**
- * `execute()` 的 `details` 里携带的结构化信息。`AgentToolResult` 本身没有 `isError` 字段
- * (那是 wire 层 `ToolResultMessage.isError`,由 agent-loop 根据 execute() 是否 throw 派生,
- * 不是 execute() 返回值的一部分)——`details` 是这个类型上唯一的自由扩展点,所以 MCP 的
- * isError 语义放在这里:沿用 `McpClient.callTool()` 的"映射不抛"约定(见 client.ts),把
- * 判断权交给调用方(模型可以从错误结果里换个工具或参数继续,而不是让整个 tool batch 因为
- * 一次 MCP 调用失败而被打断)。
- */
-export interface McpToolResultDetails {
-	isError: boolean;
-}
-
 /** 多 server 同名工具时的前缀分隔符。 */
 const NAME_SEPARATOR = "__";
 
@@ -81,9 +69,20 @@ function toToolDefinition(client: McpClient, info: McpToolInfo, exposedName: str
 		parameters: Type.Unsafe(info.inputSchema),
 		execute: async (_toolCallId: string, params: unknown, signal: AbortSignal | undefined) => {
 			const result = await client.callTool(info.name, (params ?? {}) as Record<string, unknown>, signal);
+			if (result.isError) {
+				// throw 是向 pi 表达"这次工具调用失败了"的唯一方式:agent-loop 的 executePreparedToolCall
+				// 自己 catch 异常并生成 wire 层 isError:true 的结果(不会中断 batch/循环,见
+				// packages/agent/src/agent-loop.ts:665-702 的 try/catch + createErrorToolResult),
+				// 而 AgentToolResult 返回值本身没有 isError 字段可写,写在 details 里下游各处
+				// (ToolResultMessage.isError、tool_execution_end 事件、UI 着色、各 provider 的
+				// is_error 协议字段)都读不到。error.message 会被 createErrorToolResult 原样用作
+				// 模型看到的文本,所以保留 McpClient.callTool() 生成的可读错误信息
+				// (形如 `MCP tool "x" failed: ...`),不再重新包装。
+				throw new Error(result.text);
+			}
 			return {
 				content: [{ type: "text", text: result.text }],
-				details: { isError: result.isError },
+				details: undefined,
 			};
 		},
 	};

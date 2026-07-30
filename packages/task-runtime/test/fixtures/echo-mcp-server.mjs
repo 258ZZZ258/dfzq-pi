@@ -52,6 +52,18 @@ const TOOLS = [
 	},
 ];
 
+// fix round 1/5(Task 10):MCP_FIXTURE_EXTRA_TOOL=<name> 时,给这个 server 实例额外挂一个只有
+// 它自己有的工具,用来测"两个 server 部分撞名(echo/boom/leak 共有 + 各自独有一个)"的非对称
+// 前缀场景 —— 之前的撞名测试两个 server 都是同一份 TOOLS,全部对称撞名,测不出"不撞名的名字
+// 不该加前缀"这条分支。没有显式 tools/call 处理分支:落到文件末尾的通用 echo-like 兜底即可。
+if (process.env.MCP_FIXTURE_EXTRA_TOOL) {
+	TOOLS.push({
+		name: process.env.MCP_FIXTURE_EXTRA_TOOL,
+		description: "Extra tool unique to this fixture instance.",
+		inputSchema: { type: "object", properties: {} },
+	});
+}
+
 function send(payload) {
 	process.stdout.write(`${JSON.stringify(payload)}\n`);
 }

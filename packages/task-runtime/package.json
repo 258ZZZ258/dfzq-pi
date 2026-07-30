@@ -6,6 +6,9 @@
 	"scripts": {
 		"test": "vitest --run"
 	},
+	"bin": {
+		"task-runtime": "./src/cli/main.ts"
+	},
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "^0.82.1",
 		"typebox": "1.1.38"

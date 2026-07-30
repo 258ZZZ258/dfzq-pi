@@ -89,4 +89,44 @@ describe("reconcile", () => {
 		expect(report.missingInMcp).toEqual([]);
 		expect(report.missingInPi).toEqual([]);
 	});
+
+	it("reports a clean run as neither schemaMismatch nor vacuous", async () => {
+		const { trajectory, toolLog } = await fixture(["search"], ["search"]);
+		const report = await reconcile(trajectory, toolLog);
+		expect(report.ok).toBe(true);
+		expect(report.schemaMismatch).toBe(false);
+		expect(report.vacuous).toBe(false);
+	});
+
+	it("flags schemaMismatch when tool_execution_end no longer carries toolName", async () => {
+		// 模拟上游把 toolName 改名:事件类型还在,字段没了。
+		root = await mkdtemp(join(tmpdir(), "recon-"));
+		const trajectory = join(root, "trajectory.jsonl");
+		const toolLog = join(root, "tool_calls.jsonl");
+		await writeFile(
+			trajectory,
+			JSON.stringify({
+				runId: "r1",
+				specId: "s1",
+				seq: 0,
+				ts: 0,
+				type: "tool_execution_end",
+				payload: { name: "search" }, // 改名后的字段
+			}),
+		);
+		await writeFile(toolLog, JSON.stringify({ ts: 0, server: "srv", tool: "search", ok: true }));
+
+		const report = await reconcile(trajectory, toolLog);
+		expect(report.schemaMismatch).toBe(true);
+		expect(report.ok).toBe(false);
+	});
+
+	it("flags vacuous instead of ok when neither side recorded any tool call", async () => {
+		const { trajectory, toolLog } = await fixture([], []);
+		const report = await reconcile(trajectory, toolLog);
+		// 两侧都空 —— 可能任务没用工具,也可能事件类型改名 + EVAL_TASK_LOG 没接通。
+		// 无论哪种,都不能声称「一致」。
+		expect(report.vacuous).toBe(true);
+		expect(report.ok).toBe(false);
+	});
 });

@@ -24,7 +24,7 @@ export async function attachTrajectory(runtime: Runtime, filePath: string): Prom
 	await mkdir(dirname(filePath), { recursive: true });
 	const stream: WriteStream = createWriteStream(filePath, { flags: "a" });
 	let hasError = false;
-	let isDetached = false;
+	let detachPromise: Promise<void> | null = null;
 
 	stream.on("error", (err) => {
 		hasError = true;
@@ -36,13 +36,24 @@ export async function attachTrajectory(runtime: Runtime, filePath: string): Prom
 		if (hasError) return; // Don't write if stream has errored
 		stream.write(`${JSON.stringify(event)}\n`);
 	});
-	return async () => {
-		if (isDetached) return; // Already detached, avoid duplicate
-		isDetached = true;
-		unsubscribe();
-		stream.end();
-		await once(stream, "close");
+	const detachFn = async () => {
+		if (detachPromise) return detachPromise;
+		detachPromise = (async () => {
+			unsubscribe();
+			// Check if stream is already closed (e.g., due to error or destroy)
+			if (!stream.closed && !stream.writableEnded) {
+				stream.end();
+				await once(stream, "close");
+			} else if (!stream.closed) {
+				// Stream has writableEnded but not closed yet, wait for close
+				await once(stream, "close");
+			}
+		})();
+		return detachPromise;
 	};
+	// Expose stream for testing error scenarios (internal only)
+	(detachFn as any).__stream = stream;
+	return detachFn;
 }
 
 export async function readTrajectory(filePath: string): Promise<RuntimeEvent[]> {

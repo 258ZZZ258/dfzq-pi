@@ -74,7 +74,7 @@ describe("trajectory", () => {
 		expect(events.map((e) => e.seq)).toEqual([...Array(20).keys()]);
 	});
 
-	it("detach is idempotent and does not hang on repeated calls", { timeout: 5000 }, async () => {
+	it("detach is idempotent and does not hang on repeated sequential calls", { timeout: 5000 }, async () => {
 		root = await mkdtemp(join(tmpdir(), "traj-"));
 		const file = join(root, "trajectory.jsonl");
 		const { runtime, emit } = fakeRuntime();
@@ -91,6 +91,23 @@ describe("trajectory", () => {
 		expect(events.length).toBe(1);
 	});
 
+	it("detach is safe under concurrent calls", { timeout: 5000 }, async () => {
+		root = await mkdtemp(join(tmpdir(), "traj-"));
+		const file = join(root, "trajectory.jsonl");
+		const { runtime, emit } = fakeRuntime();
+		const detach = await attachTrajectory(runtime, file);
+		emit({ seq: 0, type: "turn_start" });
+		emit({ seq: 1, type: "turn_end" });
+
+		// Call detach concurrently
+		await Promise.all([detach(), detach(), detach()]);
+
+		// Both events must be on disk since all detach calls waited for close
+		const events = await readTrajectory(file);
+		expect(events.length).toBe(2);
+		expect(events.map((e) => e.type)).toEqual(["turn_start", "turn_end"]);
+	});
+
 	it("handles write stream errors without crashing the process", { timeout: 5000 }, async () => {
 		root = await mkdtemp(join(tmpdir(), "traj-"));
 		const file = join(root, "trajectory.jsonl");
@@ -99,10 +116,10 @@ describe("trajectory", () => {
 
 		emit({ seq: 0, type: "turn_start" });
 
-		// Delete the directory to cause subsequent writes to fail
-		await rm(root, { recursive: true });
+		// Destroy the stream to trigger error event
+		(detach as any).__stream.destroy(new Error("Simulated write error"));
 
-		// Emit another event—this should fail but not crash the process
+		// Emit another event—should be no-op due to error handler
 		emit({ seq: 1, type: "turn_end" });
 
 		// Give error handler time to run

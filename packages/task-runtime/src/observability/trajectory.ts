@@ -20,7 +20,16 @@ function shouldRecord(type: string): boolean {
 	return RECORDED_TYPES.has(type) || type.startsWith("auto_retry_");
 }
 
-export async function attachTrajectory(runtime: Runtime, filePath: string): Promise<() => Promise<void>> {
+/** Optional configuration for attachTrajectory (primarily for testing) */
+interface AttachTrajectoryOptions {
+	onStreamCreated?: (stream: WriteStream) => void;
+}
+
+export async function attachTrajectory(
+	runtime: Runtime,
+	filePath: string,
+	options?: AttachTrajectoryOptions,
+): Promise<() => Promise<void>> {
 	await mkdir(dirname(filePath), { recursive: true });
 	const stream: WriteStream = createWriteStream(filePath, { flags: "a" });
 	let hasError = false;
@@ -30,6 +39,11 @@ export async function attachTrajectory(runtime: Runtime, filePath: string): Prom
 		hasError = true;
 		console.error(`Trajectory write error: ${err.message}`);
 	});
+
+	// Allow tests to inject error scenarios via callback
+	if (options?.onStreamCreated) {
+		options.onStreamCreated(stream);
+	}
 
 	const unsubscribe = runtime.subscribe((event) => {
 		if (!shouldRecord(event.type)) return;
@@ -51,8 +65,6 @@ export async function attachTrajectory(runtime: Runtime, filePath: string): Prom
 		})();
 		return detachPromise;
 	};
-	// Expose stream for testing error scenarios (internal only)
-	(detachFn as any).__stream = stream;
 	return detachFn;
 }
 

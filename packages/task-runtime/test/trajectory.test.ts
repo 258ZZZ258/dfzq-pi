@@ -99,25 +99,36 @@ describe("trajectory", () => {
 		emit({ seq: 0, type: "turn_start" });
 		emit({ seq: 1, type: "turn_end" });
 
-		// Call detach concurrently
-		await Promise.all([detach(), detach(), detach()]);
+		// Each concurrent detach call should see complete file when it resolves
+		const checkAfterDetach = async () => {
+			await detach();
+			const events = await readTrajectory(file);
+			return events.length;
+		};
 
-		// Both events must be on disk since all detach calls waited for close
-		const events = await readTrajectory(file);
-		expect(events.length).toBe(2);
-		expect(events.map((e) => e.type)).toEqual(["turn_start", "turn_end"]);
+		const results = await Promise.all([checkAfterDetach(), checkAfterDetach(), checkAfterDetach()]);
+
+		// All concurrent calls must see both events when they resolve
+		// (if any resolved early without true flush, it would see fewer)
+		expect(results).toEqual([2, 2, 2]);
 	});
 
 	it("handles write stream errors without crashing the process", { timeout: 5000 }, async () => {
 		root = await mkdtemp(join(tmpdir(), "traj-"));
 		const file = join(root, "trajectory.jsonl");
 		const { runtime, emit } = fakeRuntime();
-		const detach = await attachTrajectory(runtime, file);
+		let streamRef: any;
+
+		const detach = await attachTrajectory(runtime, file, {
+			onStreamCreated: (stream) => {
+				streamRef = stream;
+			},
+		});
 
 		emit({ seq: 0, type: "turn_start" });
 
 		// Destroy the stream to trigger error event
-		(detach as any).__stream.destroy(new Error("Simulated write error"));
+		streamRef.destroy(new Error("Simulated write error"));
 
 		// Emit another event—should be no-op due to error handler
 		emit({ seq: 1, type: "turn_end" });

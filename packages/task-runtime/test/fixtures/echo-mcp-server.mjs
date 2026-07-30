@@ -89,6 +89,25 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 		return;
 	}
 	if (msg.method === "tools/call") {
+		// Task 15:EVAL_TASK_LOG 是 S0 出口判据②(对账)的数据来源,链路是
+		// main.ts 读 process.env.EVAL_TASK_LOG → 注入每个 McpServerSpec.env → McpClient.spawn
+		// 的白名单 env(不继承 process.env,见 client.ts)。这里落一行 JSON 证明 env 真的到了
+		// 这个子进程 —— 单元测试看不到这条链路,只有真实跨进程 spawn 才测得出。
+		if (process.env.EVAL_TASK_LOG) {
+			try {
+				fs.appendFileSync(
+					process.env.EVAL_TASK_LOG,
+					`${JSON.stringify({
+						ts: Date.now(),
+						server: "echo",
+						tool: msg.params.name,
+						arguments: msg.params.arguments ?? {},
+					})}\n`,
+				);
+			} catch {
+				// 日志是尽力而为的观测,不能因为写失败就打断这个 fixture 本该做的 MCP 协议响应。
+			}
+		}
 		if (msg.params.name === "boom") {
 			send({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "boom failed" } });
 			return;

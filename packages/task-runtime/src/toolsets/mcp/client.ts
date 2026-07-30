@@ -133,6 +133,9 @@ export class McpClient {
 			client.tools = listed.tools ?? [];
 		} catch (error) {
 			await client.dispose();
+			// 这里保留 stderrSummary() 全量 —— 与 callTool() 不同,这条路径不经过模型:它是
+			// assemble() 装配期的 throw,最终落到 CLI/运维手里,由人来判断"这个 Python server
+			// 为什么起不来",stderr 的 traceback 正是他需要的诊断信息。
 			throw new Error(
 				`MCP server "${options.id}" failed to initialize: ${(error as Error).message}${client.stderrSummary()}`,
 			);
@@ -158,10 +161,19 @@ export class McpClient {
 				.join("\n");
 			return { text, isError: Boolean(result.isError) };
 		} catch (error) {
-			return {
-				text: `MCP tool "${name}" failed: ${(error as Error).message}${this.stderrSummary()}`,
-				isError: true,
-			};
+			const message = (error as Error).message;
+			// stderr 细节按受众路由,不是脱敏:这段文本进的是模型上下文(pi 的 ToolResult ->
+			// trajectory 持久化),而模型修不了 MCP server 的问题(装不了依赖、改不了路径),喂给它
+			// 子进程原始输出零收益,还白白扩大凭据泄漏面(stderr 是操作者调试通道,崩溃现场最容易
+			// 吐连接串/token/env dump)。stderr 细节转去运维通道 —— 出口和 Task 8 abortFn 的失败
+			// 日志一致(console.error;包内暂无 logger 抽象,S2 接结构化日志时一并换)。
+			// initialize 失败(见 spawn() 的 catch)相反:那条路径不经过模型、是运维在查装配失败
+			// 原因,stderrSummary() 原样保留。
+			const stderr = this.stderrSummary();
+			if (stderr) {
+				console.error(`[McpClient] tool "${name}" on "${this.id}" failed: ${message}${stderr}`);
+			}
+			return { text: `MCP tool "${name}" failed: ${message}`, isError: true };
 		}
 	}
 
@@ -255,7 +267,10 @@ export class McpClient {
 		entry.resolve(message.result);
 	}
 
-	/** 只是「读走」以防管道堵塞;顺带留一份有界的诊断尾巴,方便 initialize/callTool 失败时定位问题。 */
+	/**
+	 * 只是「读走」以防管道堵塞;顺带留一份有界的诊断尾巴,喂给 initialize 失败的 throw 和
+	 * callTool 失败的 console.error(均为运维通道,不进模型上下文,见 callTool() 里的说明)。
+	 */
 	private onStderrLine(line: string): void {
 		if (!line) return;
 		const trimmed = line.length > STDERR_LINE_MAX_CHARS ? `${line.slice(0, STDERR_LINE_MAX_CHARS)}…` : line;

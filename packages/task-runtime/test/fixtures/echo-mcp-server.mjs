@@ -3,6 +3,21 @@
 import fs from "node:fs";
 import { createInterface } from "node:readline";
 
+// fix round 2/5:两个哨兵字符串,分别验证 stderr 按受众路由到 callTool()(不该到模型)和
+// spawn() 的 initialize 失败 throw(该到运维)两条路径。这个进程会被当独立子进程 spawn,不会被
+// test 文件 import,所以字面量在 mcp-client.test.ts 里重复了一份 —— 改这里记得同步改那边。
+const CALL_STDERR_SENTINEL = "SENTINEL_MCP_CALLTOOL_STDERR_PROBE";
+const INIT_STDERR_SENTINEL = "SENTINEL_MCP_INIT_STDERR_PROBE";
+
+// fix round 2/5:MCP_FIXTURE_FAIL_INIT_WITH_STDERR=1 时,进程一启动(早于任何 stdin 读取)就往
+// stderr 打一个哨兵,之后 initialize 请求会回一个 JSON-RPC error(见下方 handler)。在模块顶层
+// 同步写、而不是等收到 initialize 请求才写,是为了确定性地避免时序竞争:子进程启动到父进程真正
+// 发出 initialize 请求之间天然有一段进程间通信延迟,这段时间足够父进程的独立 stderr reader 把这
+// 一行读走、落进 stderrTail,不需要额外人为 delay。
+if (process.env.MCP_FIXTURE_FAIL_INIT_WITH_STDERR === "1") {
+	process.stderr.write(`${INIT_STDERR_SENTINEL}\n`);
+}
+
 // fix round 1/5:模拟真实(尤其是 Python)MCP server 收到 SIGTERM 后拖着不退出的情况,
 // 用于测试 client 端 dispose() 的 SIGKILL 升级路径。
 if (process.env.MCP_FIXTURE_IGNORE_SIGTERM === "1") {
@@ -45,6 +60,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 	if (!line.trim()) return;
 	const msg = JSON.parse(line);
 	if (msg.method === "initialize") {
+		if (process.env.MCP_FIXTURE_FAIL_INIT_WITH_STDERR === "1") {
+			send({ jsonrpc: "2.0", id: msg.id, error: { code: -32002, message: "initialize failed" } });
+			return;
+		}
 		send({
 			jsonrpc: "2.0",
 			id: msg.id,
@@ -68,6 +87,18 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 				id: msg.id,
 				result: { content: [{ type: "text", text: JSON.stringify(process.env) }] },
 			});
+			return;
+		}
+		if (msg.params.name === "stderr-then-fail") {
+			// 故意不放进 TOOLS。验证 callTool() 失败时返回给模型的 text 不含 stderr 内容
+			// (stderr 只进运维通道 console.error,不进模型上下文)。stdout 响应延迟一小段再发,
+			// 给父进程独立的 stderr reader 留出确定性的时间窗口先把这行读走、落进 stderrTail——
+			// 否则两个 write() 背靠背发出,两条 pipe 各自被处理的先后顺序没有保证,会让"console.error
+			// 是否已经带上这行"这个断言变成时序竞争、跑出 flaky。
+			process.stderr.write(`${CALL_STDERR_SENTINEL}\n`);
+			setTimeout(() => {
+				send({ jsonrpc: "2.0", id: msg.id, error: { code: -32003, message: "stderr-then-fail failed" } });
+			}, 30);
 			return;
 		}
 		if (msg.params.name === "spam-stderr") {

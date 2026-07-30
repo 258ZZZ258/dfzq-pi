@@ -1,8 +1,13 @@
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { McpClient, type McpSpawnOptions } from "../src/toolsets/mcp/client.ts";
 
 const SERVER = fileURLToPath(new URL("./fixtures/echo-mcp-server.mjs", import.meta.url));
+
+// fix round 2/5:字面量必须和 test/fixtures/echo-mcp-server.mjs 里的同名常量保持一致 —— fixture
+// 是独立 spawn 的子进程,不能 import 常量模块(那样会在测试进程里跑一份 fixture 的顶层副作用)。
+const CALL_STDERR_SENTINEL = "SENTINEL_MCP_CALLTOOL_STDERR_PROBE";
+const INIT_STDERR_SENTINEL = "SENTINEL_MCP_INIT_STDERR_PROBE";
 
 const clients: McpClient[] = [];
 afterEach(async () => {
@@ -110,5 +115,44 @@ describe("McpClient", () => {
 		expect(elapsed).toBeLessThan(2_000);
 		// 子进程被真正回收,不是"dispose() 返回了但进程还活着"的孤儿。
 		expect(isAlive(client.pid)).toBe(false);
+	});
+
+	// fix round 2/5:stderr 按受众路由,不是脱敏。callTool() 失败返回给模型的 text 只应该有 MCP
+	// 自己的 error message —— 模型修不了 MCP server 的问题(装不了依赖、改不了路径),子进程的
+	// 原始调试输出对它零收益,反而白白扩大凭据泄漏面(stderr 是操作者调试通道,崩溃现场最容易吐
+	// 连接串/token/env dump)。stderr 细节改道 console.error(运维通道,和 Task 8 abortFn 同一个
+	// 出口),这里同时断言"没进模型的 text"和"确实到了 console.error",证明是结构性路由而不是
+	// 静默丢弃。
+	it("routes callTool failure stderr to console.error instead of the text returned to the model", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const client = await spawn(undefined, { requestTimeoutMs: 4_000 });
+			const result = await client.callTool("stderr-then-fail", {});
+
+			expect(result.isError).toBe(true);
+			// MCP 自己的语义化错误摘要还在 —— 模型知道"这次失败了、为什么失败"。
+			expect(result.text).toContain("stderr-then-fail failed");
+			// 但子进程的 stderr 原始输出不该混进去。
+			expect(result.text).not.toContain(CALL_STDERR_SENTINEL);
+
+			expect(errorSpy).toHaveBeenCalledTimes(1);
+			expect(errorSpy.mock.calls[0]?.[0]).toContain(CALL_STDERR_SENTINEL);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	// fix round 2/5:与上一条相反的路径 —— initialize 失败的 throw 不经过模型,是 assemble()
+	// 装配期抛给 CLI/运维的,stderr(比如 Python 的 traceback)正是运维排查"server 为什么起不来"
+	// 需要的信息,所以这条路径上 stderrSummary() 原样保留,这里断言哨兵确实出现在抛出的错误里。
+	it("keeps stderr detail in the initialize-failure throw (ops channel, not model-facing)", async () => {
+		await expect(
+			McpClient.spawn({
+				id: "echo",
+				command: process.execPath,
+				args: [SERVER],
+				env: { MCP_FIXTURE_FAIL_INIT_WITH_STDERR: "1" },
+			}),
+		).rejects.toThrow(new RegExp(INIT_STDERR_SENTINEL));
 	});
 });

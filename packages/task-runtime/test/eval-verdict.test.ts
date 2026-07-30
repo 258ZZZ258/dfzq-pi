@@ -135,26 +135,48 @@ describe("renderSummary — scope note follows the actual selection mode", () =>
 });
 
 describe("renderSummary — never states a bare 判据①/判据② pass claim", () => {
-	// 现有的正向断言只能挡住「把标签本身改错」,挡不住「别处新增一句裸的通过表述」
-	// (例如「结论:S0 判据①②均已通过」)。这里补否定式断言:全文任何地方出现
-	// 「判据①」/「判据②」,后面都必须紧跟限定括号「(」,否则就是裸断言,判违规。
-	function expectNoBarePassClaim(text: string): void {
-		expect(text).not.toMatch(/判据①(?!\()/);
-		expect(text).not.toMatch(/判据②(?!\()/);
+	// 只看「紧跟一个左括号」挡不住括号里塞结论词的伪造写法,例如
+	// 「判据①(已通过)」—— 紧邻字符检查对这种写法完全失明。
+	// 升级成:逐一找出全文每一处「判据①/②」,每处都必须紧跟 (...) 括号(裸出现依旧违规),
+	// 且括号内容不得含「通过/满足/达成」这类结论词 —— 唯一被认可的结论位置是
+	// 括号**外**、冒号后的那句(比如「**判据①(5 题子集全部 completed)**:通过 —— ...」),
+	// 这里的检查只看括号内,不会误伤那个位置。
+	const CONCLUSION_WORDS = ["通过", "满足", "达成"];
+
+	function assertNoBarePassClaim(text: string): void {
+		const pattern = /判据([①②])(\([^)]*\))?/g;
+		let match: RegExpExecArray | null = pattern.exec(text);
+		let checked = 0;
+		while (match !== null) {
+			checked += 1;
+			const marker = `判据${match[1]}`;
+			const paren = match[2];
+			// 裸出现(后面没有紧跟括号):这本身就是违规,不用往下看括号内容。
+			expect(paren, `位置 ${match.index} 的「${marker}」未紧跟限定括号,是裸断言`).toBeDefined();
+			for (const word of CONCLUSION_WORDS) {
+				expect(
+					paren?.includes(word),
+					`位置 ${match.index} 的「${marker}${paren}」括号内含结论词「${word}」,疑似伪造的通过断言`,
+				).toBe(false);
+			}
+			match = pattern.exec(text);
+		}
+		// 防止正则本身失效导致这条断言形同虚设——全文至少要出现过判据①和判据②各一次。
+		expect(checked).toBeGreaterThanOrEqual(2);
 	}
 
 	it("default mode", () => {
 		const outcomes = [outcome("L1-001")];
-		expectNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "default" }));
+		assertNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "default" }));
 	});
 
 	it("all mode", () => {
 		const outcomes = [outcome("L1-001")];
-		expectNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "all" }));
+		assertNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "all" }));
 	});
 
 	it("custom mode", () => {
 		const outcomes = [outcome("L1-001")];
-		expectNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "custom" }));
+		assertNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "custom" }));
 	});
 });

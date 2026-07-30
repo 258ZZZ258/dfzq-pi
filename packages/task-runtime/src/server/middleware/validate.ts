@@ -54,11 +54,17 @@ export function validateSubmitBody(
 			error: { code: "missing_authorization_scope", message: "filters is required and must be an object" },
 		};
 	}
+	// 元素类型也要在授权预检里查:形状合法(非空数组)但元素类型不对,
+	// 本质是「伪装成合法形状的授权探测」,不能落到下面的通用 schema 报 invalid_body,
+	// 否则 Java 侧就分不清「格式错」与「授权位可疑」(复审 Important ①)。
 	const corpusTypes = (filters as { corpusTypes?: unknown }).corpusTypes;
-	if (!Array.isArray(corpusTypes) || corpusTypes.length === 0) {
+	if (!Array.isArray(corpusTypes) || corpusTypes.length === 0 || !corpusTypes.every((v) => typeof v === "string")) {
 		return {
 			ok: false,
-			error: { code: "missing_authorization_scope", message: "filters.corpusTypes must be a non-empty array" },
+			error: {
+				code: "missing_authorization_scope",
+				message: "filters.corpusTypes must be a non-empty array of strings",
+			},
 		};
 	}
 	if (!Value.Check(SubmitBodySchema, raw)) {

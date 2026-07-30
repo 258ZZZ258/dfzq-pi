@@ -52,6 +52,24 @@ describe("spec router", () => {
 		const router = await loadSpecRouter(dir);
 		expect(router.taskKinds()).toEqual(new Set(["one", "two"]));
 	});
+
+	it("throws when the directory has no .json files — misconfigured specs path must fail at assembly time, not at request time", async () => {
+		root = await mkdtemp(join(tmpdir(), "dfzq-specs-"));
+		const dir = join(root, "specs");
+		await mkdir(dir);
+		await writeFile(join(dir, "notes.txt"), "ignored");
+
+		await expect(loadSpecRouter(dir)).rejects.toThrow(new RegExp(dir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	});
+
+	it("throws with the offending filename when a spec file is invalid JSON", async () => {
+		root = await mkdtemp(join(tmpdir(), "dfzq-specs-"));
+		const dir = join(root, "specs");
+		await mkdir(dir);
+		await writeFile(join(dir, "broken.json"), "{ not json");
+
+		await expect(loadSpecRouter(dir)).rejects.toThrow(/broken\.json/);
+	});
 });
 
 describe("submit body validation", () => {
@@ -69,6 +87,16 @@ describe("submit body validation", () => {
 
 	it("rejects an empty corpusTypes with missing_authorization_scope", () => {
 		const out = validateSubmitBody(body({ filters: { corpusTypes: [] } }));
+		expect(out).toMatchObject({ ok: false, error: { code: "missing_authorization_scope" } });
+	});
+
+	it("rejects a corpusTypes with a non-string element as missing_authorization_scope, not invalid_body — a malformed element shape is disguised authorization probing", () => {
+		const out = validateSubmitBody(body({ filters: { corpusTypes: [123] } }));
+		expect(out).toMatchObject({ ok: false, error: { code: "missing_authorization_scope" } });
+	});
+
+	it("rejects a mixed-type corpusTypes as missing_authorization_scope too", () => {
+		const out = validateSubmitBody(body({ filters: { corpusTypes: ["internal", 42] } }));
 		expect(out).toMatchObject({ ok: false, error: { code: "missing_authorization_scope" } });
 	});
 

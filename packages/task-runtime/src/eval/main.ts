@@ -2,11 +2,75 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import type { McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { buildPrompt, loadPromptParts } from "./build-prompt.ts";
 import { DEFAULT_CASE_IDS, loadFormalCases, selectCases } from "./cases.ts";
+import { discoverTools } from "./discover-tools.ts";
 import { type CaseOutcome, judge, renderSummary, runCase } from "./drive.ts";
+import { evaluateProbe, judgeProbes, PROBES, type ProbeOutcome, renderProbeSummary } from "./limits-probe.ts";
 
 const TASK_TIMEOUT_MS = 900_000; // 对齐 eval_config.yaml 的 task_timeout_seconds: 900
+
+interface EvalSpec {
+	mcpServers?: McpServerSpec[];
+	limits?: Record<string, number>;
+	[key: string]: unknown;
+}
+
+interface RunProbesArgs {
+	/** 已把 mcpServers.args 解析成绝对路径的基线 spec;探针只借用它的 tools/mcpServers,limits 会被整体替换。 */
+	spec: EvalSpec;
+	evalRoot: string;
+	outDir: string;
+	profilePath: string;
+}
+
+/**
+ * 判据③:四类限额各触发一次且归类正确。
+ *
+ * 每个探针写一份独立临时 spec —— `limits` 字段用 probe.limits **整体替换**,不是合并进
+ * 基线的 `{ maxTurns: 16, runTimeoutMs: 900000 }`。合并的话基线限额会跟探针限额一起生效,
+ * 触发的可能是基线那一类而不是探针要测的那一类,判据③「归类正确」就失去意义。
+ */
+async function runProbes(args: RunProbesArgs): Promise<void> {
+	const all = await loadFormalCases(args.evalRoot);
+	const [probeCase] = selectCases(
+		all,
+		// PROBES 全部共用同一个 caseId(见 limits-probe.ts 的注释与测试断言),取第一个即可。
+		[PROBES[0].caseId],
+	);
+	const parts = await loadPromptParts(args.evalRoot);
+	const prompt = buildPrompt(probeCase, "precise", parts);
+	const limitsDir = join(args.outDir, "limits");
+
+	const outcomes: ProbeOutcome[] = [];
+	for (const probe of PROBES) {
+		process.stderr.write(`[eval] probe ${probe.id} (期望 ${probe.expect}) …\n`);
+		const probeSpec: EvalSpec = { ...args.spec, limits: { ...probe.limits } };
+		const probeSpecPath = join(limitsDir, `spec.${probe.id}.json`);
+		await mkdir(limitsDir, { recursive: true });
+		await writeFile(probeSpecPath, JSON.stringify(probeSpec, null, 2));
+
+		const outcome = await runCase({
+			evalCase: probeCase,
+			prompt,
+			evalRoot: args.evalRoot,
+			// 每个探针的 caseId 都是 L3-001,必须分目录跑,否则后一个探针的 outcome.json /
+			// trajectory 会覆盖前一个的。
+			outDir: join(limitsDir, probe.id),
+			specPath: probeSpecPath,
+			profilePath: args.profilePath,
+			timeoutMs: TASK_TIMEOUT_MS,
+		});
+		outcomes.push(evaluateProbe(probe, outcome.result?.status, outcome.result?.limit));
+	}
+
+	const verdict = judgeProbes(outcomes);
+	await writeFile(join(limitsDir, "summary.json"), `${JSON.stringify({ outcomes, verdict }, null, 2)}\n`);
+	await writeFile(join(limitsDir, "summary.md"), renderProbeSummary(outcomes));
+	process.stderr.write(`[eval] 判据③ ${verdict.pass ? "pass" : "FAIL"} —— ${verdict.detail}\n`);
+	if (!verdict.pass) process.exitCode = 2;
+}
 
 async function main(): Promise<void> {
 	const { values } = parseArgs({
@@ -17,26 +81,38 @@ async function main(): Promise<void> {
 			profile: { type: "string" },
 			cases: { type: "string" },
 			all: { type: "boolean" },
+			discover: { type: "boolean" },
+			probes: { type: "boolean" },
 		},
 	});
-	for (const key of ["eval-root", "out"] as const) {
-		if (!values[key]) throw new Error(`--${key} is required`);
-	}
+	if (!values["eval-root"]) throw new Error("--eval-root is required");
 	const evalRoot = resolve(values["eval-root"] as string);
-	const outDir = resolve(values.out as string);
 	const specSource = resolve(values.spec ?? "packages/task-runtime/specs/blackbox-eval.json");
 	const profilePath = resolve(values.profile ?? "packages/task-runtime/profiles/deepseek-cloud.json");
 
-	await mkdir(outDir, { recursive: true });
-
 	// spec 里的 mcpServers.args 存的是相对 eval-root 的片段(提交进版本库的文件不能带本机绝对路径),
-	// 这里解析成绝对路径后写一份临时 spec 给 CLI。
-	const spec = JSON.parse(await readFile(specSource, "utf8")) as {
-		mcpServers?: Array<{ id: string; command: string; args: string[]; env: Record<string, string> }>;
-	};
+	// 这里解析成绝对路径后写一份临时 spec 给 CLI。--discover / --probes 也共用这份解析结果。
+	const spec = JSON.parse(await readFile(specSource, "utf8")) as EvalSpec;
 	for (const server of spec.mcpServers ?? []) {
 		server.args = server.args.map((arg) => (arg.startsWith("/") ? arg : join(evalRoot, arg)));
 	}
+
+	if (values.discover) {
+		// 只做 initialize + tools/list,不跑用例、不调模型 —— 换 fixture 时用来核对工具名单。
+		const discovered = await discoverTools(spec.mcpServers ?? []);
+		process.stdout.write(`${JSON.stringify(discovered, null, 2)}\n`);
+		return;
+	}
+
+	if (!values.out) throw new Error("--out is required");
+	const outDir = resolve(values.out as string);
+	await mkdir(outDir, { recursive: true });
+
+	if (values.probes) {
+		await runProbes({ spec, evalRoot, outDir, profilePath });
+		return;
+	}
+
 	const specPath = join(outDir, "spec.resolved.json");
 	await writeFile(specPath, JSON.stringify(spec, null, 2));
 

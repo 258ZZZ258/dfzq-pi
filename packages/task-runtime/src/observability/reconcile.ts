@@ -12,17 +12,35 @@ export interface ReconcileReport {
 	orderMismatch: boolean;
 }
 
-/** 多 server 同名时 adapter 会加 "<serverId>__" 前缀,对账时剥掉。 */
-function stripServerPrefix(name: string): string {
+/**
+ * 多 server 同名时 adapter 会加 "<serverId>__" 前缀。
+ * 只在前缀真正匹配某个已知 server id 时才剥离,防止误剔真实工具名里的 "__"。
+ * 不传 knownServerIds 时不做任何剥离。
+ */
+function stripServerPrefix(name: string, knownServerIds?: string[]): string {
+	if (!knownServerIds || knownServerIds.length === 0) {
+		return name;
+	}
 	const index = name.indexOf("__");
-	return index >= 0 ? name.slice(index + 2) : name;
+	if (index < 0) return name;
+	const prefix = name.slice(0, index);
+	return knownServerIds.includes(prefix) ? name.slice(index + 2) : name;
 }
 
-export async function reconcile(trajectoryPath: string, toolLogPath: string): Promise<ReconcileReport> {
+export async function reconcile(
+	trajectoryPath: string,
+	toolLogPath: string,
+	knownServerIds?: string[],
+): Promise<ReconcileReport> {
 	const events = await readTrajectory(trajectoryPath);
 	const piCalls = events
 		.filter((event) => event.type === "tool_execution_end")
-		.map((event) => stripServerPrefix(String((event.payload as { toolName?: string }).toolName ?? "")));
+		.map((event) => {
+			const payload = event.payload;
+			if (typeof payload !== "object" || payload === null) return "";
+			const toolName = String((payload as { toolName?: string }).toolName ?? "");
+			return stripServerPrefix(toolName, knownServerIds);
+		});
 
 	const raw = await readFile(toolLogPath, "utf8");
 	const mcpCalls = raw

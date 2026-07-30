@@ -65,11 +65,28 @@ describe("reconcile", () => {
 		expect(report.ok).toBe(false);
 		expect(report.orderMismatch).toBe(true);
 		expect(report.missingInMcp).toEqual([]);
+		expect(report.missingInPi).toEqual([]);
 	});
 
 	it("strips the server prefix pi adds on name collisions", async () => {
 		const { trajectory, toolLog } = await fixture(["policy__search"], ["search"]);
+		const report = await reconcile(trajectory, toolLog, ["policy"]);
+		expect(report.ok).toBe(true);
+	});
+
+	it("does not strip prefix if tool name truly contains __ and server id is not recognized", async () => {
+		const { trajectory, toolLog } = await fixture(["a__b"], ["a__b"]);
 		const report = await reconcile(trajectory, toolLog);
 		expect(report.ok).toBe(true);
+		expect(report.missingInMcp).toEqual([]);
+		expect(report.missingInPi).toEqual([]);
+	});
+
+	it("preserves tool name with __ when server id is not in known list", async () => {
+		const { trajectory, toolLog } = await fixture(["policy__search"], ["policy__search"]);
+		const report = await reconcile(trajectory, toolLog, ["other"]);
+		expect(report.ok).toBe(true);
+		expect(report.missingInMcp).toEqual([]);
+		expect(report.missingInPi).toEqual([]);
 	});
 });

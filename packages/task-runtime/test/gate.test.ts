@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Gate, isRejection } from "../src/server/gate.ts";
+import { Gate, isAdmissionRejected, isRejection } from "../src/server/gate.ts";
 
 describe("gate", () => {
 	it("admits a run and reports it active", async () => {
@@ -85,5 +85,84 @@ describe("gate", () => {
 		queued.release(); // s2 让出槽位,s3 才能被放行
 		const retry = await retryPromise;
 		expect(isRejection(retry)).toBe(false);
+	});
+
+	// 设计裁定追加用例①:tryAcquire 必须同步区分 admitted / session_busy / queue_full / queued 四支,
+	// 且 queue_full 分支要归还会话位,queued 分支要在持票者 release 后 resolve 成可用 ticket。
+	it("tryAcquire synchronously distinguishes admitted, session_busy, queue_full, and queued", async () => {
+		const gate = new Gate({ maxConcurrent: 1, maxQueueDepth: 1 });
+
+		// 有空位 → admitted
+		const admission1 = gate.tryAcquire("s1");
+		expect(admission1.kind).toBe("admitted");
+		expect(isAdmissionRejected(admission1)).toBe(false);
+		if (admission1.kind !== "admitted") throw new Error("unexpected");
+		expect(gate.activeCount).toBe(1);
+
+		// 同会话 → session_busy(同步返回,不进队列)
+		const busy = gate.tryAcquire("s1");
+		expect(busy).toEqual({ kind: "session_busy" });
+		expect(isAdmissionRejected(busy)).toBe(true);
+
+		// 无空位但队未满 → queued
+		const admission2 = gate.tryAcquire("s2");
+		expect(admission2.kind).toBe("queued");
+		if (admission2.kind !== "queued") throw new Error("unexpected");
+		expect(gate.queueDepth).toBe(1);
+
+		// 队满 → queue_full,且刚占上的会话位被归还
+		const full = gate.tryAcquire("s3");
+		expect(full).toEqual({ kind: "queue_full", retryAfterSeconds: 5 });
+		expect(isAdmissionRejected(full)).toBe(true);
+
+		// s1 释放后,s2 排队中的 promise 应该 resolve 成可用 ticket
+		admission1.ticket.release();
+		const s2Ticket = await admission2.ticket;
+		expect(typeof s2Ticket.release).toBe("function");
+
+		// s3 的会话位已在 queue_full 时被归还,此时重新 tryAcquire 应该能排上队,
+		// 而不是再次被误判为 session_busy。
+		const retry = gate.tryAcquire("s3");
+		expect(retry.kind).toBe("queued");
+	});
+
+	// 设计裁定追加用例②(审查提的 Minor):两级等待链上 activeCount 必须全程恒为 1,
+	// 不能在 handoff 分支里被误加 this.active--(那样会让计数在两个持票者交接的瞬间跌到 0,
+	// 即便实际上一直有一个 ticket 处于占用状态)。同时验证 B、C 拿到的是各自独立的 ticket。
+	it("keeps activeCount pinned at 1 through a two-level handoff chain", async () => {
+		const gate = new Gate({ maxConcurrent: 1, maxQueueDepth: 4 });
+
+		const a = await gate.acquire("a");
+		if (isRejection(a)) throw new Error("unexpected rejection");
+		expect(gate.activeCount).toBe(1);
+
+		const bPromise = gate.acquire("b");
+		await Promise.resolve();
+		expect(gate.queueDepth).toBe(1);
+
+		const cPromise = gate.acquire("c");
+		await Promise.resolve();
+		expect(gate.queueDepth).toBe(2);
+
+		// A 释放 → B 从队列被放行。全程 active 应该恒为 1,从未跌到 0。
+		a.release();
+		const b = await bPromise;
+		if (isRejection(b)) throw new Error("unexpected rejection");
+		expect(gate.activeCount).toBe(1);
+		expect(gate.queueDepth).toBe(1);
+
+		// B 释放 → C 从队列被放行。同样,active 应该恒为 1。
+		b.release();
+		const c = await cPromise;
+		if (isRejection(c)) throw new Error("unexpected rejection");
+		expect(gate.activeCount).toBe(1);
+		expect(gate.queueDepth).toBe(0);
+
+		// B 与 C 是各自独立的 ticket:B 上的重复 release 是 no-op,不影响 C。
+		b.release();
+		expect(gate.activeCount).toBe(1);
+
+		c.release();
+		expect(gate.activeCount).toBe(0);
 	});
 });

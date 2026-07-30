@@ -40,6 +40,10 @@ async function main(): Promise<void> {
 	const specPath = join(outDir, "spec.resolved.json");
 	await writeFile(specPath, JSON.stringify(spec, null, 2));
 
+	// 摘要措辞跟着实际调用方式走(见 drive.ts 的 CaseSelection):传了 --all 就是「15 题全集」,
+	// 传了 --cases 就是「自定义」,两者都没传才是默认的 5 题子集。判断依据是「传了哪个 flag」,
+	// 不是「结果凑巧等于哪个集合」——否则自定义参数刚好传出默认 5 题时,措辞会认错范围。
+	const mode: "default" | "all" | "custom" = values.all ? "all" : values.cases ? "custom" : "default";
 	const all = await loadFormalCases(evalRoot);
 	const ids = values.all ? all.map((c) => c.id) : (values.cases?.split(",").map((s) => s.trim()) ?? DEFAULT_CASE_IDS);
 	const cases = selectCases(all, ids);
@@ -64,7 +68,7 @@ async function main(): Promise<void> {
 
 	const verdict = judge(outcomes);
 	await writeFile(join(outDir, "summary.json"), `${JSON.stringify({ outcomes, verdict }, null, 2)}\n`);
-	await writeFile(join(outDir, "summary.md"), renderSummary(outcomes, verdict));
+	await writeFile(join(outDir, "summary.md"), renderSummary(outcomes, verdict, { mode }));
 	process.stderr.write(
 		`[eval] 判据① ${verdict.criterion1.pass ? "pass" : "FAIL"} / 判据② ${verdict.criterion2.pass ? "pass" : "FAIL"}\n`,
 	);

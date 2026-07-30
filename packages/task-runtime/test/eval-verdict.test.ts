@@ -97,3 +97,64 @@ describe("renderSummary", () => {
 		expect(text).toContain("3");
 	});
 });
+
+describe("judge — empty outcomes must not fabricate a pass", () => {
+	// outcomes=[] 时,filter().length===0 在两个判据里都会真空成立 —— 这跟 vacuous
+	// 是同一类陷阱,只是发生在「用例数」这一层。必须显式挡住,不能靠 filter 的真空语义兜底。
+	it("fails both criteria when no case ran at all, and says so without claiming a pass", () => {
+		const verdict = judge([]);
+		expect(verdict.criterion1.pass).toBe(false);
+		expect(verdict.criterion1.detail).not.toContain("通过");
+		expect(verdict.criterion2.pass).toBe(false);
+		expect(verdict.criterion2.detail).not.toContain("通过");
+	});
+});
+
+describe("renderSummary — scope note follows the actual selection mode", () => {
+	it("default mode keeps the family-coverage note (accurate for the 5-case subset)", () => {
+		const outcomes = [outcome("L1-001")];
+		const text = renderSummary(outcomes, judge(outcomes), { mode: "default" });
+		expect(text).toContain("族内差异未覆盖");
+	});
+
+	it("all mode drops the family-coverage note and states the full 15-case scope", () => {
+		const outcomes = [outcome("L1-001")];
+		const text = renderSummary(outcomes, judge(outcomes), { mode: "all" });
+		expect(text).not.toContain("族内差异未覆盖");
+		expect(text).toContain("15 题");
+		expect(text).toContain("判据①(15 题全集全部 completed)");
+	});
+
+	it("custom mode drops the family-coverage note and claims no family property either way", () => {
+		const outcomes = [outcome("L1-001")];
+		const text = renderSummary(outcomes, judge(outcomes), { mode: "custom" });
+		expect(text).not.toContain("族内差异未覆盖");
+		expect(text).not.toContain("5 族全覆盖");
+		expect(text).toContain("自定义");
+	});
+});
+
+describe("renderSummary — never states a bare 判据①/判据② pass claim", () => {
+	// 现有的正向断言只能挡住「把标签本身改错」,挡不住「别处新增一句裸的通过表述」
+	// (例如「结论:S0 判据①②均已通过」)。这里补否定式断言:全文任何地方出现
+	// 「判据①」/「判据②」,后面都必须紧跟限定括号「(」,否则就是裸断言,判违规。
+	function expectNoBarePassClaim(text: string): void {
+		expect(text).not.toMatch(/判据①(?!\()/);
+		expect(text).not.toMatch(/判据②(?!\()/);
+	}
+
+	it("default mode", () => {
+		const outcomes = [outcome("L1-001")];
+		expectNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "default" }));
+	});
+
+	it("all mode", () => {
+		const outcomes = [outcome("L1-001")];
+		expectNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "all" }));
+	});
+
+	it("custom mode", () => {
+		const outcomes = [outcome("L1-001")];
+		expectNoBarePassClaim(renderSummary(outcomes, judge(outcomes), { mode: "custom" }));
+	});
+});

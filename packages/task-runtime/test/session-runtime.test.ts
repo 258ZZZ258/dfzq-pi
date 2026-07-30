@@ -181,6 +181,65 @@ describe("SessionRuntime", () => {
 	});
 });
 
+describe("SessionRuntime - subscriber fan-out isolation", () => {
+	// Regression lock (final fix round, finding 3): the fan-out loop ran listeners bare inside
+	// pi's AgentSession._emit, which has no try/catch either -- so any throwing subscriber
+	// unwound through the agent loop and broke the run. trajectory.ts's JSON.stringify(event)
+	// is enough to trigger it on a cyclic payload.
+	it("keeps delivering to the other listeners and completes the run when one listener throws", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		cleanups.push(async () => {
+			errorSpy.mockRestore();
+		});
+
+		const runtime = await build({ maxTurns: 5 }, [fauxAssistantMessage("done")]);
+		const before: string[] = [];
+		const after: string[] = [];
+		let throwCount = 0;
+
+		// Registered between two healthy listeners so the assertion covers both "listeners
+		// added before the bad one still ran" and "fan-out did not stop at the bad one".
+		runtime.subscribe((event) => before.push(event.type));
+		runtime.subscribe(() => {
+			throwCount += 1;
+			throw new Error("subscriber boom");
+		});
+		runtime.subscribe((event) => after.push(event.type));
+
+		const result = await runtime.run("hello");
+
+		expect(result.status).toBe("completed");
+		expect(result.output).toContain("done");
+		expect(throwCount).toBeGreaterThan(0);
+		expect(before.length).toBe(throwCount);
+		expect(after).toEqual(before);
+		expect(errorSpy).toHaveBeenCalled();
+	});
+
+	// The in-tree case that motivated this: a cyclic payload makes trajectory.ts's
+	// JSON.stringify throw. Reproduce the shape directly against subscribe().
+	it("survives a listener that throws on JSON.stringify of a cyclic structure", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		cleanups.push(async () => {
+			errorSpy.mockRestore();
+		});
+
+		const runtime = await build({ maxTurns: 5 }, [fauxAssistantMessage("done")]);
+		const cyclic: { self?: unknown } = {};
+		cyclic.self = cyclic;
+		const survivor: string[] = [];
+
+		runtime.subscribe(() => {
+			JSON.stringify(cyclic);
+		});
+		runtime.subscribe((event) => survivor.push(event.type));
+
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("completed");
+		expect(survivor.length).toBeGreaterThan(0);
+	});
+});
+
 describe("SessionRuntime - shared PluginRegistry", () => {
 	// Regression lock (final fix round, finding 1): createSessionRuntime() used to register
 	// the per-run limits descriptor into the caller's PluginRegistry. That made a shared

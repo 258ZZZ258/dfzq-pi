@@ -68,7 +68,23 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 			type: event.type,
 			payload: event,
 		};
-		for (const listener of listeners) listener(enveloped);
+		// This fan-out runs synchronously inside pi's AgentSession._emit (agent-session.ts),
+		// which has no try/catch of its own -- an uncaught throw from any listener would
+		// unwind straight through the agent loop and kill the in-flight run. subscribe() is
+		// a public contract and the entry point for S2's event pipeline, so a single bad
+		// consumer must not be able to take the session down (the first in-tree consumer,
+		// trajectory.ts, already calls JSON.stringify(event), which throws on a cyclic
+		// payload). Log and keep fanning out to the remaining listeners.
+		for (const listener of listeners) {
+			try {
+				listener(enveloped);
+			} catch (error) {
+				console.error(
+					`[SessionRuntime] event subscriber threw for spec "${specId}" event "${enveloped.type}"; continuing fan-out`,
+					error,
+				);
+			}
+		}
 	});
 
 	async function run(input: string, opts?: RunOptions): Promise<RunResult> {

@@ -42,3 +42,6 @@ plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
 collect.sh
+
+# dfzq 开发文档(含客户信息与内网架构决策,不进版本库)
+dfzq-pi开发任务/

@@ -1,5 +1,6 @@
 import { PluginRegistry } from "./plugin-registry.ts";
 import { limitsDescriptor } from "./plugins/limits.ts";
+import { pathGuardDescriptor } from "./plugins/path-guard.ts";
 import { resultBudgetDescriptor } from "./plugins/result-budget.ts";
 import { type AssessFn, createSufficiencyGateDescriptor } from "./plugins/sufficiency-gate.ts";
 
@@ -20,6 +21,7 @@ export function createDefaultPluginRegistry(deps: DefaultPluginDeps = {}): Plugi
 	const registry = new PluginRegistry();
 	registry.register(limitsDescriptor);
 	registry.register(resultBudgetDescriptor);
+	registry.register(pathGuardDescriptor);
 	if (deps.assess) registry.register(createSufficiencyGateDescriptor(deps.assess));
 	return registry;
 }

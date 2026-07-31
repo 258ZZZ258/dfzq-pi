@@ -402,7 +402,7 @@ describe("assemble - implicit limits plugin", () => {
 		cleanups.push(second.dispose);
 
 		// 进程级表没被写脏:两次装配都只 lookup,没有任何 per-run 东西 register 进去。
-		expect([...shared.names()]).toEqual(["limits", "result-budget"]);
+		expect([...shared.names()]).toEqual(["limits", "result-budget", "path-guard"]);
 
 		// 只驱动第一个 session,第二个的 LimitState 必须纹丝不动。
 		await first.session.prompt("hi");

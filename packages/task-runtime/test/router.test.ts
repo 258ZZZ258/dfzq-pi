@@ -100,6 +100,11 @@ describe("submit body validation", () => {
 		expect(out).toMatchObject({ ok: false, error: { code: "missing_authorization_scope" } });
 	});
 
+	it("rejects an empty-string element in corpusTypes as missing_authorization_scope — a formally non-empty array that matches no real corpusType is still a bypass attempt", () => {
+		const out = validateSubmitBody(body({ filters: { corpusTypes: [""] } }));
+		expect(out).toMatchObject({ ok: false, error: { code: "missing_authorization_scope" } });
+	});
+
 	it("rejects a missing clientRequestId", () => {
 		const raw = body();
 		delete raw.clientRequestId;

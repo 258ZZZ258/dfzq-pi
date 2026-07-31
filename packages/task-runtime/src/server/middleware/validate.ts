@@ -58,7 +58,14 @@ export function validateSubmitBody(
 	// 本质是「伪装成合法形状的授权探测」,不能落到下面的通用 schema 报 invalid_body,
 	// 否则 Java 侧就分不清「格式错」与「授权位可疑」(复审 Important ①)。
 	const corpusTypes = (filters as { corpusTypes?: unknown }).corpusTypes;
-	if (!Array.isArray(corpusTypes) || corpusTypes.length === 0 || !corpusTypes.every((v) => typeof v === "string")) {
+	// 元素还要求非空字符串:空串放行会让 corpusTypes: [""] 混进「形状合法」的分支,而设计
+	// 文档写的是「绝不默认放行」——这里必须留在授权预检里判(不能挪去给 schema 加
+	// minLength,那会让报错退回 invalid_body,把「授权位要用专有 code」的修复撞回去)。
+	if (
+		!Array.isArray(corpusTypes) ||
+		corpusTypes.length === 0 ||
+		!corpusTypes.every((v) => typeof v === "string" && v.length > 0)
+	) {
 		return {
 			ok: false,
 			error: {

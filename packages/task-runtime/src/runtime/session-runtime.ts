@@ -80,10 +80,18 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		//
 		// 这圈保证的是「**不是我们这行**打死 agent loop」,不是「这种输入不会失败」——
 		// 两者的差别正是那条测试的 fixture 要拿捏的地方,getter **只抛第一次**:我们的
-		// subscriber 比 pi 先读到 details,第一次读由这圈吃掉;pi 后来那次读拿到正常值
-		// (agent-loop.ts 的 `details: finalized.result.details` 只是引用读,并不枚举自有属性),
-		// 于是 run 照常跑完。换成恒抛的 getter 就没有判别性了 —— 那种输入无论有没有这圈都以
-		// error 收场,因为下游总有人会再读一次。
+		// subscriber 比 pi 先读到 details,第一次读由这圈吃掉。
+		//
+		// pi 后来那次读之所以安全,靠的是**时序**而不是"pi 不枚举 details":pi 会在组装下一轮
+		// context 时用 structuredClone 深拷贝整个消息历史(含这个 details),那确实会枚举到同一个
+		// getter —— 出处是 ExtensionRunner.emitContext(coding-agent/src/core/extensions/runner.ts:981),
+		// 经 sdk.ts:353 transformContext ← agent-loop.ts:291 streamAssistantResponse。但它必然发生在
+		// 本轮 tool_execution_end **之后**(下一轮 context 组装前必须先把本轮工具结果记入消息历史),
+		// 所以轮到 pi 读时 one-shot 已经用掉了。正常态实测 getter 被读 2 次,两次的调用栈正是上面
+		// 这两条路径。
+		//
+		// 换成恒抛的 getter 就没有判别性了 —— 那种输入无论有没有这圈都以 error 收场,因为上面那次
+		// structuredClone 照样会撞上它。
 		if (event.type === "tool_execution_end") {
 			try {
 				collectClauseIds((event as { result?: unknown }).result, clauseIds);

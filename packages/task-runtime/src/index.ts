@@ -15,6 +15,7 @@ export type {
 	RuntimeSnapshot,
 	RunUsage,
 } from "./runtime/contract.ts";
+export { createDefaultPluginRegistry, type DefaultPluginDeps } from "./runtime/default-plugins.ts";
 export { PluginRegistry } from "./runtime/plugin-registry.ts";
 export { createSessionRuntime } from "./runtime/session-runtime.ts";
 export { type AppOptions, createApp } from "./server/app.ts";

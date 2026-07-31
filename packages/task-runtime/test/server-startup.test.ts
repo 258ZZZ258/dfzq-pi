@@ -3,7 +3,7 @@ import { createServer, Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { startServer } from "../src/server/main.ts";
+import { createDefaultRuntimeFactory, startServer } from "../src/server/main.ts";
 import * as sqliteModule from "../src/store/sqlite.ts";
 import { createSqliteRunStore } from "../src/store/sqlite.ts";
 import { createStubRuntime, type StubRuntime } from "./helpers/stub-runtime.ts";
@@ -202,6 +202,53 @@ describe("server startup", () => {
 		},
 		CASE_TIMEOUT_MS,
 	);
+});
+
+// 审查 Minor-c 的回归锁:outputContract.schema 此前放在 createDefaultRuntimeFactory 返回的
+// 工厂函数体内、每次 run 才读一次 —— 坏 schema(缺失/损坏)要拖到第一次真实请求才暴露。
+// 挪到构造期的 for 循环里、与 spec 一起预读之后,坏 schema 必须在 createDefaultRuntimeFactory()
+// 本身就响亮失败,不必等 runtimeFactory 被调用过一次。
+describe("createDefaultRuntimeFactory - outputContract schema reading (Minor-c)", () => {
+	it("fails at construction time when outputContract.schema is missing, not on the first run", async () => {
+		const specsDir = join(root, "specs");
+		await writeFile(
+			join(specsDir, "with-contract.json"),
+			JSON.stringify({
+				id: "with-contract",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				outputContract: { schema: "missing.schema.json" },
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(
+			profilePath,
+			JSON.stringify({
+				id: "p",
+				baseUrl: "http://127.0.0.1:1",
+				apiKeyEnv: "X",
+				api: "openai-completions",
+				roles: {
+					main: {
+						provider: "p",
+						modelId: "m",
+						contextWindow: 1000,
+						maxTokens: 100,
+						reasoning: false,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					},
+				},
+			}),
+		);
+		// 这里必须是 createDefaultRuntimeFactory() 这次 await 本身 reject —— 如果 schema 读取
+		// 还留在返回的工厂函数体内,这个断言会通过(construction 不抛),而是要等真的调用
+		// 工厂函数才会抛,那样就没锁住"构造期"这个时点。
+		await expect(
+			createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir }),
+		).rejects.toThrow(/ENOENT|no such file or directory/);
+	});
 });
 
 // 以下用例来自评审对 main.ts 的复审(Critical + Important),补在 brief 逐字采用的

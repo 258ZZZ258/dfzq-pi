@@ -51,4 +51,14 @@ export function validateSpec(spec: RuntimeSpec, ctx: ValidateContext): void {
 			throw new Error(`RuntimeSpec "${spec.id}": plugin "${name}" is not registered`);
 		}
 	}
+
+	if (spec.outputContract !== undefined) {
+		if (typeof spec.outputContract.schema !== "string" || spec.outputContract.schema.length === 0) {
+			throw new Error(`RuntimeSpec "${spec.id}": outputContract.schema must be a non-empty path`);
+		}
+		const attempts = spec.outputContract.maxRepairAttempts;
+		if (attempts !== undefined && (!Number.isInteger(attempts) || attempts < 0)) {
+			throw new Error(`RuntimeSpec "${spec.id}": outputContract.maxRepairAttempts must be a non-negative integer`);
+		}
+	}
 }

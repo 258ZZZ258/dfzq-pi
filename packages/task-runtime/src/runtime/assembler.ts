@@ -9,10 +9,11 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { type ProviderProfile, profileRoles, requireApiKey, resolveRole } from "../env/provider-profile.ts";
-import type { PluginRef, RuntimeSpec } from "../spec/types.ts";
+import { type PluginRef, pluginName, type RuntimeSpec } from "../spec/types.ts";
 import { validateSpec } from "../spec/validate.ts";
 import type { ToolsetRegistry } from "../toolsets/registry.ts";
-import { instantiatePlugins, type PluginDescriptor, type PluginEntry, type PluginRegistry } from "./plugin-registry.ts";
+import { instantiatePlugins, type PluginContext, type PluginEntry, type PluginRegistry } from "./plugin-registry.ts";
+import { LIMITS_PLUGIN_NAME, type LimitsOptions } from "./plugins/limits.ts";
 
 export interface AssembleOptions {
 	spec: RuntimeSpec;
@@ -21,16 +22,8 @@ export interface AssembleOptions {
 	toolsets: ToolsetRegistry;
 	cwd: string;
 	agentDir: string;
-	/**
-	 * 本层注入的 per-run 内置插件(limits / 将来的 observability),先于 spec 声明的插件挂载。
-	 *
-	 * 收的是 **PluginDescriptor 实例**而不是插件名:这些描述符的闭包捕获了本次 run 的状态
-	 * (LimitState、本次 session 的 abort 句柄),按名字走 `registry` 就等于把 per-run 状态
-	 * 写进进程级的 PluginRegistry —— 同一个 registry 第二次 assemble 会直接撞
-	 * "already registered",并发两次则互相串状态。见 plugin-registry.ts 的类注释。
-	 * 它们与 spec 声明的插件共用同一次替换型 hook 冲突校验(instantiatePlugins)。
-	 */
-	builtinPlugins?: readonly PluginDescriptor[];
+	/** 本次装配的 per-run 上下文,透传给每个插件工厂。 */
+	pluginContext: PluginContext;
 	/** 测试缝:绕过 ProviderProfile,直接用已注册的 faux 模型 */
 	modelOverride?: {
 		modelRuntime: ModelRuntime;
@@ -95,9 +88,6 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			);
 		}
 
-		// spec 声明的插件是进程级的,照旧走 registry 解析;per-run 的内置插件由调用方直接
-		// 给实例。两边拼成一张表后交给 instantiatePlugins() 做**一次**冲突校验,这样绕过
-		// registry 的内置插件也照样受替换型 hook 保护。
 		const specPluginRefs: PluginRef[] = [
 			...(spec.contextStrategy ? [spec.contextStrategy] : []),
 			...(spec.stopPolicy ? [spec.stopPolicy] : []),
@@ -105,11 +95,31 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			...(spec.approvalPolicy ? [spec.approvalPolicy] : []),
 			...(spec.extraPlugins ?? []),
 		];
-		const pluginEntries: PluginEntry[] = [
-			...(options.builtinPlugins ?? []).map((descriptor) => ({ descriptor })),
-			...registry.lookupAll(specPluginRefs),
-		];
-		const extensionFactories = instantiatePlugins(pluginEntries);
+		// limits 现在是 registry 里一个**可解析的名字**,于是 `extraPlugins: ["limits"]` 之类
+		// 的声明能通过 validateSpec(它只查 knownPlugins),再被下面的 lookupAll 解析成第二个
+		// 条目。turn_end 是观察型 hook,替换型冲突校验不拦它 —— 两个实例共享同一个
+		// ctx.limitState、各自 `state.turns += 1`,于是 maxTurns:5 在第 3 个真实回合就触发。
+		// 这是限额子系统自身的静默错判,必须在装配期响亮拒绝。
+		// **不做静默去重**:悄悄丢掉重复项会让写错 spec 的人永远不知道自己写错了。
+		const duplicateLimits = specPluginRefs.find((ref) => pluginName(ref) === LIMITS_PLUGIN_NAME);
+		if (duplicateLimits) {
+			throw new Error(
+				`RuntimeSpec "${spec.id}": "${LIMITS_PLUGIN_NAME}" is mounted implicitly from spec.limits ` +
+					`and must not be declared as a plugin ref`,
+			);
+		}
+
+		// limits 由 spec.limits 字段驱动,不是 spec 声明的 PluginRef,所以在这里无条件
+		// 挂上。它和 spec 声明的插件走同一张表、同一次冲突校验 —— 不存在"内置插件绕过
+		// 替换型 hook 保护"的缝。
+		// registry 里没有 limits 会在这里直接抛 `plugin "limits" is not registered`。
+		// 这是刻意的:唯一合法的 registry 来源是 createDefaultPluginRegistry()。
+		// (validateSpec 看不到这个隐式 ref,所以报错点是 lookupAll 而不是 validateSpec。)
+		const pluginEntries: PluginEntry[] = registry.lookupAll([
+			{ name: LIMITS_PLUGIN_NAME, options: { limits: spec.limits } satisfies LimitsOptions },
+			...specPluginRefs,
+		]);
+		const extensionFactories = instantiatePlugins(pluginEntries, options.pluginContext);
 
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,

@@ -1,9 +1,9 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { type ServerType, serve } from "@hono/node-server";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
-import { PluginRegistry } from "../runtime/plugin-registry.ts";
+import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
 import { createSqliteRunStore } from "../store/sqlite.ts";
@@ -139,32 +139,34 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 	const profile = JSON.parse(await readFile(options.profilePath, "utf8")) as ProviderProfile;
 	// spec 文件重读一次:SpecRouter 只持有 RuntimeSpec,mcpServers 不在该类型上。
 	const specFiles = new Map<string, SpecFile>();
+	// C6(输出契约判官)需要的 schema 文件:与 profile / spec 同一条纪律,构造期读一次、
+	// 跨 run 复用,不放进下面返回的工厂函数体内每次 run 重读重 parse。
+	// 审查 Minor-c:挪到这里之前,schema 文件缺失/损坏要拖到第一次真实请求才暴露,
+	// 而且失败信息 obscure(typebox 在 Value.Check 里报 "Cannot use 'in' operator to
+	// search for 'type' in null" 这类无法一眼看出病因的错误)。挪到构造期后,坏 schema
+	// 在 startServer() 装配阶段就响亮失败,不必等到请求进来。
+	const outputContractSchemas = new Map<string, unknown>();
 	for (const name of (await readdir(options.specsDir)).filter((n) => n.endsWith(".json"))) {
 		const parsed = JSON.parse(await readFile(join(options.specsDir, name), "utf8")) as SpecFile;
 		specFiles.set(parsed.id, parsed);
+		if (parsed.outputContract !== undefined) {
+			outputContractSchemas.set(
+				parsed.id,
+				JSON.parse(await readFile(resolve(options.specsDir, parsed.outputContract.schema), "utf8")),
+			);
+		}
 	}
+
+	// ToolsetRegistry **必须**按 run 新建(见 toolsets/registry.ts 的类注释):
+	// 下面的 register(spec.toolset, ...) 每次 run 都会调一次,复用同一实例会撞
+	// `Toolset "X" is already registered`。PluginRegistry 相反 —— 它是进程级的,
+	// 所以在本工厂外面建一次、跨 run 复用。
+	const plugins = createDefaultPluginRegistry();
 
 	return async ({ specId, sessionId }) => {
 		const spec = specFiles.get(specId);
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
-		// ToolsetRegistry **必须**按 run 新建:下面 toolsets.register(spec.toolset, ...) 在
-		// 本闭包里每次 run 都会重新调用一次。若跨 run 复用同一个 ToolsetRegistry 实例,第二次
-		// run 再 register 同一个 spec.toolset id 会直接撞 `Toolset "X" is already registered`
-		// (见 toolsets/registry.ts 的类注释)。
-		//
-		// PluginRegistry 按 run 新建则是**当前无实际影响的保守做法**,不要和上面那条理由混为
-		// 一谈:limits 描述符是作为*实例*直接传给 assemble({ builtinPlugins }) 的(见
-		// session-runtime.ts),从不经过 registry.register() ——本工厂也从未往这个
-		// PluginRegistry 里 register 过任何东西,所以它在这条路径上永远是空表,复用与否对
-		// limits 毫无影响。
-		//
-		// TODO(继承自 cli/main.ts 的既有模式,非本任务引入):正因为这个 PluginRegistry 从不被
-		// 填充,任何声明了 contextStrategy / stopPolicy / resultPolicy / approvalPolicy /
-		// extraPlugins 的 spec,经这里装配时会在 assemble() 内部的 validateSpec 阶段报
-		// `plugin "..." is not registered`。当前 fixture 都没用到这些字段,这个缺口处于休眠
-		// 状态,但第一次真实使用命名插件时必现——需要在 createDefaultRuntimeFactory(或其
-		// DefaultFactoryOptions)里补一个"进程级插件描述符从哪来"的装配入口。
 		const toolsets = new ToolsetRegistry();
 		toolsets.register(spec.toolset, createMcpToolset(spec.mcpServers ?? []));
 
@@ -172,10 +174,11 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		return createSessionRuntime({
 			spec,
 			profile,
-			registry: new PluginRegistry(),
+			registry: plugins,
 			toolsets,
 			cwd: join(workdir, "workspace"),
 			agentDir: join(workdir, "agent"),
+			outputContractSchema: outputContractSchemas.get(specId),
 		});
 	};
 }

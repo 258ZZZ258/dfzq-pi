@@ -7,6 +7,17 @@ export type RunStatus = "completed" | "aborted" | "limit_exceeded" | "error";
 
 export type LimitKind = "maxTurns" | "runTimeout" | "maxTotalTokens" | "maxCostUsd";
 
+/**
+ * 本 run 的限额状态。SessionRuntime 拥有它(run() 开头重置、runTimeoutMs 的 timer 写
+ * tripped、归一化 RunResult 时读),limits 插件是另一个写方。放在 contract.ts 而不是
+ * plugins/limits.ts:plugin-registry.ts 的 PluginContext 要引用它,而 registry 是通用
+ * 设施,不该反向依赖某个具体插件。
+ */
+export interface LimitState {
+	turns: number;
+	tripped?: LimitKind;
+}
+
 export interface RunUsage {
 	input: number;
 	output: number;

@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
-import { PluginRegistry } from "../src/runtime/plugin-registry.ts";
+import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import { createSessionRuntime } from "../src/runtime/session-runtime.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
@@ -68,7 +68,7 @@ describe("concurrent runtimes", () => {
 		const runtimeA = await createSessionRuntime({
 			spec: spec("alpha", "You are ALPHA."),
 			profile: profileFor("faux"),
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: a.cwd,
 			agentDir: a.agentDir,
@@ -77,7 +77,7 @@ describe("concurrent runtimes", () => {
 		const runtimeB = await createSessionRuntime({
 			spec: spec("beta", "You are BETA."),
 			profile: profileFor("faux"),
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: b.cwd,
 			agentDir: b.agentDir,
@@ -110,7 +110,7 @@ describe("concurrent runtimes", () => {
 		const runtimeA = await createSessionRuntime({
 			spec: spec("alpha", "A"),
 			profile: profileFor("faux"),
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: a.cwd,
 			agentDir: a.agentDir,
@@ -119,7 +119,7 @@ describe("concurrent runtimes", () => {
 		const runtimeB = await createSessionRuntime({
 			spec: spec("beta", "B"),
 			profile: profileFor("faux"),
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: b.cwd,
 			agentDir: b.agentDir,
@@ -158,10 +158,12 @@ describe("concurrent runtimes", () => {
 	});
 
 	// Regression lock (final fix round, finding 1): every other test in this file hands each
-	// runtime its own `new PluginRegistry()`, which is exactly what hid the per-run-state leak
-	// -- createSessionRuntime() registered the limits descriptor into the caller's registry, so
+	// runtime its own registry, which is exactly what hid the per-run-state leak --
+	// createSessionRuntime() registered the limits descriptor into the caller's registry, so
 	// the second call against a shared one threw `Plugin "limits" is already registered`. A
 	// PluginRegistry is process-level; two concurrent runtimes must be able to share one.
+	// Task 5 起 limits 是 createDefaultPluginRegistry() 里的进程级描述符,per-run 状态全部
+	// 走 PluginContext —— 这条锁因此更强了:共享的表里现在**真的有**插件。
 	it("runs two runtimes concurrently off one shared PluginRegistry without interfering", async () => {
 		const a = await createFauxHarness();
 		const b = await createFauxHarness();
@@ -169,7 +171,7 @@ describe("concurrent runtimes", () => {
 		a.faux.setResponses([fauxAssistantMessage("ALPHA-SHARED-REGISTRY")]);
 		b.faux.setResponses([fauxAssistantMessage("BETA-SHARED-REGISTRY")]);
 
-		const shared = new PluginRegistry();
+		const shared = createDefaultPluginRegistry();
 		const [runtimeA, runtimeB] = await Promise.all([
 			createSessionRuntime({
 				spec: spec("alpha", "You are ALPHA."),
@@ -201,7 +203,9 @@ describe("concurrent runtimes", () => {
 		expect(resultB.output).toContain("BETA-SHARED-REGISTRY");
 		expect(resultB.output).not.toContain("ALPHA-SHARED-REGISTRY");
 
-		// The shared registry stayed process-level: nothing per-run was written into it.
-		expect([...shared.names()]).toEqual([]);
+		// The shared registry stayed process-level: two runtimes only *looked up* out of it,
+		// nothing per-run got registered in. Its contents are still exactly what
+		// createDefaultPluginRegistry() put there.
+		expect([...shared.names()]).toEqual(["limits", "result-budget", "path-guard"]);
 	});
 });

@@ -1,0 +1,14 @@
+{
+	"id": "named-plugins-probe",
+	"description": "风险 12 的关闭凭证:三个命名插件同时声明,必须装配成功且真的生效",
+	"model": { "role": "main" },
+	"toolset": "probe",
+	"tools": ["echo"],
+	"limits": { "maxTurns": 3 },
+	"stopPolicy": { "name": "sufficiency-gate", "options": { "maxProbes": 2, "matters": "auto" } },
+	"resultPolicy": {
+		"name": "result-budget",
+		"options": { "maxHits": { "search_policy": 20 }, "maxChars": { "default": 4000 } }
+	},
+	"approvalPolicy": { "name": "path-guard", "options": { "allowRoots": ["/var/dfzq/uploads/<runId>"] } }
+}

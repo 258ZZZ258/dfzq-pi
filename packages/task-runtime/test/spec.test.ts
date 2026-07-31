@@ -47,4 +47,17 @@ describe("validateSpec", () => {
 		const spec: RuntimeSpec = { ...baseSpec(), limits: {} };
 		expect(() => validateSpec(spec, ctx)).toThrow(/at least one limit/i);
 	});
+
+	it("rejects an outputContract with an empty schema path", () => {
+		const spec: RuntimeSpec = { ...baseSpec(), outputContract: { schema: "" } };
+		expect(() => validateSpec(spec, ctx)).toThrow(/outputContract\.schema.*non-empty path/);
+	});
+
+	it("rejects an outputContract with a negative maxRepairAttempts", () => {
+		const spec: RuntimeSpec = {
+			...baseSpec(),
+			outputContract: { schema: "answer.schema.json", maxRepairAttempts: -1 },
+		};
+		expect(() => validateSpec(spec, ctx)).toThrow(/outputContract\.maxRepairAttempts.*non-negative integer/);
+	});
 });

@@ -9,7 +9,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createFauxHarness, fauxAssistantMessage } from "./helpers/faux.ts";
 
 let harness: Awaited<ReturnType<typeof createFauxHarness>> | undefined;
+let cleanups: Array<() => void> = [];
 afterEach(async () => {
+	for (const fn of cleanups.reverse()) fn();
+	cleanups = [];
 	await harness?.cleanup();
 	harness = undefined;
 });
@@ -63,6 +66,7 @@ describe("faux: followUp() inside turn_end", () => {
 			sessionManager: SessionManager.inMemory(harness.cwd),
 		});
 		sessionHolder.current = session;
+		cleanups.push(() => session.dispose());
 
 		await session.prompt("开始");
 		await session.waitForIdle();
@@ -77,6 +81,5 @@ describe("faux: followUp() inside turn_end", () => {
 		// 测试必须变红。
 		expect(injected).toBe(true);
 		expect(assistantTurns).toBe(2);
-		session.dispose();
 	});
 });

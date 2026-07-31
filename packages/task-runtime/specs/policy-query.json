@@ -1,0 +1,31 @@
+{
+  "id": "policy-query",
+  "description": "制度查询与合规判断(skeleton:仅 T1/T4;完整工具面与输出契约见 C8)",
+
+  "model": { "role": "main" },
+  "thinkingLevel": "medium",
+
+  "toolset": "policy-query",
+  "tools": ["search_policy", "get_clause_detail"],
+
+  "systemPrompt": "@specs/policy-query/system.md",
+
+  "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000 },
+
+  "limits": { "maxTurns": 30, "runTimeoutMs": 600000, "maxTotalTokens": 400000 },
+
+  "mcpServers": [
+    {
+      "id": "policy-query",
+      "command": "${DFZQ_AUDIT_AI_PYTHON}",
+      "args": ["-m", "query.mcp.server"],
+      "cwd": "${DFZQ_AUDIT_AI_ROOT}",
+      "env": {
+        "PIPELINE_CONFIG_DIR": "${PIPELINE_CONFIG_DIR}",
+        "POLICY_MCP_AUDIT_LOG": "${POLICY_MCP_AUDIT_LOG}",
+        "HF_HUB_OFFLINE": "1",
+        "PATH": "${PATH}"
+      }
+    }
+  ]
+}

@@ -43,10 +43,20 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	// 由 assemble() 从 options.registry 无条件 lookup 出来。本次 run 的状态(LimitState、
 	// abort 句柄)全部经下面这个 PluginContext 注入 —— 所以一个 PluginRegistry 可以被
 	// 反复复用,也不会在并发 run 之间串状态。见 plugin-registry.ts 的类注释。
-	const pluginContext: PluginContext = {
-		specId: options.spec.id,
+	const pluginContext: Omit<PluginContext, "callTool"> = {
 		getRunId: () => currentRunId,
-		getSession: () => assembled.session,
+		getSession: () => {
+			// 装配期误调要给描述性错误。裸读 assembled.session 会抛
+			// `TypeError: Cannot read properties of undefined` —— 那句话不指向病因。
+			// 这一层的规矩是「装配期失败要响要早」,响也包括「说清楚是什么失败了」。
+			if (!assembled) {
+				throw new Error(
+					"PluginContext.getSession() was called during assembly, before the AgentSession exists; " +
+						"plugin factories must defer session access to hook/judge callbacks",
+				);
+			}
+			return assembled.session;
+		},
 		abort: () => abortFn(),
 		limitState: state,
 		registerFinalJudge: (judge) => judges.push(judge),
@@ -225,6 +235,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 
 		let thrown: unknown;
 		let judgeError: string | undefined;
+		let judgeAttempts: Record<string, number> = {};
 		try {
 			try {
 				await session.prompt(input);
@@ -254,6 +265,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 					return { attempts: {}, errorMessage: error instanceof Error ? error.message : String(error) };
 				});
 				judgeError = outcome.errorMessage;
+				judgeAttempts = outcome.attempts;
 			}
 		} finally {
 			// clearTimeout 挪到重判**之后**(brief 把它留在第一层 finally 里):留在原处的话,
@@ -289,6 +301,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 			},
 			turns: state.turns,
 			durationMs: Date.now() - startedAt,
+			judgeAttempts,
 		};
 	}
 

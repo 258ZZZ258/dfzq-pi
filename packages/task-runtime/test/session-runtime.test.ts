@@ -441,6 +441,13 @@ async function buildWithRegistry(
 }
 
 /** 登记一个判官的最小测试插件。`judge` 直接给,免得每条用例都抄一遍 register 样板。 */
+/**
+ * 往默认表里再加一个登记判官的测试插件。
+ *
+ * ⚠ `name` 不能用默认表里已有的插件名(`limits` / `result-budget` / `path-guard` /
+ * `sufficiency-gate`)—— 会撞 `already registered`。这条测试守的是**判官派发顺序**,
+ * 与插件叫什么无关,所以用测试专用名。
+ */
 function registryWithCustomJudge(name: string, judge: FinalJudge["judge"], overrides: Partial<FinalJudge> = {}) {
 	const registry = createDefaultPluginRegistry();
 	registry.register({
@@ -686,14 +693,17 @@ describe("SessionRuntime final-judge rejudging", () => {
 			// 第一次不通过、第二次通过 —— 与 buildWithJudge 用的 verdicts 列表是同一套模式,
 			// 只是这里要走真实的 createSessionRuntime + 真实的 C6,所以手写一个带计数的判官。
 			let sufficiencyCalls = 0;
-			const registry = registryWithCustomJudge("sufficiency-gate", async () => {
+			const registry = registryWithCustomJudge("faux-evidence-gate", async () => {
 				sufficiencyCalls += 1;
-				if (sufficiencyCalls === 1) return { ok: false, followUp: "sufficiency-gate 要求先补充证据" };
+				if (sufficiencyCalls === 1) return { ok: false, followUp: "插件判官要求先补充证据" };
 				return { ok: true };
 			});
 			const runtime = await buildWithOutputContract(
 				registry,
-				{ stopPolicy: "sufficiency-gate", outputContract: { schema: "answer.schema.json", maxRepairAttempts: 2 } },
+				{
+					stopPolicy: "faux-evidence-gate",
+					outputContract: { schema: "answer.schema.json", maxRepairAttempts: 2 },
+				},
 				minimalContractSchema,
 				[fauxAssistantMessage("第一版全是散文"), fauxAssistantMessage(JSON.stringify({ conclusion: "允许" }))],
 			);
@@ -701,11 +711,11 @@ describe("SessionRuntime final-judge rejudging", () => {
 			const result = await runtime.run("hello");
 
 			expect(promptSpy.mock.calls[0]?.[0]).toBe("hello");
-			// 关键断言:第一次 reprompt 派发的是 sufficiency-gate 的文案,不是 C6 的
+			// 关键断言:第一次 reprompt 派发的是插件判官的文案,不是 C6 的
 			// "未找到 JSON 块"—— 尽管第一版回答对 C6 来说也确实不合格。
-			expect(promptSpy.mock.calls[1]?.[0]).toBe("sufficiency-gate 要求先补充证据");
+			expect(promptSpy.mock.calls[1]?.[0]).toBe("插件判官要求先补充证据");
 
-			// sufficiency-gate 第二次通过、C6 也认可第二版 JSON —— run 应当顺利收尾。
+			// 插件判官第二次通过、C6 也认可第二版 JSON —— run 应当顺利收尾。
 			expect(result.status).toBe("completed");
 			expect(result.output).toContain('"conclusion":"允许"');
 		});
@@ -963,5 +973,58 @@ describe("SessionRuntime - clause_id collection ignores isError results (Task 9)
 		expect(result.status).toBe("completed");
 		// lookup 成功、真的贡献了 A-1;lookupFail 抛错、isError:true,它回显的 Z-9 不该出现。
 		expect(seen[0]).toEqual(["A-1"]);
+	});
+});
+
+/** 判官只有被 spec 声明后才会实例化 —— 光注册进表不够。 */
+async function buildDeclaring(
+	pluginName: string,
+	registry: ReturnType<typeof createDefaultPluginRegistry>,
+	responses: unknown[],
+) {
+	const harness = await createFauxHarness();
+	cleanups.push(harness.cleanup);
+	harness.faux.setResponses(responses as never);
+	const runtime = await createSessionRuntime({
+		spec: { ...spec({ maxTurns: 5 }), stopPolicy: pluginName },
+		profile,
+		registry,
+		toolsets: toolsets(),
+		cwd: harness.cwd,
+		agentDir: harness.agentDir,
+		modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+	});
+	cleanups.push(runtime.dispose);
+	return runtime;
+}
+
+describe("judgeAttempts 上到 RunResult", () => {
+	it("reports how many times each judge actually rejudged", async () => {
+		// 验收要区分「一次答对」与「靠重判才合规」—— 只看 status=completed 分不出来。
+		// 此前 runFinalJudges 算了这个数,session-runtime 却整个丢弃,只有单测能观测到。
+		let calls = 0;
+		const registry = registryWithCustomJudge("counting-attempts", async () => {
+			calls += 1;
+			return calls === 1 ? { ok: false, followUp: "再来一次" } : { ok: true };
+		});
+		const runtime = await buildDeclaring("counting-attempts", registry, [
+			fauxAssistantMessage("一稿"),
+			fauxAssistantMessage("二稿"),
+		]);
+		const result = await runtime.run("hello");
+		expect(result.judgeAttempts["counting-attempts"]).toBe(1);
+	});
+
+	it("reports zero attempts when the judge passes on the first draft", async () => {
+		const registry = registryWithCustomJudge("passing-judge", async () => ({ ok: true }));
+		const runtime = await buildDeclaring("passing-judge", registry, [fauxAssistantMessage("一稿")]);
+		const result = await runtime.run("hello");
+		expect(result.judgeAttempts["passing-judge"]).toBe(0);
+	});
+
+	it("is an empty object when there are no judges at all", async () => {
+		const runtime = await build({ maxTurns: 5 }, [fauxAssistantMessage("一稿")]);
+		const result = await runtime.run("hello");
+		expect(result.judgeAttempts).toEqual({});
 	});
 });

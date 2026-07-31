@@ -5,13 +5,13 @@ import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 
 function makeContext(overrides: Partial<PluginContext> = {}): PluginContext {
 	return {
-		specId: "s1",
 		getRunId: () => "r1",
 		getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 		abort: () => {},
 		limitState: { turns: 0 },
 		registerFinalJudge: () => {},
 		getRunInput: () => "",
+		callTool: async () => ({}),
 		...overrides,
 	};
 }
@@ -65,3 +65,19 @@ function captureTurnEnd(
 	});
 	return () => handler?.({}) ?? Promise.resolve(undefined);
 }
+
+describe("sufficiency-gate 的无条件注册(C3 接线)", () => {
+	it("registers sufficiency-gate without any injected deps", () => {
+		// 此前 assess 缺省时不注册 —— 那是刻意的 fail-closed,但代价是生产上
+		// createDefaultPluginRegistry() 的两个调用点都不传 deps ⇒ C3 永不可达。
+		// 改成插件自己从 PluginContext.callTool 取,注册就不再依赖调用方传线。
+		expect(createDefaultPluginRegistry().names()).toContain("sufficiency-gate");
+	});
+
+	it("still accepts an injected assess as a test seam", () => {
+		const registry = createDefaultPluginRegistry({
+			assess: async () => ({ sufficient: true, covered: [], missing: [] }),
+		});
+		expect(registry.names()).toContain("sufficiency-gate");
+	});
+});

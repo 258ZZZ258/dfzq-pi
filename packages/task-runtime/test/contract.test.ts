@@ -12,6 +12,7 @@ describe("runtime contract", () => {
 			usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3, cost: 0 },
 			turns: 1,
 			durationMs: 5,
+			judgeAttempts: {},
 		};
 		const rt: Runtime = {
 			id: "rt1",

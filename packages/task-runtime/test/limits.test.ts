@@ -13,7 +13,6 @@ function instantiate(
 ) {
 	let handler: ((event: unknown) => Promise<unknown>) | undefined;
 	const ctx: PluginContext = {
-		specId: "s1",
 		getRunId: () => "r1",
 		getSession: () =>
 			({ getSessionStats: () => ({ tokens: { total: stats.totalTokens }, cost: stats.cost }) }) as never,
@@ -21,6 +20,7 @@ function instantiate(
 		limitState: state,
 		registerFinalJudge: () => {},
 		getRunInput: () => "",
+		callTool: async () => ({}),
 	};
 	const extension = limitsDescriptor.factory(ctx, { limits });
 	const factory = typeof extension === "function" ? extension : extension.factory;
@@ -48,13 +48,13 @@ describe("limits plugin", () => {
 	// spec.limits 在 RuntimeSpec 上必填,所以正路上永远带得到 options;缺了就是误用,要响。
 	it("throws instead of silently becoming a zero-limit counter when options are missing", () => {
 		const ctx: PluginContext = {
-			specId: "s1",
 			getRunId: () => "r1",
 			getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 			abort: () => {},
 			limitState: { turns: 0 },
 			registerFinalJudge: () => {},
 			getRunInput: () => "",
+			callTool: async () => ({}),
 		};
 		expect(() => limitsDescriptor.factory(ctx)).toThrow(/was instantiated without its LimitsOptions\.limits/);
 		expect(() => limitsDescriptor.factory(ctx, {})).toThrow(/was instantiated without its LimitsOptions\.limits/);

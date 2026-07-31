@@ -23,7 +23,6 @@ const REPLACING_HOOKS: ReadonlySet<string> = new Set([
  * 一个 session 跨多个 run 地变。
  */
 export interface PluginContext {
-	specId: string;
 	getRunId: () => string;
 	getSession: () => AgentSession;
 	abort: () => void;
@@ -36,6 +35,19 @@ export interface PluginContext {
 	registerFinalJudge: (judge: FinalJudge) => void;
 	/** 本 run 的输入正文。matters:"auto" 从这里抽。run() 未开始时返回空串。 */
 	getRunInput: () => string;
+	/**
+	 * 调用本 run 已解析的某个工具。**这是插件够得着 per-run MCP 会话的唯一通路。**
+	 *
+	 * 为什么需要它:`PluginRegistry` 是进程级的(启动时注册一次),而 MCP client 是 per-run
+	 * 的(`ToolsetRegistry.resolve()` 每次 run 开一组子进程)。`sufficiency-gate` 要调 C1 的
+	 * `assess_sufficiency`,那根线在**注册**处接不上 —— 注册时还没有 run。
+	 *
+	 * 时序成立:`assembler` 在 `toolsets.resolve()` 之后才 `instantiatePlugins()`,
+	 * 所以实例化时工具已经在手。
+	 *
+	 * 工具不存在时抛 —— 声明了依赖某工具的插件配上没有该工具的 spec,是装配错误,要响要早。
+	 */
+	callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 }
 
 export type PluginFactory = (ctx: PluginContext, options?: Record<string, unknown>) => InlineExtension;

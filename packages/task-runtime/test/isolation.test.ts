@@ -206,6 +206,6 @@ describe("concurrent runtimes", () => {
 		// The shared registry stayed process-level: two runtimes only *looked up* out of it,
 		// nothing per-run got registered in. Its contents are still exactly what
 		// createDefaultPluginRegistry() put there.
-		expect([...shared.names()]).toEqual(["limits", "result-budget", "path-guard"]);
+		expect([...shared.names()]).toEqual(["limits", "result-budget", "path-guard", "sufficiency-gate"]);
 	});
 });

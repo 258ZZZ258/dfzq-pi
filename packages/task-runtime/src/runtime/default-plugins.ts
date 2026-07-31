@@ -6,9 +6,11 @@ import { type AssessFn, createSufficiencyGateDescriptor } from "./plugins/suffic
 
 export interface DefaultPluginDeps {
 	/**
-	 * C1 policy-query-mcp 的 assess_sufficiency。**缺省时 sufficiency-gate 不会被注册**,
-	 * 于是声明了它的 spec 在装配期报 `plugin "sufficiency-gate" is not registered`。
-	 * 这是刻意的 fail-closed:C1 没接线时不许静默跳过充分性判定(权限红线「不静默放宽」)。
+	 * 测试缝:覆盖 `sufficiency-gate` 调 C1 `assess_sufficiency` 的默认实现。
+	 *
+	 * 生产不传 —— 插件缺省走 `PluginContext.callTool`,从本 run 已解析的工具里取。
+	 * (此前这个字段缺省会让 sufficiency-gate **不被注册**,而两个生产调用点都不传 ⇒
+	 * C3 在生产上永不可达。现在注册无条件,「C1 有没有接上」由装配期的工具名校验回答。)
 	 */
 	assess?: AssessFn;
 }
@@ -22,6 +24,6 @@ export function createDefaultPluginRegistry(deps: DefaultPluginDeps = {}): Plugi
 	registry.register(limitsDescriptor);
 	registry.register(resultBudgetDescriptor);
 	registry.register(pathGuardDescriptor);
-	if (deps.assess) registry.register(createSufficiencyGateDescriptor(deps.assess));
+	registry.register(createSufficiencyGateDescriptor(deps.assess));
 	return registry;
 }

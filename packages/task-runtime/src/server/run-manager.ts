@@ -279,6 +279,7 @@ export class RunManager {
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
 			turns: 0,
 			durationMs: 0,
+			judgeAttempts: {},
 		};
 		try {
 			this.store.finish(runId, result, this.now());

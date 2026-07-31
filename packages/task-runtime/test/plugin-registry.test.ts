@@ -4,7 +4,6 @@ import { type PluginContext, PluginRegistry } from "../src/runtime/plugin-regist
 /** 大多数用例不关心 per-run 上下文,给个够用的最小占位。 */
 function makeContext(): PluginContext {
 	return {
-		specId: "s1",
 		getRunId: () => "r1",
 		getSession: () => {
 			throw new Error("not assembled yet");
@@ -13,6 +12,7 @@ function makeContext(): PluginContext {
 		limitState: { turns: 0 },
 		registerFinalJudge: () => {},
 		getRunInput: () => "",
+		callTool: async () => ({}),
 	};
 }
 
@@ -101,7 +101,6 @@ describe("PluginRegistry", () => {
 			},
 		});
 		const ctx: PluginContext = {
-			specId: "s1",
 			getRunId: () => "r1",
 			getSession: () => {
 				throw new Error("not assembled yet");
@@ -110,10 +109,10 @@ describe("PluginRegistry", () => {
 			limitState: { turns: 0 },
 			registerFinalJudge: () => {},
 			getRunInput: () => "",
+			callTool: async () => ({}),
 		};
 		registry.resolveAll(["probe"], ctx);
 		expect(seen).toHaveLength(1);
-		expect(seen[0]?.specId).toBe("s1");
 		expect(seen[0]?.getRunId()).toBe("r1");
 	});
 
@@ -131,13 +130,13 @@ describe("PluginRegistry", () => {
 			},
 		});
 		const ctx: PluginContext = {
-			specId: "s1",
 			getRunId: () => "r1",
 			getSession: () => session as never,
 			abort: () => {},
 			limitState: { turns: 0 },
 			registerFinalJudge: () => {},
 			getRunInput: () => "",
+			callTool: async () => ({}),
 		};
 		registry.resolveAll(["late"], ctx);
 		session = { id: "assembled-later" };

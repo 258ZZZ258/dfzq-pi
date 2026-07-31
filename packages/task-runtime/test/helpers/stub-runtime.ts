@@ -43,6 +43,7 @@ export function createStubRuntime(options: StubRuntimeOptions = {}): StubRuntime
 			usage: { ...ZERO_USAGE },
 			turns: 1,
 			durationMs: 1,
+			judgeAttempts: {},
 			...options.result,
 		};
 	}

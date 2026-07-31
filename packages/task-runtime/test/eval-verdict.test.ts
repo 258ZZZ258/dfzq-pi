@@ -13,6 +13,7 @@ function result(status: RunResult["status"] = "completed"): RunResult {
 		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2, cost: 0.1 },
 		turns: 3,
 		durationMs: 10,
+		judgeAttempts: {},
 	};
 }
 

@@ -28,13 +28,44 @@ export function extractMatters(input: string): string[] {
 		.filter((part) => part.length >= 4);
 }
 
-export function createSufficiencyGateDescriptor(assess: AssessFn): PluginDescriptor {
+/**
+ * C1 的 `assess_sufficiency` 返回的取证完整性报告。
+ *
+ * ⚠ 字段名跟着 C1 走:那边刻意叫 `hit_count_sufficient` 而不是 `sufficient` ——
+ * 底层 `assess()` 只做 `len(candidates) >= min_hits` 的计数,**不做语义判定**。
+ * 真正有判定力的是 `unfetched`:检索到了却没取正文就下结论,是这个判官要拦的事。
+ */
+interface AssessToolResult {
+	hit_count_sufficient?: boolean;
+	unfetched?: string[];
+	retrieved_count?: number;
+	fetched_count?: number;
+}
+
+/** 缺省实现:走 per-run 的 MCP 会话调 C1。注入版保留作测试缝。 */
+function assessViaTool(ctx: PluginContext): AssessFn {
+	return async (_clauseIds, matters) => {
+		const raw = (await ctx.callTool("assess_sufficiency", { matters: [...matters] })) as AssessToolResult;
+		const unfetched = Array.isArray(raw?.unfetched) ? raw.unfetched : [];
+		return {
+			// 判定依据是**取证完整性**,不是 hit_count_sufficient —— 后者只是计数。
+			sufficient: unfetched.length === 0,
+			covered: [],
+			missing: unfetched,
+		};
+	};
+}
+
+export function createSufficiencyGateDescriptor(assess?: AssessFn): PluginDescriptor {
 	return {
 		name: SUFFICIENCY_GATE_PLUGIN_NAME,
 		// 不挂任何 hook:它参与的是终局判定,那个时点 hook 看不见(hook 只看得见单轮)。
 		hooks: [],
 		factory: (ctx: PluginContext, rawOptions?: Record<string, unknown>) => {
 			const options = (rawOptions ?? {}) as SufficiencyGateOptions;
+			// 注入优先(测试缝),否则走 per-run 的 MCP 会话。**注册不再依赖调用方传线** ——
+			// 此前 deps.assess 缺省就不注册,而两个生产调用点都不传 ⇒ C3 永不可达。
+			const runAssess = assess ?? assessViaTool(ctx);
 			const judge: FinalJudge = {
 				name: SUFFICIENCY_GATE_PLUGIN_NAME,
 				maxAttempts: options.maxProbes ?? 2,
@@ -46,7 +77,7 @@ export function createSufficiencyGateDescriptor(assess: AssessFn): PluginDescrip
 						options.matters === undefined || options.matters === "auto"
 							? extractMatters(ctx.getRunInput())
 							: options.matters;
-					const report = await assess(context.clauseIds, matters);
+					const report = await runAssess(context.clauseIds, matters);
 					if (report.sufficient) return { ok: true };
 					return {
 						ok: false,

@@ -2,6 +2,18 @@ import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
 /**
+ * 边界契约的语料类型全集(audit-ai `query/query/api/routes_boundary.py:44-46` 的 Literal)。
+ *
+ * `audit_project` **是合法枚举值**,只是 audit-ai 侧未接入(`_CORPUS_MAP` 无此键 → 422)。
+ * 所以「未授权」「合法但未接入」「格式错」是三件不同的事,**三档不得合并** —— 合并后
+ * Java 侧分不清该去申请授权、该改请求、还是该等我们接入。
+ */
+const KNOWN_CORPUS_TYPES: ReadonlySet<string> = new Set(["internal", "external", "qa", "case", "audit_project"]);
+
+/** 合法但 audit-ai 尚未接入的语料类型。对齐 `BOUNDARY-v1:51-62` 的 422 语义。 */
+const UNSUPPORTED_CORPUS_TYPES: ReadonlySet<string> = new Set(["audit_project"]);
+
+/**
  * body 校验用 typebox —— 与工具 schema 同一套,不引第二个校验库(设计文档 §5.2)。
  */
 const FiltersSchema = Type.Object({
@@ -72,6 +84,27 @@ export function validateSubmitBody(
 				code: "missing_authorization_scope",
 				message: "filters.corpusTypes must be a non-empty array of strings",
 			},
+		};
+	}
+	// 第二档:合法但未接入。必须排在 schema 之前 —— 排在后面会先被通用 schema 判成
+	// invalid_body,与「格式错」混为一谈。
+	const unsupported = (corpusTypes as string[]).filter((v) => UNSUPPORTED_CORPUS_TYPES.has(v));
+	if (unsupported.length > 0) {
+		return {
+			ok: false,
+			error: {
+				code: "unsupported_corpus_type",
+				message: `corpus type(s) not yet supported: ${unsupported.join(", ")}`,
+			},
+		};
+	}
+	// 第三档:枚举外的值是格式错。留在授权预检里判(而不是下放给 SubmitBodySchema 加 enum)
+	// 是因为第二档必须先于 schema 执行,而两档共用同一份 corpusTypes 遍历更难写歪。
+	const unknown = (corpusTypes as string[]).filter((v) => !KNOWN_CORPUS_TYPES.has(v));
+	if (unknown.length > 0) {
+		return {
+			ok: false,
+			error: { code: "invalid_body", message: `unknown corpus type(s): ${unknown.join(", ")}` },
 		};
 	}
 	if (!Value.Check(SubmitBodySchema, raw)) {

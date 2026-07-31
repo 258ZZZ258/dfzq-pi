@@ -12,7 +12,13 @@ import { isTerminal } from "./routes.ts";
  * 它不出现在任何工具的 JSON Schema 里,由 MCP adapter 在 schema 之外注入(规格 §2.3)。
  */
 export interface RunFilters {
-	permTags: string[];
+	/**
+	 * 可缺省,且**缺省与空数组同义**:「无额外限制」是边界契约的明文,不是 fail-open
+	 * (audit-ai `query/query/api/routes_boundary.py:39-40` 原话)。这个默认语义属于消费端
+	 * (C1 / MCP 注入点),不属于这一层 —— 本层在此补 `[]` 会把 filters_json 的存档改写成
+	 * 与 Java 发来的请求体不同的东西,而那是事后审计授权范围的唯一凭证。
+	 */
+	permTags?: string[];
 	corpusTypes: string[];
 	projectId?: string | null;
 	owner?: string | null;

@@ -42,6 +42,18 @@ export interface RuntimeSpec {
 	excludeTools?: string[];
 
 	systemPrompt?: string;
+	/**
+	 * 随本 spec 注入的 skill 文件路径,**相对 spec 文件所在目录**解析(与 `outputContract.schema`
+	 * 同一套路径语义)。
+	 *
+	 * 走 pi 的 `DefaultResourceLoader.additionalSkillPaths`,与 `noSkills: true` **不冲突** ——
+	 * `noSkills` 只过滤磁盘扫描出来的 skill,不挡构造选项传进来的(resource-loader.ts:467-469)。
+	 * 底座保持「剥光通用能力」,任务需要的能力由任务自己声明。
+	 *
+	 * 为什么不并进 `appendSystemPrompt`:那样每轮都会全量常驻整篇正文,而正规 skill loader
+	 * 只常驻 name/description 摘要,正文由模型按需 Read。两者对 context 的占用不是一个量级。
+	 */
+	skills?: string[];
 	appendSystemPrompt?: string[];
 
 	compaction?: CompactionSpec;

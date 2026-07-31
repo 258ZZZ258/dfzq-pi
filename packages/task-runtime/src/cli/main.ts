@@ -86,6 +86,7 @@ async function main(): Promise<void> {
 		cwd: join(workdir, "workspace"),
 		agentDir: join(workdir, "agent"),
 		outputContractSchema,
+		skillPaths: spec.skills?.map((rel) => resolve(dirname(values.spec as string), rel)),
 	});
 
 	const detach = values.trajectory ? await attachTrajectory(runtime, values.trajectory) : undefined;

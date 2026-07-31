@@ -23,6 +23,12 @@ export interface AssembleOptions {
 	cwd: string;
 	agentDir: string;
 	/**
+	 * `spec.skills` 解析成的**绝对**路径。与 `outputContractSchema` 同一条纪律:
+	 * 相对路径的基准是 spec 文件所在目录,而 assemble() 不知道 spec 从哪来 ——
+	 * 所以解析归调用方(`createDefaultRuntimeFactory` / `cli/main.ts`)。
+	 */
+	skillPaths?: string[];
+	/**
 	 * 本次装配的 per-run 上下文。**不含 `callTool`** —— 那一项只有 assemble() 造得出
 	 * (它同时握着已解析的工具与待实例化的插件),由本函数补齐后再交给插件工厂。
 	 */
@@ -37,6 +43,12 @@ export interface AssembleOptions {
 export interface Assembled {
 	session: AgentSession;
 	specId: string;
+	/**
+	 * 本次装配的资源加载器。暴露它只为**可观测** —— 「spec 声明的 skill 到底加载上没有」
+	 * 除了 `getSkills()` 没有别的验法(skill 不是工具,不出现在 getActiveToolNames 里,
+	 * 它只影响 system prompt 里的 `<available_skills>` 摘要)。
+	 */
+	resources: DefaultResourceLoader;
 	dispose: () => Promise<void>;
 }
 
@@ -175,7 +187,10 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			settingsManager,
 			// 剥光通用能力(照抄 packages/evals/src/pi-harness.ts)
 			noExtensions: true, // 只过滤磁盘扫描,不影响 extensionFactories
+			// noSkills 只过滤磁盘扫描,不挡下面的 additionalSkillPaths(resource-loader.ts:467-469)。
+			// 两者并存是刻意的:底座剥光通用能力,任务需要的能力由 spec 自己声明。
 			noSkills: true,
+			additionalSkillPaths: options.skillPaths,
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true, // 安全项:阻止 AGENTS.md / CLAUDE.md 被加载(prompt injection 直通车)
@@ -207,6 +222,7 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 		return {
 			session,
 			specId: spec.id,
+			resources: resourceLoader,
 			dispose: async () => {
 				session.dispose();
 				await disposeToolset();

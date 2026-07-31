@@ -2,6 +2,7 @@ import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
+import type { RuntimeEvent } from "../src/runtime/contract.ts";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 import { createSessionRuntime } from "../src/runtime/session-runtime.ts";
@@ -412,5 +413,141 @@ describe("SessionRuntime - PluginContext wiring (review I-1)", () => {
 		const result = await runPromise;
 		expect(result.status).toBe("aborted");
 		expect(runtime.isIdle).toBe(true);
+	});
+});
+
+/** 只用来登记一个可编程判官的测试插件。verdicts 用完后重复最后一项。 */
+function registryWithJudge(verdicts: Array<{ ok: boolean }>) {
+	const registry = createDefaultPluginRegistry();
+	let call = 0;
+	registry.register({
+		name: "test-judge",
+		hooks: [],
+		factory: (ctx) => {
+			ctx.registerFinalJudge({
+				name: "test-judge",
+				maxAttempts: 5,
+				onExhausted: "pass",
+				judge: async () => {
+					const verdict = verdicts[Math.min(call, verdicts.length - 1)];
+					call += 1;
+					return verdict?.ok ? { ok: true } : { ok: false, followUp: "请继续查证" };
+				},
+			});
+			return { name: "test-judge", factory: () => {} };
+		},
+	});
+	return registry;
+}
+
+async function buildWithJudge(limits: RuntimeSpec["limits"], verdicts: Array<{ ok: boolean }>, responses: unknown[]) {
+	const harness = await createFauxHarness();
+	cleanups.push(harness.cleanup);
+	harness.faux.setResponses(responses as never);
+	const runtime = await createSessionRuntime({
+		spec: { ...spec(limits), stopPolicy: "test-judge" },
+		profile,
+		registry: registryWithJudge(verdicts),
+		toolsets: toolsets(),
+		cwd: harness.cwd,
+		agentDir: harness.agentDir,
+		modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+	});
+	cleanups.push(runtime.dispose);
+	return runtime;
+}
+
+describe("SessionRuntime final-judge rejudging", () => {
+	it("re-prompts the session when a judge rejects, and keeps counting turns across prompts", async () => {
+		const runtime = await buildWithJudge(
+			{ maxTurns: 10 },
+			[{ ok: false }, { ok: false }, { ok: true }],
+			[fauxAssistantMessage("第一版"), fauxAssistantMessage("第二版"), fauxAssistantMessage("第三版")],
+		);
+		const events: RuntimeEvent[] = [];
+		runtime.subscribe((event) => events.push(event));
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("completed");
+		expect(result.output).toContain("第三版");
+		// turns 跨三次 prompt 累加 —— 不是每次 prompt 归零。maxTurns 因此仍然是重判的硬顶。
+		expect(result.turns).toBeGreaterThanOrEqual(3);
+
+		// 副作用锁:重判在 run 层重新发 prompt,所以**一个 run 会产生多次 agent_end**
+		// (这里实测 3 次 agent_start / turn_end / agent_end / agent_settled),而 runId
+		// 全程不变。S2 的观测层与工具调用对账不得假设"一 run 一 agent_end" —— 谁靠那条
+		// 不变量切分 run 边界,这条断言就是他的告警。
+		expect(events.filter((event) => event.type === "agent_end")).toHaveLength(3);
+		expect(new Set(events.map((event) => event.runId))).toEqual(new Set([result.runId]));
+	});
+
+	it("does not re-prompt once maxTurns has tripped", async () => {
+		// 判官恒判不通过。maxTurns:1 会在第一次 prompt 结束时就置位 state.tripped,
+		// shouldStop() 因此在第一轮重判前就为 true —— 结果必须是 limit_exceeded 而不是 error。
+		const runtime = await buildWithJudge(
+			{ maxTurns: 1 },
+			[{ ok: false }],
+			[fauxAssistantMessage("只此一版"), fauxAssistantMessage("不该出现")],
+		);
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("limit_exceeded");
+		expect(result.limit).toBe("maxTurns");
+		expect(result.output).toContain("只此一版");
+	});
+
+	// 锁住 clearTimeout 的位置。实现里它被刻意从第一层 finally 挪到了重判之后(brief 原文
+	// 把重判插在 finally 之后,那样 runTimeout 的定时器在第一次 prompt() 返回时就死了,
+	// session-runtime.ts 里"runTimeoutMs 横跨全部重判"的注释便是空话):判官还能再发
+	// Σ maxAttempts 次 prompt,足以把一个声明了 100ms 上限的 run 拖到秒级。
+	// 第一次应答是即时的(定时器来不及在它身上触发),之后每次应答 200ms —— 触发点因此
+	// 必然落在重判途中。定时器若提前被清,这条会变成 completed。
+	it("lets runTimeoutMs trip during rejudging instead of dying with the first prompt", async () => {
+		const slow = () =>
+			new Promise((resolve) => {
+				setTimeout(() => resolve(fauxAssistantMessage("慢")), 200);
+			});
+		const runtime = await buildWithJudge(
+			{ runTimeoutMs: 100 },
+			[{ ok: false }],
+			[fauxAssistantMessage("第一版"), slow, slow, slow, slow, slow],
+		);
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("limit_exceeded");
+		expect(result.limit).toBe("runTimeout");
+	});
+
+	it("reports error when a judge itself throws", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		harness.faux.setResponses([fauxAssistantMessage("答案")] as never);
+		const registry = createDefaultPluginRegistry();
+		registry.register({
+			name: "throwing-judge",
+			hooks: [],
+			factory: (ctx) => {
+				ctx.registerFinalJudge({
+					name: "throwing-judge",
+					maxAttempts: 2,
+					onExhausted: "pass",
+					judge: async () => {
+						throw new Error("assess 调用失败");
+					},
+				});
+				return { name: "throwing-judge", factory: () => {} };
+			},
+		});
+		const runtime = await createSessionRuntime({
+			spec: { ...spec({ maxTurns: 5 }), stopPolicy: "throwing-judge" },
+			profile,
+			registry,
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(runtime.dispose);
+		const result = await runtime.run("hello");
+		// 判官抛异常不能变成静默成功 —— run 层的 .catch 把它转成 errorMessage。
+		expect(result.status).toBe("error");
+		expect(result.errorMessage).toContain("assess 调用失败");
 	});
 });

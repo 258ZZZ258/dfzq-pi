@@ -19,6 +19,7 @@ function instantiate(
 			({ getSessionStats: () => ({ tokens: { total: stats.totalTokens }, cost: stats.cost }) }) as never,
 		abort,
 		limitState: state,
+		registerFinalJudge: () => {},
 	};
 	const extension = limitsDescriptor.factory(ctx, { limits });
 	const factory = typeof extension === "function" ? extension : extension.factory;
@@ -51,6 +52,7 @@ describe("limits plugin", () => {
 			getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 			abort: () => {},
 			limitState: { turns: 0 },
+			registerFinalJudge: () => {},
 		};
 		expect(() => limitsDescriptor.factory(ctx)).toThrow(/was instantiated without its LimitsOptions\.limits/);
 		expect(() => limitsDescriptor.factory(ctx, {})).toThrow(/was instantiated without its LimitsOptions\.limits/);

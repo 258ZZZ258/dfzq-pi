@@ -49,6 +49,7 @@ function pluginContext(overrides: Partial<PluginContext> = {}): PluginContext {
 		getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 		abort: () => {},
 		limitState: { turns: 0 },
+		registerFinalJudge: () => {},
 		...overrides,
 	};
 }

@@ -11,6 +11,7 @@ function makeContext(): PluginContext {
 		},
 		abort: () => {},
 		limitState: { turns: 0 },
+		registerFinalJudge: () => {},
 	};
 }
 
@@ -93,6 +94,7 @@ describe("PluginRegistry", () => {
 			},
 			abort: () => {},
 			limitState: { turns: 0 },
+			registerFinalJudge: () => {},
 		};
 		registry.resolveAll(["probe"], ctx);
 		expect(seen).toHaveLength(1);
@@ -119,6 +121,7 @@ describe("PluginRegistry", () => {
 			getSession: () => session as never,
 			abort: () => {},
 			limitState: { turns: 0 },
+			registerFinalJudge: () => {},
 		};
 		registry.resolveAll(["late"], ctx);
 		session = { id: "assembled-later" };

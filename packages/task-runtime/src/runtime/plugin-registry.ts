@@ -1,6 +1,7 @@
 import type { AgentSession, InlineExtension } from "@earendil-works/pi-coding-agent";
 import { type PluginRef, pluginName, pluginOptions } from "../spec/types.ts";
 import type { LimitState } from "./contract.ts";
+import type { FinalJudge } from "./final-judge.ts";
 
 /**
  * 替换型 hook:返回值覆盖原值,同一 hook 挂两个插件会让后者静默盖掉前者。
@@ -27,6 +28,12 @@ export interface PluginContext {
 	getSession: () => AgentSession;
 	abort: () => void;
 	limitState: LimitState;
+	/**
+	 * 插件在**实例化时**登记终局判官。判官由 SessionRuntime.run() 在 prompt() 返回后
+	 * 统一驱动 —— 插件自己够不着那个时点(hook 只看得见单轮),所以这是它参与终局判定
+	 * 的唯一通路。登记顺序即执行顺序。
+	 */
+	registerFinalJudge: (judge: FinalJudge) => void;
 }
 
 export type PluginFactory = (ctx: PluginContext, options?: Record<string, unknown>) => InlineExtension;

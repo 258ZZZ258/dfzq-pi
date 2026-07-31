@@ -170,6 +170,31 @@ describe("assemble", () => {
 		expect(assembled.session.systemPrompt).not.toContain("DFZQ-APPENDED-ONE");
 	});
 
+	// 契约硬化(规格 §1.1):契约必须落在整篇 systemPrompt **之后**。
+	// ⚠ 这不是"放在最后"—— buildSystemPrompt 在 appendSystemPrompt 之后还会追加
+	// skills 摘要与 "Current working directory:" 行(system-prompt.ts:41-71)。
+	// 断言只钉住"在 systemPrompt 之后",不谎称末位。
+	it("places appendSystemPrompt after the entire systemPrompt body", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			pluginContext: pluginContext(),
+			spec: spec({
+				systemPrompt: "HEAD-MARKER 前置指引正文 TAIL-MARKER",
+				appendSystemPrompt: ["CONTRACT-MARKER"],
+			}),
+			profile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+		const prompt = assembled.session.systemPrompt;
+		expect(prompt.indexOf("CONTRACT-MARKER")).toBeGreaterThan(prompt.indexOf("TAIL-MARKER"));
+	});
+
 	it("fails at assembly time when the toolset is unknown", async () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);

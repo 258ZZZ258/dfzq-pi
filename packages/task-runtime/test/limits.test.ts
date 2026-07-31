@@ -1,15 +1,29 @@
 import { describe, expect, it, vi } from "vitest";
+import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 import { createLimitsDescriptor, type LimitState } from "../src/runtime/plugins/limits.ts";
 
 interface CapturedHandlers {
 	turn_end?: (event: unknown) => Promise<unknown>;
 }
 
+/** limits 的 factory 目前不读 ctx(Task 5 才会把它搬进 registry),给个够用的最小占位。 */
+function stubContext(state: LimitState): PluginContext {
+	return {
+		specId: "s",
+		getRunId: () => "r",
+		getSession: () => {
+			throw new Error("not assembled yet");
+		},
+		abort: () => {},
+		limitState: state,
+	};
+}
+
 /** 用一个假 ExtensionAPI 捕获插件注册的 handler,不起真会话。 */
 function instantiate(state: LimitState, hooks: Parameters<typeof createLimitsDescriptor>[1]) {
 	const captured: CapturedHandlers = {};
 	const descriptor = createLimitsDescriptor(state, hooks);
-	const extension = descriptor.factory();
+	const extension = descriptor.factory(stubContext(state));
 	const api = {
 		on: (type: keyof CapturedHandlers, handler: (event: unknown) => Promise<unknown>) => {
 			captured[type] = handler;

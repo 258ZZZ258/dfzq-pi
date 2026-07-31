@@ -12,7 +12,13 @@ import { type ProviderProfile, profileRoles, requireApiKey, resolveRole } from "
 import type { PluginRef, RuntimeSpec } from "../spec/types.ts";
 import { validateSpec } from "../spec/validate.ts";
 import type { ToolsetRegistry } from "../toolsets/registry.ts";
-import { instantiatePlugins, type PluginDescriptor, type PluginEntry, type PluginRegistry } from "./plugin-registry.ts";
+import {
+	instantiatePlugins,
+	type PluginContext,
+	type PluginDescriptor,
+	type PluginEntry,
+	type PluginRegistry,
+} from "./plugin-registry.ts";
 
 export interface AssembleOptions {
 	spec: RuntimeSpec;
@@ -31,6 +37,8 @@ export interface AssembleOptions {
 	 * 它们与 spec 声明的插件共用同一次替换型 hook 冲突校验(instantiatePlugins)。
 	 */
 	builtinPlugins?: readonly PluginDescriptor[];
+	/** 本次装配的 per-run 上下文,透传给每个插件工厂。 */
+	pluginContext: PluginContext;
 	/** 测试缝:绕过 ProviderProfile,直接用已注册的 faux 模型 */
 	modelOverride?: {
 		modelRuntime: ModelRuntime;
@@ -109,7 +117,7 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			...(options.builtinPlugins ?? []).map((descriptor) => ({ descriptor })),
 			...registry.lookupAll(specPluginRefs),
 		];
-		const extensionFactories = instantiatePlugins(pluginEntries);
+		const extensionFactories = instantiatePlugins(pluginEntries, options.pluginContext);
 
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,

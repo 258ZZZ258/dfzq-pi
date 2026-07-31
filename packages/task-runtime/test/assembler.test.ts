@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import { assemble } from "../src/runtime/assembler.ts";
-import { PluginRegistry } from "../src/runtime/plugin-registry.ts";
+import { type PluginContext, PluginRegistry } from "../src/runtime/plugin-registry.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
 import { createFauxHarness, fauxAssistantMessage } from "./helpers/faux.ts";
@@ -34,6 +34,19 @@ function spec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
 		limits: { maxTurns: 5 },
 		systemPrompt: "You are a test agent.",
 		...overrides,
+	};
+}
+
+/** assemble() 的 per-run 上下文对本文件里的用例全是透传项,给个够用的最小占位。 */
+function pluginContext(): PluginContext {
+	return {
+		specId: "demo",
+		getRunId: () => "r1",
+		getSession: () => {
+			throw new Error("not assembled yet");
+		},
+		abort: () => {},
+		limitState: { turns: 0 },
 	};
 }
 
@@ -75,6 +88,7 @@ describe("assemble", () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);
 		const assembled = await assemble({
+			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
 			registry: new PluginRegistry(),
@@ -92,6 +106,7 @@ describe("assemble", () => {
 		cleanups.push(harness.cleanup);
 		harness.faux.setResponses([fauxAssistantMessage("hello from faux")]);
 		const assembled = await assemble({
+			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
 			registry: new PluginRegistry(),
@@ -113,6 +128,7 @@ describe("assemble", () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);
 		const assembled = await assemble({
+			pluginContext: pluginContext(),
 			spec: spec({ appendSystemPrompt: ["DFZQ-APPENDED-ONE", "DFZQ-APPENDED-TWO"] }),
 			profile,
 			registry: new PluginRegistry(),
@@ -133,6 +149,7 @@ describe("assemble", () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);
 		const assembled = await assemble({
+			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
 			registry: new PluginRegistry(),
@@ -150,6 +167,7 @@ describe("assemble", () => {
 		cleanups.push(harness.cleanup);
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec({ toolset: "missing" }),
 				profile,
 				registry: new PluginRegistry(),
@@ -172,6 +190,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 		cleanups.push(harness.cleanup);
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec({ tools: ["echo", "typo"] }),
 				profile,
 				registry: new PluginRegistry(),
@@ -188,6 +207,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 		cleanups.push(harness.cleanup);
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec({ excludeTools: ["typo"] }),
 				profile,
 				registry: new PluginRegistry(),
@@ -211,6 +231,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 		const disposeSpy = vi.fn(async () => {});
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec({ tools: ["echo", "typo"] }),
 				profile,
 				registry: new PluginRegistry(),
@@ -229,6 +250,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 		const disposeSpy = vi.fn(async () => {});
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec({ excludeTools: ["typo"] }),
 				profile,
 				registry: new PluginRegistry(),
@@ -256,6 +278,7 @@ describe("assemble - builtinPlugins", () => {
 
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec({ extraPlugins: ["shaper"] }),
 				profile,
 				registry: specPlugins,
@@ -278,6 +301,7 @@ describe("assemble - builtinPlugins", () => {
 
 		for (let i = 0; i < 2; i += 1) {
 			const assembled = await assemble({
+				pluginContext: pluginContext(),
 				spec: spec(),
 				profile,
 				registry: shared,
@@ -322,6 +346,7 @@ describe("assemble - resolveModel (no modelOverride)", () => {
 			},
 		};
 		const assembled = await assemble({
+			pluginContext: pluginContext(),
 			spec: spec(),
 			profile: realProfile,
 			registry: new PluginRegistry(),
@@ -369,6 +394,7 @@ describe("assemble - resolveModel (no modelOverride)", () => {
 		};
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec(),
 				profile: missingProfile,
 				registry: new PluginRegistry(),
@@ -399,6 +425,7 @@ describe("assemble - toolset handle ownership", () => {
 		});
 
 		const first = await assemble({
+			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
 			registry: new PluginRegistry(),
@@ -408,6 +435,7 @@ describe("assemble - toolset handle ownership", () => {
 			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
 		});
 		const second = await assemble({
+			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
 			registry: new PluginRegistry(),
@@ -439,6 +467,7 @@ describe("assemble - toolset handle ownership", () => {
 
 		await expect(
 			assemble({
+				pluginContext: pluginContext(),
 				spec: spec({ extraPlugins: ["a", "b"] }),
 				profile,
 				registry: conflictingPlugins,

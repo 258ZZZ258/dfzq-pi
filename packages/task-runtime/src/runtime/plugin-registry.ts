@@ -1,5 +1,6 @@
-import type { InlineExtension } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, InlineExtension } from "@earendil-works/pi-coding-agent";
 import { type PluginRef, pluginName, pluginOptions } from "../spec/types.ts";
+import type { LimitState } from "./contract.ts";
 
 /**
  * 替换型 hook:返回值覆盖原值,同一 hook 挂两个插件会让后者静默盖掉前者。
@@ -12,7 +13,23 @@ const REPLACING_HOOKS: ReadonlySet<string> = new Set([
 	"session_before_compact",
 ]);
 
-export type PluginFactory = (options?: Record<string, unknown>) => InlineExtension;
+/**
+ * 一次装配(= 一个 SessionRuntime)的上下文。插件在**实例化时**从这里拿 per-run 依赖,
+ * 这样 PluginRegistry 可以回归它的进程级定位:描述符启动时注册一次,状态在实例化时注入。
+ *
+ * getSession / getRunId 必须是**惰性句柄**,不能换成实例字段:插件在 assemble() 的
+ * 内部被实例化,那时 AgentSession 还没造出来;runId 则在 S3 按 specId 池化之后会
+ * 一个 session 跨多个 run 地变。
+ */
+export interface PluginContext {
+	specId: string;
+	getRunId: () => string;
+	getSession: () => AgentSession;
+	abort: () => void;
+	limitState: LimitState;
+}
+
+export type PluginFactory = (ctx: PluginContext, options?: Record<string, unknown>) => InlineExtension;
 
 export interface PluginDescriptor {
 	name: string;
@@ -30,12 +47,11 @@ export interface PluginEntry {
 /**
  * 实例化一组已定位的插件,并做替换型 hook 冲突校验。
  *
- * 故意做成自由函数而不是 PluginRegistry 的方法:per-run 的内置插件(limits 等)的描述符
- * 闭包捕获了本次 run 的状态,不能进进程级的 registry(见下方 PluginRegistry 的说明),
- * 但它们和 spec 声明的进程级插件最终挂在同一个 session 上,所以必须参与**同一次**冲突
- * 校验 —— 绕过 registry 不等于可以绕过这层保护。
+ * 做成自由函数而不是 PluginRegistry 的方法:调用方(assembler)要把 spec 声明的插件与
+ * 无条件挂载的 limits 拼成同一张表,再做**一次**冲突校验 —— 分两次校验等于两个插件
+ * 各自认为自己独占了同一个替换型 hook。
  */
-export function instantiatePlugins(entries: readonly PluginEntry[]): InlineExtension[] {
+export function instantiatePlugins(entries: readonly PluginEntry[], ctx: PluginContext): InlineExtension[] {
 	const claimed = new Map<string, string>();
 	const out: InlineExtension[] = [];
 	for (const { descriptor, options } of entries) {
@@ -50,7 +66,7 @@ export function instantiatePlugins(entries: readonly PluginEntry[]): InlineExten
 			}
 			claimed.set(hook, descriptor.name);
 		}
-		out.push(descriptor.factory(options));
+		out.push(descriptor.factory(ctx, options));
 	}
 	return out;
 }
@@ -96,7 +112,7 @@ export class PluginRegistry {
 	}
 
 	/** 解析并做替换型 hook 冲突校验。任何问题在装配期抛。 */
-	resolveAll(refs: readonly PluginRef[]): InlineExtension[] {
-		return instantiatePlugins(this.lookupAll(refs));
+	resolveAll(refs: readonly PluginRef[], ctx: PluginContext): InlineExtension[] {
+		return instantiatePlugins(this.lookupAll(refs), ctx);
 	}
 }

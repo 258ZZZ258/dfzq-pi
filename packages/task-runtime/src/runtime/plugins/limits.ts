@@ -1,12 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { RuntimeLimits } from "../../spec/types.ts";
-import type { LimitKind } from "../contract.ts";
+import type { LimitKind, LimitState } from "../contract.ts";
 import type { PluginDescriptor } from "../plugin-registry.ts";
 
-export interface LimitState {
-	turns: number;
-	tripped?: LimitKind;
-}
+export type { LimitState } from "../contract.ts";
 
 export interface LimitsHooks {
 	limits: RuntimeLimits;
@@ -25,7 +22,7 @@ export function createLimitsDescriptor(state: LimitState, hooks: LimitsHooks): P
 	return {
 		name: LIMITS_PLUGIN_NAME,
 		hooks: ["turn_end"], // 观察型,可与 stopPolicy 叠加
-		factory: () => ({
+		factory: (_ctx) => ({
 			name: LIMITS_PLUGIN_NAME,
 			factory: (pi: ExtensionAPI) => {
 				pi.on("turn_end", async () => {

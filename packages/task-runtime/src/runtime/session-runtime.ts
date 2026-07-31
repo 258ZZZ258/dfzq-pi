@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { type Assembled, type AssembleOptions, assemble } from "./assembler.ts";
 import type { LimitKind, RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
+import type { PluginContext } from "./plugin-registry.ts";
 import { createLimitsDescriptor, type LimitState } from "./plugins/limits.ts";
 
-export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "builtinPlugins">;
+export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "builtinPlugins" | "pluginContext">;
 
 export async function createSessionRuntime(options: CreateSessionRuntimeOptions): Promise<Runtime> {
 	const state: LimitState = { turns: 0 };
@@ -15,6 +16,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	// further down: referencing that later `const` from here would trip TS2448 ("used before
 	// its declaration"), since the closure and the declaration live in the same function scope.
 	let assembled!: Assembled;
+	let currentRunId = "";
 
 	// The limits descriptor closes over `state` / `abortFn` / this call's `assembled` -- all
 	// strictly per-run. It is handed to assemble() as an *instance* rather than registered
@@ -31,7 +33,15 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		abort: () => abortFn(),
 	});
 
-	assembled = await assemble({ ...options, builtinPlugins: [limitsPlugin] });
+	const pluginContext: PluginContext = {
+		specId: options.spec.id,
+		getRunId: () => currentRunId,
+		getSession: () => assembled.session,
+		abort: () => abortFn(),
+		limitState: state,
+	};
+
+	assembled = await assemble({ ...options, builtinPlugins: [limitsPlugin], pluginContext });
 	const session = assembled.session;
 	// abortFn is invoked from two synchronous callbacks -- the limits plugin's `turn_end`
 	// hook and the runTimeoutMs setTimeout below -- neither of which can be made to `await`
@@ -54,7 +64,6 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	const id = randomUUID();
 	const specId = assembled.specId;
 	let seq = 0;
-	let currentRunId = "";
 	let lastActiveAt = Date.now();
 	const listeners = new Set<(event: RuntimeEvent) => void>();
 

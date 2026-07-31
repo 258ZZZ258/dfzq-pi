@@ -1,5 +1,10 @@
 # Development Rules
 
+## DFZQ Task Runtime Scope
+
+- Put all subsequent DFZQ task-runtime feature development in `packages/task-runtime`.
+- Do not modify Pi upstream packages (`packages/agent`, `packages/ai`, `packages/coding-agent`, or `packages/tui`) for this work unless the user explicitly requests it.
+
 ## Conversational Style
 
 - Keep answers short and concise

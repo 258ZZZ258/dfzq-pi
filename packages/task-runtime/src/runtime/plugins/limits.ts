@@ -1,48 +1,48 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { RuntimeLimits } from "../../spec/types.ts";
 import type { LimitKind, LimitState } from "../contract.ts";
-import type { PluginDescriptor } from "../plugin-registry.ts";
-
-export type { LimitState };
-
-export interface LimitsHooks {
-	limits: RuntimeLimits;
-	getStats: () => { totalTokens: number; cost: number };
-	abort: () => void;
-}
+import type { PluginContext, PluginDescriptor } from "../plugin-registry.ts";
 
 export const LIMITS_PLUGIN_NAME = "limits";
+
+/** assembler 构造的 options 形状。不来自 spec JSON 的插件声明,来自 spec.limits 字段。 */
+export interface LimitsOptions {
+	limits: RuntimeLimits;
+}
 
 /**
  * pi 的 shouldStopAfterTurn 在 Agent 层就断了(agent.ts 零引用),AgentSession 够不着。
  * 所以限额只能数 turn_end + abort()。runTimeoutMs 由 SessionRuntime 用 setTimeout 挂,
  * 写同一个 LimitState。
+ *
+ * 进程级描述符:per-run 状态全部从 ctx 取,所以同一个 PluginRegistry 可以被反复复用。
  */
-export function createLimitsDescriptor(state: LimitState, hooks: LimitsHooks): PluginDescriptor {
-	return {
-		name: LIMITS_PLUGIN_NAME,
-		hooks: ["turn_end"], // 观察型,可与 stopPolicy 叠加
-		factory: (_ctx) => ({
+export const limitsDescriptor: PluginDescriptor = {
+	name: LIMITS_PLUGIN_NAME,
+	hooks: ["turn_end"], // 观察型,可与 stopPolicy 叠加
+	factory: (ctx: PluginContext, options?: Record<string, unknown>) => {
+		const limits = ((options ?? {}) as Partial<LimitsOptions>).limits ?? {};
+		const state = ctx.limitState;
+		return {
 			name: LIMITS_PLUGIN_NAME,
 			factory: (pi: ExtensionAPI) => {
 				pi.on("turn_end", async () => {
 					if (state.tripped) return; // 已触发过,不重复 abort
 					state.turns += 1;
-					const tripped = evaluate(state, hooks);
+					const tripped = evaluate(state, limits, ctx);
 					if (!tripped) return;
 					state.tripped = tripped;
-					hooks.abort();
+					ctx.abort();
 				});
 			},
-		}),
-	};
-}
+		};
+	},
+};
 
-function evaluate(state: LimitState, hooks: LimitsHooks): LimitKind | undefined {
-	const { limits } = hooks;
+function evaluate(state: LimitState, limits: RuntimeLimits, ctx: PluginContext): LimitKind | undefined {
 	if (limits.maxTurns !== undefined && state.turns >= limits.maxTurns) return "maxTurns";
-	const stats = hooks.getStats();
-	if (limits.maxTotalTokens !== undefined && stats.totalTokens > limits.maxTotalTokens) return "maxTotalTokens";
+	const stats = ctx.getSession().getSessionStats();
+	if (limits.maxTotalTokens !== undefined && stats.tokens.total > limits.maxTotalTokens) return "maxTotalTokens";
 	if (limits.maxCostUsd !== undefined && stats.cost > limits.maxCostUsd) return "maxCostUsd";
 	return undefined;
 }

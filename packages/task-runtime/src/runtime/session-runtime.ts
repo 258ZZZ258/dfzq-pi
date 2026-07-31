@@ -1,38 +1,26 @@
 import { randomUUID } from "node:crypto";
 import { type Assembled, type AssembleOptions, assemble } from "./assembler.ts";
-import type { LimitKind, RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
+import type { LimitKind, LimitState, RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
 import type { PluginContext } from "./plugin-registry.ts";
-import { createLimitsDescriptor, type LimitState } from "./plugins/limits.ts";
 
-export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "builtinPlugins" | "pluginContext">;
+export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "pluginContext">;
 
 export async function createSessionRuntime(options: CreateSessionRuntimeOptions): Promise<Runtime> {
 	const state: LimitState = { turns: 0 };
 	let abortFn: () => void = () => {};
-	// `assemble()` hasn't run yet when the limits descriptor is built below, but the
-	// descriptor's `getStats` closure is only ever invoked from a `turn_end` hook -- i.e.
-	// after `assemble()` has resolved and assigned this. Declared with `let ...!:` (definite
-	// assignment assertion) rather than reading `assembled` from the outer `const` declared
-	// further down: referencing that later `const` from here would trip TS2448 ("used before
-	// its declaration"), since the closure and the declaration live in the same function scope.
+	// `assemble()` hasn't run yet when `pluginContext` is built below, but its `getSession`
+	// handle is only ever invoked from a hook -- i.e. after `assemble()` has resolved and
+	// assigned this. Declared with `let ...!:` (definite assignment assertion) rather than
+	// reading `assembled` from the outer `const` declared further down: referencing that later
+	// `const` from here would trip TS2448 ("used before its declaration"), since the closure
+	// and the declaration live in the same function scope.
 	let assembled!: Assembled;
 	let currentRunId = "";
 
-	// The limits descriptor closes over `state` / `abortFn` / this call's `assembled` -- all
-	// strictly per-run. It is handed to assemble() as an *instance* rather than registered
-	// into `options.registry` by name: PluginRegistry is process-level, and writing per-run
-	// state into it made a shared registry single-use (a second createSessionRuntime() threw
-	// `Plugin "limits" is already registered`) and concurrent runs cross-contaminating. Same
-	// invariant as ToolsetRegistry's `providers` -- see plugin-registry.ts / toolsets/registry.ts.
-	const limitsPlugin = createLimitsDescriptor(state, {
-		limits: options.spec.limits,
-		getStats: () => {
-			const stats = assembled.session.getSessionStats();
-			return { totalTokens: stats.tokens.total, cost: stats.cost };
-		},
-		abort: () => abortFn(),
-	});
-
+	// limits 不在这里构造描述符了:它是 createDefaultPluginRegistry() 里的进程级描述符,
+	// 由 assemble() 从 options.registry 无条件 lookup 出来。本次 run 的状态(LimitState、
+	// abort 句柄)全部经下面这个 PluginContext 注入 —— 所以一个 PluginRegistry 可以被
+	// 反复复用,也不会在并发 run 之间串状态。见 plugin-registry.ts 的类注释。
 	const pluginContext: PluginContext = {
 		specId: options.spec.id,
 		getRunId: () => currentRunId,
@@ -41,7 +29,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		limitState: state,
 	};
 
-	assembled = await assemble({ ...options, builtinPlugins: [limitsPlugin], pluginContext });
+	assembled = await assemble({ ...options, pluginContext });
 	const session = assembled.session;
 	// abortFn is invoked from two synchronous callbacks -- the limits plugin's `turn_end`
 	// hook and the runTimeoutMs setTimeout below -- neither of which can be made to `await`

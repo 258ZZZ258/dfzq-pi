@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { attachTrajectory } from "../observability/trajectory.ts";
-import { PluginRegistry } from "../runtime/plugin-registry.ts";
+import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
@@ -58,7 +58,7 @@ async function main(): Promise<void> {
 	const runtime = await createSessionRuntime({
 		spec,
 		profile,
-		registry: new PluginRegistry(),
+		registry: createDefaultPluginRegistry(),
 		toolsets,
 		cwd: join(workdir, "workspace"),
 		agentDir: join(workdir, "agent"),

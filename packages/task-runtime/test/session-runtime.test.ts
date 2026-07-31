@@ -2,7 +2,8 @@ import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
-import { type PluginContext, PluginRegistry } from "../src/runtime/plugin-registry.ts";
+import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
+import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 import { createSessionRuntime } from "../src/runtime/session-runtime.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
@@ -60,7 +61,7 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1)
 	}
 }
 
-async function build(limits: RuntimeSpec["limits"], responses: unknown[], registry = new PluginRegistry()) {
+async function build(limits: RuntimeSpec["limits"], responses: unknown[], registry = createDefaultPluginRegistry()) {
 	const harness = await createFauxHarness();
 	cleanups.push(harness.cleanup);
 	harness.faux.setResponses(responses as never);
@@ -250,10 +251,12 @@ describe("SessionRuntime - shared PluginRegistry", () => {
 	// the per-run limits descriptor into the caller's PluginRegistry. That made a shared
 	// registry single-use -- the second createSessionRuntime() threw
 	// `Plugin "limits" is already registered` -- which the whole tree hid by passing a fresh
-	// `new PluginRegistry()` at all 15 call sites. S1a (concurrent requests) and S3 (pooling
-	// by specId) both reuse one process-level registry, so this must hold.
+	// registry at all 15 call sites. S1a (concurrent requests) and S3 (pooling by specId) both
+	// reuse one process-level registry, so this must hold.
+	// Task 5 起 limits 是 createDefaultPluginRegistry() 里的进程级描述符,只被 lookup、
+	// 不再被 register —— 这两条锁因此更强了:共享的表里现在**真的有**这个插件。
 	it("creates two runtimes in sequence from one shared PluginRegistry", async () => {
-		const shared = new PluginRegistry();
+		const shared = createDefaultPluginRegistry();
 
 		const first = await build({ maxTurns: 5 }, [fauxAssistantMessage("first")], shared);
 		const firstResult = await first.run("hello");
@@ -270,7 +273,7 @@ describe("SessionRuntime - shared PluginRegistry", () => {
 	// has maxTurns:1 (trips immediately) while runtime B has maxTurns:5 (must complete).
 	// A shared LimitState would show up as B inheriting A's tripped limit.
 	it("keeps per-run limit state isolated between two runtimes sharing one PluginRegistry", async () => {
-		const shared = new PluginRegistry();
+		const shared = createDefaultPluginRegistry();
 		const tripping = await build({ maxTurns: 1 }, [fauxAssistantMessage("a")], shared);
 		const roomy = await build({ maxTurns: 5 }, [fauxAssistantMessage("b")], shared);
 
@@ -319,7 +322,7 @@ describe("SessionRuntime - PluginContext wiring (review I-1)", () => {
 
 	it("hands spec-declared plugins the real PluginContext: getRunId varies per run, getSession resolves to the live session", async () => {
 		let capturedCtx: PluginContext | undefined;
-		const registry = new PluginRegistry();
+		const registry = createDefaultPluginRegistry();
 		registry.register({
 			name: "probe",
 			hooks: [],
@@ -368,7 +371,7 @@ describe("SessionRuntime - PluginContext wiring (review I-1)", () => {
 
 	it("forwards ctx.abort() to the real session.abort(), not a snapshot of the initial no-op", async () => {
 		let capturedAbort: (() => void) | undefined;
-		const registry = new PluginRegistry();
+		const registry = createDefaultPluginRegistry();
 		registry.register({
 			name: "probe",
 			hooks: [],

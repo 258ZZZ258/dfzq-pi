@@ -3,6 +3,8 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import { assemble } from "../src/runtime/assembler.ts";
+import type { LimitState } from "../src/runtime/contract.ts";
+import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import { type PluginContext, PluginRegistry } from "../src/runtime/plugin-registry.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
@@ -37,16 +39,17 @@ function spec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
 	};
 }
 
-/** assemble() 的 per-run 上下文对本文件里的用例全是透传项,给个够用的最小占位。 */
-function pluginContext(): PluginContext {
+/** assemble() 的 per-run 上下文。本文件的用例不测限额,但 limits 现在是**无条件挂载**的
+ *  (assembler.ts 从 registry lookup 出来),它的 turn_end 会真的读 getSession() —— 所以
+ *  这里给的是一个能应答 getSessionStats() 的占位 session,不能是 throw。 */
+function pluginContext(overrides: Partial<PluginContext> = {}): PluginContext {
 	return {
 		specId: "demo",
 		getRunId: () => "r1",
-		getSession: () => {
-			throw new Error("not assembled yet");
-		},
+		getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 		abort: () => {},
 		limitState: { turns: 0 },
+		...overrides,
 	};
 }
 
@@ -91,7 +94,7 @@ describe("assemble", () => {
 			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: harness.cwd,
 			agentDir: harness.agentDir,
@@ -109,7 +112,7 @@ describe("assemble", () => {
 			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: harness.cwd,
 			agentDir: harness.agentDir,
@@ -131,7 +134,7 @@ describe("assemble", () => {
 			pluginContext: pluginContext(),
 			spec: spec({ appendSystemPrompt: ["DFZQ-APPENDED-ONE", "DFZQ-APPENDED-TWO"] }),
 			profile,
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: harness.cwd,
 			agentDir: harness.agentDir,
@@ -152,7 +155,7 @@ describe("assemble", () => {
 			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: harness.cwd,
 			agentDir: harness.agentDir,
@@ -170,7 +173,7 @@ describe("assemble", () => {
 				pluginContext: pluginContext(),
 				spec: spec({ toolset: "missing" }),
 				profile,
-				registry: new PluginRegistry(),
+				registry: createDefaultPluginRegistry(),
 				toolsets: toolsets(),
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
@@ -193,7 +196,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 				pluginContext: pluginContext(),
 				spec: spec({ tools: ["echo", "typo"] }),
 				profile,
-				registry: new PluginRegistry(),
+				registry: createDefaultPluginRegistry(),
 				toolsets: toolsets(),
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
@@ -210,7 +213,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 				pluginContext: pluginContext(),
 				spec: spec({ excludeTools: ["typo"] }),
 				profile,
-				registry: new PluginRegistry(),
+				registry: createDefaultPluginRegistry(),
 				toolsets: toolsets(),
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
@@ -234,7 +237,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 				pluginContext: pluginContext(),
 				spec: spec({ tools: ["echo", "typo"] }),
 				profile,
-				registry: new PluginRegistry(),
+				registry: createDefaultPluginRegistry(),
 				toolsets: toolsetsWithDispose(disposeSpy),
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
@@ -253,7 +256,7 @@ describe("assemble - tool whitelist cross-validation", () => {
 				pluginContext: pluginContext(),
 				spec: spec({ excludeTools: ["typo"] }),
 				profile,
-				registry: new PluginRegistry(),
+				registry: createDefaultPluginRegistry(),
 				toolsets: toolsetsWithDispose(disposeSpy),
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
@@ -264,57 +267,95 @@ describe("assemble - tool whitelist cross-validation", () => {
 	});
 });
 
-describe("assemble - builtinPlugins", () => {
-	// Regression lock (final fix round, finding 1): builtinPlugins used to be plugin *names*
-	// resolved out of the shared PluginRegistry, which forced per-run descriptors into a
-	// process-level table. They are now descriptor instances that never touch the registry --
-	// but they must still take part in the same replacing-hook conflict check as spec plugins,
-	// otherwise bypassing the registry would silently drop that protection.
-	it("rejects a replacing-hook conflict between a builtin plugin and a spec-declared plugin", async () => {
+describe("assemble - implicit limits plugin", () => {
+	// 风险 12 的核心回归锁。limits 过去走 assemble({ builtinPlugins }) 的侧门,于是
+	// PluginRegistry 在**所有**生产路径上都是空表,任何声明命名插件的 spec 装配即失败。
+	// limits 现在由 assemble() 从 registry 无条件 lookup —— 空表必须**响亮地**失败,
+	// 绝不能"registry 里没有就跳过"。那种兜底正是这次重构要消灭的静默失败本身。
+	it("throws instead of silently skipping when the registry has no limits descriptor", async () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);
-		const specPlugins = new PluginRegistry();
-		specPlugins.register({ name: "shaper", hooks: ["tool_result"], factory: () => ({}) as never });
+		await expect(
+			assemble({
+				pluginContext: pluginContext(),
+				spec: spec(),
+				profile,
+				registry: new PluginRegistry(), // 裸表 = 误用;唯一合法来源是 createDefaultPluginRegistry()
+				toolsets: toolsets(),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			}),
+		).rejects.toThrow(/plugin "limits" is not registered/);
+	});
+
+	// 接替原 `assemble - builtinPlugins` 的第 1 条(它锁的是"绕过 registry 的内置插件也照样
+	// 受替换型 hook 保护")。builtinPlugins 删掉后已经没有"绕过"可言 —— 全部插件走同一张表、
+	// 同一次校验。但替换型 hook 冲突校验本身仍要独立锁一条:下面 "toolset handle ownership"
+	// 里那条同场景用例的主断言是 handle 释放,冲突只是它的触发手段,且不校验插件名。
+	it("rejects a replacing-hook conflict between two spec-declared plugins, naming both", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const registry = createDefaultPluginRegistry();
+		registry.register({ name: "shaper", hooks: ["tool_result"], factory: () => ({}) as never });
+		registry.register({ name: "trimmer", hooks: ["tool_result"], factory: () => ({}) as never });
 
 		await expect(
 			assemble({
 				pluginContext: pluginContext(),
-				spec: spec({ extraPlugins: ["shaper"] }),
+				spec: spec({ extraPlugins: ["shaper", "trimmer"] }),
 				profile,
-				registry: specPlugins,
+				registry,
 				toolsets: toolsets(),
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
 				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
-				builtinPlugins: [{ name: "builtin-shaper", hooks: ["tool_result"], factory: () => ({}) as never }],
 			}),
-		).rejects.toThrow(/replacing hook "tool_result".*builtin-shaper.*shaper/s);
+		).rejects.toThrow(/replacing hook "tool_result".*"shaper".*"trimmer"/s);
 	});
 
-	// Observing hooks stack, and a builtin descriptor must never be written into the registry:
-	// the same descriptor instance can be passed to two assemble() calls off one registry.
-	it("does not write builtin plugin descriptors into the shared PluginRegistry", async () => {
+	// 接替原第 2 条(`expect([...shared.names()]).toEqual([])`,锁"内置描述符绝不写进
+	// registry")。limits 现在**本来就在**表里,那条断言的前提消失,换成更强的不变量:
+	// 同一个 registry 连续两次 assemble 既不撞 already-registered,表内容也没被写脏
+	// (assemble 只 lookup 不 register),且两次的 per-run LimitState 互不串。
+	it("reuses one registry across two assemblies without already-registered, keeping limit state per-run", async () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);
-		const shared = new PluginRegistry();
-		const builtin = { name: "counter", hooks: ["turn_end"], factory: () => ({ name: "counter", factory: () => {} }) };
+		harness.faux.setResponses([fauxAssistantMessage("first")]);
+		const shared = createDefaultPluginRegistry();
+		const stateA: LimitState = { turns: 0 };
+		const stateB: LimitState = { turns: 0 };
 
-		for (let i = 0; i < 2; i += 1) {
-			const assembled = await assemble({
-				pluginContext: pluginContext(),
-				spec: spec(),
-				profile,
-				registry: shared,
-				toolsets: toolsets(),
-				cwd: harness.cwd,
-				agentDir: harness.agentDir,
-				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
-				builtinPlugins: [builtin as never],
-			});
-			cleanups.push(assembled.dispose);
-		}
+		const first = await assemble({
+			pluginContext: pluginContext({ limitState: stateA }),
+			spec: spec(),
+			profile,
+			registry: shared,
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(first.dispose);
+		const second = await assemble({
+			pluginContext: pluginContext({ limitState: stateB }),
+			spec: spec(),
+			profile,
+			registry: shared,
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(second.dispose);
 
-		expect([...shared.names()]).toEqual([]);
+		// 进程级表没被写脏:两次装配都只 lookup,没有任何 per-run 东西 register 进去。
+		expect([...shared.names()]).toEqual(["limits"]);
+
+		// 只驱动第一个 session,第二个的 LimitState 必须纹丝不动。
+		await first.session.prompt("hi");
+		expect(stateA.turns).toBe(1);
+		expect(stateB.turns).toBe(0);
 	});
 });
 
@@ -349,7 +390,7 @@ describe("assemble - resolveModel (no modelOverride)", () => {
 			pluginContext: pluginContext(),
 			spec: spec(),
 			profile: realProfile,
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: toolsets(),
 			cwd: harness.cwd,
 			agentDir: harness.agentDir,
@@ -397,7 +438,7 @@ describe("assemble - resolveModel (no modelOverride)", () => {
 				pluginContext: pluginContext(),
 				spec: spec(),
 				profile: missingProfile,
-				registry: new PluginRegistry(),
+				registry: createDefaultPluginRegistry(),
 				toolsets: toolsets(),
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
@@ -428,7 +469,7 @@ describe("assemble - toolset handle ownership", () => {
 			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: sharedToolsets,
 			cwd: harness.cwd,
 			agentDir: harness.agentDir,
@@ -438,7 +479,7 @@ describe("assemble - toolset handle ownership", () => {
 			pluginContext: pluginContext(),
 			spec: spec(),
 			profile,
-			registry: new PluginRegistry(),
+			registry: createDefaultPluginRegistry(),
 			toolsets: sharedToolsets,
 			cwd: harness.cwd,
 			agentDir: harness.agentDir,
@@ -461,7 +502,7 @@ describe("assemble - toolset handle ownership", () => {
 		const harness = await createFauxHarness();
 		cleanups.push(harness.cleanup);
 		const disposeSpy = vi.fn(async () => {});
-		const conflictingPlugins = new PluginRegistry();
+		const conflictingPlugins = createDefaultPluginRegistry();
 		conflictingPlugins.register({ name: "a", hooks: ["tool_result"], factory: () => ({}) as never });
 		conflictingPlugins.register({ name: "b", hooks: ["tool_result"], factory: () => ({}) as never });
 

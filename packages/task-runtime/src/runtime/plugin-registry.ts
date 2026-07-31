@@ -76,8 +76,11 @@ export function instantiatePlugins(entries: readonly PluginEntry[], ctx: PluginC
  * (LimitState、本次 run 的 abort 句柄……)都不得通过 register() 进到这里 —— 这与
  * toolsets/registry.ts 里 `providers` 的不变量是同一条。违反它的直接后果:同一个
  * PluginRegistry 第二次被复用就撞 "already registered",而 S1a 的并发请求与 S3 的按
- * specId 池化本来就要求一个 registry 被反复复用。per-run 插件走 assemble() 的
- * `builtinPlugins`(直接传描述符实例),不经过这张表。
+ * specId 池化本来就要求一个 registry 被反复复用。per-run 状态一律走 PluginContext
+ * (实例化时注入),没有第二条绕开这张表的通路。
+ *
+ * 唯一合法的构造入口是 default-plugins.ts 的 createDefaultPluginRegistry():裸
+ * `new PluginRegistry()` 是空表,assemble() 会在 lookup "limits" 时直接抛。
  */
 export class PluginRegistry {
 	private readonly descriptors = new Map<string, PluginDescriptor>();

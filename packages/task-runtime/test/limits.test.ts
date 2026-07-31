@@ -41,6 +41,21 @@ describe("limits plugin", () => {
 		expect(createDefaultPluginRegistry().has("limits")).toBe(true);
 	});
 
+	// Regression lock (review M-1):缺 options 时过去走 `?? {}`,得到一个永不 abort 却照常
+	// 计数的空限额计数器 —— 正是让 review I-1 那条重复挂载**变静默**的直接原因。
+	// spec.limits 在 RuntimeSpec 上必填,所以正路上永远带得到 options;缺了就是误用,要响。
+	it("throws instead of silently becoming a zero-limit counter when options are missing", () => {
+		const ctx: PluginContext = {
+			specId: "s1",
+			getRunId: () => "r1",
+			getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
+			abort: () => {},
+			limitState: { turns: 0 },
+		};
+		expect(() => limitsDescriptor.factory(ctx)).toThrow(/was instantiated without its LimitsOptions\.limits/);
+		expect(() => limitsDescriptor.factory(ctx, {})).toThrow(/was instantiated without its LimitsOptions\.limits/);
+	});
+
 	it("aborts when maxTurns is exceeded", async () => {
 		const state: LimitState = { turns: 0 };
 		const abort = vi.fn();

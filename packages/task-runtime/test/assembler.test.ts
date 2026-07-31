@@ -289,6 +289,56 @@ describe("assemble - implicit limits plugin", () => {
 		).rejects.toThrow(/plugin "limits" is not registered/);
 	});
 
+	// Regression lock (review I-1):limits 进 registry 后,"limits" 成了一个**可解析的名字**,
+	// 于是 spec 能二次声明它 —— validateSpec 只查 knownPlugins 会放行,lookupAll 解析出第二个
+	// 条目,而 turn_end 是观察型 hook,替换型冲突校验不拦。两个实例共享同一个 ctx.limitState、
+	// 各自 turns += 1,maxTurns:5 在第 3 个真实回合就触发(实测 handlers mounted: 2)。
+	// 装配期必须响亮拒绝,**不许静默去重** —— 静默去重会让写错 spec 的人永远不知道写错了。
+	// 这条缝是本次重构引入的:旧路径 registry 恒空,validateSpec 会先抛 `not registered`。
+	it.each([
+		["extraPlugins", { extraPlugins: ["limits"] }],
+		["stopPolicy", { stopPolicy: "limits" }],
+	])("rejects a spec that re-declares the implicitly mounted limits plugin via %s", async (_field, overrides) => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		await expect(
+			assemble({
+				pluginContext: pluginContext(),
+				spec: spec(overrides),
+				profile,
+				registry: createDefaultPluginRegistry(),
+				toolsets: toolsets(),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			}),
+		).rejects.toThrow(/"limits" is mounted implicitly from spec\.limits and must not be declared as a plugin ref/);
+	});
+
+	// 只挂一次 —— 上面那条锁的是"重复声明被拒",这条锁的是"正常路径确实只有一个实例"。
+	// 没有它,把隐式 ref 整个删掉(limits 一次都不挂)也能让上面那条继续绿。
+	it("mounts exactly one limits instance on the normal path", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		harness.faux.setResponses([fauxAssistantMessage("once")]);
+		const state: LimitState = { turns: 0 };
+		const assembled = await assemble({
+			pluginContext: pluginContext({ limitState: state }),
+			spec: spec(),
+			profile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+
+		// 一个真实回合 => turns 恰好 +1。挂了两个实例的话这里会是 2。
+		await assembled.session.prompt("hi");
+		expect(state.turns).toBe(1);
+	});
+
 	// 接替原 `assemble - builtinPlugins` 的第 1 条(它锁的是"绕过 registry 的内置插件也照样
 	// 受替换型 hook 保护")。builtinPlugins 删掉后已经没有"绕过"可言 —— 全部插件走同一张表、
 	// 同一次校验。但替换型 hook 冲突校验本身仍要独立锁一条:下面 "toolset handle ownership"

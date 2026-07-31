@@ -21,7 +21,17 @@ export const limitsDescriptor: PluginDescriptor = {
 	name: LIMITS_PLUGIN_NAME,
 	hooks: ["turn_end"], // 观察型,可与 stopPolicy 叠加
 	factory: (ctx: PluginContext, options?: Record<string, unknown>) => {
-		const limits = ((options ?? {}) as Partial<LimitsOptions>).limits ?? {};
+		// 缺 options 只有一个来源:有人绕开 assembler 的 `{ limits: spec.limits }` 直接挂了
+		// 这个描述符(spec.limits 在 RuntimeSpec 上必填,validateSpec 还要求至少一项)。
+		// 过去这里是 `?? {}` —— 一个永不 abort 却照常计数的空限额计数器,正是把重复挂载
+		// 变静默的直接原因。让它响起来。
+		const limits = (options as Partial<LimitsOptions> | undefined)?.limits;
+		if (limits === undefined) {
+			throw new Error(
+				`plugin "${LIMITS_PLUGIN_NAME}" was instantiated without its LimitsOptions.limits; ` +
+					`it is mounted by assemble() from spec.limits and must not be declared as a plugin ref`,
+			);
+		}
 		const state = ctx.limitState;
 		return {
 			name: LIMITS_PLUGIN_NAME,

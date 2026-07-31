@@ -9,7 +9,7 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { type ProviderProfile, profileRoles, requireApiKey, resolveRole } from "../env/provider-profile.ts";
-import type { PluginRef, RuntimeSpec } from "../spec/types.ts";
+import { type PluginRef, pluginName, type RuntimeSpec } from "../spec/types.ts";
 import { validateSpec } from "../spec/validate.ts";
 import type { ToolsetRegistry } from "../toolsets/registry.ts";
 import { instantiatePlugins, type PluginContext, type PluginEntry, type PluginRegistry } from "./plugin-registry.ts";
@@ -95,6 +95,20 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			...(spec.approvalPolicy ? [spec.approvalPolicy] : []),
 			...(spec.extraPlugins ?? []),
 		];
+		// limits 现在是 registry 里一个**可解析的名字**,于是 `extraPlugins: ["limits"]` 之类
+		// 的声明能通过 validateSpec(它只查 knownPlugins),再被下面的 lookupAll 解析成第二个
+		// 条目。turn_end 是观察型 hook,替换型冲突校验不拦它 —— 两个实例共享同一个
+		// ctx.limitState、各自 `state.turns += 1`,于是 maxTurns:5 在第 3 个真实回合就触发。
+		// 这是限额子系统自身的静默错判,必须在装配期响亮拒绝。
+		// **不做静默去重**:悄悄丢掉重复项会让写错 spec 的人永远不知道自己写错了。
+		const duplicateLimits = specPluginRefs.find((ref) => pluginName(ref) === LIMITS_PLUGIN_NAME);
+		if (duplicateLimits) {
+			throw new Error(
+				`RuntimeSpec "${spec.id}": "${LIMITS_PLUGIN_NAME}" is mounted implicitly from spec.limits ` +
+					`and must not be declared as a plugin ref`,
+			);
+		}
+
 		// limits 由 spec.limits 字段驱动,不是 spec 声明的 PluginRef,所以在这里无条件
 		// 挂上。它和 spec 声明的插件走同一张表、同一次冲突校验 —— 不存在"内置插件绕过
 		// 替换型 hook 保护"的缝。

@@ -11,6 +11,10 @@ describe("internal token check", () => {
 		expect(checkInternalToken(undefined, "secret")).toBe("unauthorized");
 	});
 
+	it("rejects an empty-string header (falsy but not undefined)", () => {
+		expect(checkInternalToken("", "secret")).toBe("unauthorized");
+	});
+
 	it("rejects a wrong token", () => {
 		expect(checkInternalToken("wrong", "secret")).toBe("unauthorized");
 	});

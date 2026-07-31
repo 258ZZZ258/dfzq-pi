@@ -126,6 +126,21 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		// 两个,均不触发这条路径;若将来有插件借 tool_result 翻转 isError,需要同步复核这条
 		// 过滤是否还站得住。
 		//
+		// **result-budget 带来的另一条真实交互(2026-07-31 审查发现,不翻转 isError,但会动
+		// content 本身)**:`result-budget` 的 `maxChars` 截断是对已序列化文本的一次原始
+		// `slice`(见 plugins/result-budget.ts),截断点落在一段合法 JSON 中间时,产出的文本
+		// 对 `JSON.parse` 是非法输入,但对模型仍然可读——`agent-loop.ts` 的
+		// `finalizeExecutedToolCall` 把 hook 返回值写进 `finalized.result` 后,**同一份**
+		// `content` 既喂给这里订阅的 `tool_execution_end`(`collectClauseIds` 的数据源),也喂给
+		// `createToolResultMessage`(模型在下一轮 context 里读到的正是这份数据)。这意味着模型
+		// 可能从被截断的文本里读到一个完整的 `clause_id` 并合法引用,而 `collectClauseIds` 原本
+		// 会因为 JSON 解析失败而对这段结果一个 id 都不采——C6 把"basis 非空而 clauseIds 空"
+		// 判定为幻觉,于是一次真实检索、真实引用的回答会被误判成编造。`final-judge.ts` 的
+		// `collectClauseIds` 已经加了一条正则兜底(`scanClauseIdsFallback`,只在文本"看起来
+		// 是 JSON 但解析失败"时触发)来接住这种情形,守住"模型能读到的 clause_id,判官就必须
+		// 能采到"这条不变量;`maxHits` 截断没有这个问题(截断后仍是合法 JSON,被丢的 hits 模型
+		// 也看不见,两边始终一致)。
+		//
 		// try/catch 的理由与下面 listener fan-out 那圈**完全相同**,而且这里更靠前:这段代码
 		// 同样跑在 pi 无 try/catch 的 AgentSession._emit 里,抛出去会直接穿透 agent loop 打死
 		// 在跑的 run。result 是 AgentToolResult = { content, details },其中 details 是工具私有

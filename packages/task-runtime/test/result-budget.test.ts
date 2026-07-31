@@ -78,9 +78,13 @@ describe("result-budget", () => {
 		expect(other.content.startsWith("x".repeat(40))).toBe(true);
 	});
 
-	it("carries details / isError / usage through — tool_result replaces every field", async () => {
-		// tool_result 是替换型 hook,逐字段全量替换、无 deep merge:漏回填一个字段
-		// 就等于把它清空。这条用例专门盯住这件事。
+	it("carries details / isError / usage through — this file's own contract, not a documented pi guarantee", async () => {
+		// 这不是在断言 pi 的合并机制就是"逐字段全量替换、无 deep merge"——实测
+		// ExtensionRunner.emitToolResult(packages/coding-agent/src/core/extensions/runner.ts:
+		// 872-925)对这三个字段其实是"undefined 就不覆盖、保留原值"的条件合并,并非无差别
+		// 清空,但那是未文档化的实现细节。这条用例锁的是本文件自己的、不依赖该细节的更严格
+		// 契约:这个单测直接读 handler 的返回值、不做任何合并,漏回填一个字段在这里就是
+		// 拿到 undefined,等价于把它清空。见 result-budget.ts 对应处的注释。
 		const handler = instantiate(OPTIONS);
 		const out = (await handler({
 			toolName: "get_clause_detail",

@@ -110,14 +110,63 @@ function describeError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** 粗略判断一段文本"看起来像"要被解析成 JSON——`tryParseJson` 与 `scanClauseIdsFallback`
+ * 共用这道门槛,好让正则兜底只落在"本来是 JSON、只是解析失败"的文本上,不落在任意提到
+ * clause_id 字样的自然语言备注上。 */
+function looksLikeJson(trimmed: string): boolean {
+	return trimmed.startsWith("{") || trimmed.startsWith("[");
+}
+
 /** 只有对象和数组才尝试解析,所以字符串不会递归成无穷。 */
 function tryParseJson(text: string): unknown {
 	const trimmed = text.trim();
-	if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return undefined;
+	if (!looksLikeJson(trimmed)) return undefined;
 	try {
 		return JSON.parse(trimmed);
 	} catch {
 		return undefined;
+	}
+}
+
+/**
+ * `tryParseJson` 解析失败时的正则兜底,只在 `JSON.parse` 抛错的字符串上跑,不改变任何
+ * 已经能被结构化解析的路径。
+ *
+ * 动机(2026-07-31 审查发现的真实交互,不是假想场景):C4 result-budget 插件的 `maxChars`
+ * 截断是对已序列化文本的一次原始 `slice`——如果截断点落在一段合法 JSON 的中间,产出的
+ * 文本对 `JSON.parse` 是非法输入,但对模型**仍然可读**:`agent-loop.ts` 的
+ * `finalizeExecutedToolCall`(:709-754)把 `tool_result` hook 的返回值写进
+ * `finalized.result` 之后,**同一份** `finalized.result.content` 既喂给 `emitToolExecutionEnd`
+ * (:763-771,本文件 `collectClauseIds` 的数据来源,经 session-runtime.ts 的
+ * `tool_execution_end` 订阅)、也喂给 `createToolResultMessage`(:773-784,模型在下一轮
+ * context 里读到的正是这份数据)。二者共享同一次截断,却只有模型那一侧对"半段 JSON"
+ * 依然可读。
+ *
+ * 少了这条兜底,结构化解析分支会在截断点直接判"解析失败、这段内容一个 clause_id 都不采"——
+ * 而模型可能已经从这段可读文本里看到一个完整的 `"clause_id":"A-1"` 并在 `basis` 里合法
+ * 引用它。C6 的反幻觉校验(`output-contract.ts` 的 `checkConditional`)把"basis 非空而
+ * clauseIds 空"判定为幻觉,于是一次真实检索、真实引用的回答被误判成编造 —— 方向是硬失败
+ * 假阳性,比"漏采导致该通过的没通过"更糟。
+ *
+ * 要守住的不变量是"模型能读到的 clause_id,判官就必须能采到",不是"能解析出完整合法的
+ * JSON"。直接在原始文本里正则找 `"clause_id":"..."` 子串,不管外层 JSON 结构是否完整,
+ * 天然满足这条不变量:只要这段文本对模型可读(子串本身完整、有闭合引号),正则就能命中;
+ * 如果截断恰好切在某个 clause_id 的值中间(比如 `"clause_id":"A-`),模型看到的也是一个
+ * 不完整的值,两边同样一无所获,不构成新的不一致——`maxHits` 截断没有这个问题(截断后仍
+ * `JSON.stringify` 成合法 JSON,被丢的 hits 模型也看不见,两边始终一致),只有 `maxChars`
+ * 这种对已序列化文本做原始字符裁切的策略会制造"模型看得到、判官采不到"的单向缺口。
+ *
+ * 只在 `looksLikeJson` 为真时才扫:任意字符串值(比如工具结果里一段提到"参见
+ * clause_id"字样的自然语言备注)都会走到这个函数,不加这道门槛会把正则的命中面从
+ * "本来是 JSON、只是截断坏掉了"扩大到"任何提及这个子串的文本",引入与本次要修的问题
+ * 无关的误报面。
+ */
+function scanClauseIdsFallback(text: string, out: Set<string>): void {
+	if (!looksLikeJson(text.trim())) return;
+	const pattern = /"clause_id"\s*:\s*"([^"]+)"/g;
+	for (const match of text.matchAll(pattern)) {
+		const id = match[1];
+		if (id !== undefined && id.length > 0) out.add(id);
 	}
 }
 
@@ -127,6 +176,10 @@ function tryParseJson(text: string): unknown {
  * 形状不固定是有原因的:MCP 工具结果常见形态是 `content[].text` 里塞一段 JSON 字符串,
  * 而不同工具的数组字段名各不相同(hits / cases / items / rows)。与其枚举形状,不如
  * 全深度找 key —— 找不到时 C6 的反幻觉校验会替我们响亮失败(basis 非空而 clauseIds 空)。
+ *
+ * 字符串值解析失败时不是空手而归:见 `scanClauseIdsFallback` 的注释,这条正则兜底专门
+ * 应对"JSON 被截断但对模型仍可读"的情形(C4 result-budget 的 `maxChars` 截断是已知会
+ * 触发它的通路)。
  */
 export function collectClauseIds(value: unknown, out: Set<string>): void {
 	walk(value, out, new WeakSet<object>(), 0);
@@ -162,7 +215,13 @@ function walk(value: unknown, out: Set<string>, seen: WeakSet<object>, depth: nu
 
 	if (typeof value === "string") {
 		const parsed = tryParseJson(value);
-		if (parsed !== undefined) walk(parsed, out, seen, depth + 1);
+		if (parsed !== undefined) {
+			walk(parsed, out, seen, depth + 1);
+			return;
+		}
+		// JSON.parse 失败(本来就不是 JSON,或是被截断成非法 JSON)—— 见 scanClauseIdsFallback
+		// 的注释,这条正则兜底专门接住"模型仍读得到、结构化解析却接不住"的那部分。
+		scanClauseIdsFallback(value, out);
 		return;
 	}
 	if (typeof value !== "object" || value === null) return;

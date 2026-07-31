@@ -291,4 +291,26 @@ describe("collectClauseIds", () => {
 		collectClauseIds({ content: [{ text: JSON.stringify({ hits: [{ clause_id: "OK-1" }] }) }] }, out);
 		expect([...out]).toEqual(["OK-1"]);
 	});
+
+	// 审查 I-1 的回归锁:C4 result-budget 的 maxChars 截断是对已序列化 JSON 的原始字符裁切,
+	// 截断点落在结构中间时产出的文本对 JSON.parse 是非法输入,但对模型仍然可读(同一份
+	// finalized.result.content 既喂 tool_execution_end、也喂模型看到的 tool result 消息)。
+	// "A-1" 的 `"clause_id":"A-1"` 子串在截断点之前、字面完整,模型能读到并合法引用;
+	// "A-2" 的值被截断点切断(`"clause_id":"A-2` 缺右引号),模型也看不到完整值 —— 两条
+	// 分别验证"能读到的必须采到"与"读不全的两边同样一无所获、不构成新的不一致"。
+	it("recovers a clause_id via regex when maxChars truncation breaks the JSON (I-1)", () => {
+		const out = new Set<string>();
+		const truncated = '{"total":5,"hits":[{"clause_id":"A-1"},{"clause_id":"A-2\n…[已截断,原长 314 字符]';
+		collectClauseIds({ content: [{ type: "text", text: truncated }] }, out);
+		expect([...out]).toEqual(["A-1"]);
+	});
+
+	// looksLikeJson 门槛的回归锁:正则兜底只应该落在"本来是 JSON、只是解析失败"的文本上,
+	// 不应该扩大到任何提到 clause_id 字样的自然语言备注 —— 否则命中面会远超"截断坏掉的
+	// JSON"这一个场景。这段备注不以 { 或 [ 开头,不满足 looksLikeJson。
+	it("does not regex-scan a prose string that merely mentions clause_id-shaped text", () => {
+		const out = new Set<string>();
+		collectClauseIds({ note: 'see also "clause_id":"DECOY" for context' }, out);
+		expect(out.size).toBe(0);
+	});
 });

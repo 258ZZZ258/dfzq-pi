@@ -113,15 +113,18 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		// 取到内容、只在错误回显里出现过的 clause_id。过滤 isError:true 让 clauseIds 只承载"确实
 		// 执行成功的工具结果",这对 C3/C6 是同一个方向的收紧,不是两个互相冲突的诉求。
 		//
-		// **已知的例外通路,机制上可达、本仓当前不可达**:pi 允许一个声明了 `tool_result` 这个
-		// 替换型 hook(见 plugin-registry.ts 的 REPLACING_HOOKS)的扩展把 isError 反过来翻
-		// 成 true 而 content 保留原本成功的内容(coding-agent/agent-session.ts 的 hook 派发 +
-		// agent-loop.ts 的落地点;`tool_result` hook 的返回值类型文档明写"if provided, replaces
-		// the tool result error flag")。这条过滤没有对这种情形做任何特殊处理 —— 若真的发生,会把
-		// 一次本来成功、真正取到内容的结果误判成"不予采信"。**现存插件只有 limits(挂
-		// turn_end)与本文件的 sufficiency-gate(不挂 hook),没有任何插件声明 tool_result**,
-		// 所以这条路径目前打不通;若将来有插件借 tool_result 翻转 isError,需要同步复核这条过滤
-		// 是否还站得住。
+		// **已知的例外通路,机制上可达**:pi 允许一个声明了 `tool_result` 这个替换型 hook
+		// (见 plugin-registry.ts 的 REPLACING_HOOKS)的扩展把 isError 反过来翻成 true 而
+		// content 保留原本成功的内容(coding-agent/agent-session.ts 的 hook 派发 + agent-loop.ts
+		// 的落地点;`tool_result` hook 的返回值类型文档明写"if provided, replaces the tool
+		// result error flag")。这条过滤没有对这种情形做任何特殊处理 —— 若真的发生,会把一次
+		// 本来成功、真正取到内容的结果误判成"不予采信"。**plugins/result-budget.ts 落地后,
+		// 「现存插件均未声明 tool_result」这一前提已不成立**——它就挂在 tool_result 上,只做
+		// 长度 / 命中条数截断,`isError` 原样回填、不翻转(见该文件对 details/isError/usage
+		// 三个字段的显式带回),所以不构成这条通路的实例。截至目前,声明了 hook 的插件只有
+		// limits(挂 turn_end,观察型)与 result-budget(挂 tool_result 但不翻转 isError)
+		// 两个,均不触发这条路径;若将来有插件借 tool_result 翻转 isError,需要同步复核这条
+		// 过滤是否还站得住。
 		//
 		// try/catch 的理由与下面 listener fan-out 那圈**完全相同**,而且这里更靠前:这段代码
 		// 同样跑在 pi 无 try/catch 的 AgentSession._emit 里,抛出去会直接穿透 agent loop 打死

@@ -1,5 +1,6 @@
 import { PluginRegistry } from "./plugin-registry.ts";
 import { limitsDescriptor } from "./plugins/limits.ts";
+import { resultBudgetDescriptor } from "./plugins/result-budget.ts";
 import { type AssessFn, createSufficiencyGateDescriptor } from "./plugins/sufficiency-gate.ts";
 
 export interface DefaultPluginDeps {
@@ -18,6 +19,7 @@ export interface DefaultPluginDeps {
 export function createDefaultPluginRegistry(deps: DefaultPluginDeps = {}): PluginRegistry {
 	const registry = new PluginRegistry();
 	registry.register(limitsDescriptor);
+	registry.register(resultBudgetDescriptor);
 	if (deps.assess) registry.register(createSufficiencyGateDescriptor(deps.assess));
 	return registry;
 }

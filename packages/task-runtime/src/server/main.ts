@@ -139,9 +139,22 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 	const profile = JSON.parse(await readFile(options.profilePath, "utf8")) as ProviderProfile;
 	// spec 文件重读一次:SpecRouter 只持有 RuntimeSpec,mcpServers 不在该类型上。
 	const specFiles = new Map<string, SpecFile>();
+	// C6(输出契约判官)需要的 schema 文件:与 profile / spec 同一条纪律,构造期读一次、
+	// 跨 run 复用,不放进下面返回的工厂函数体内每次 run 重读重 parse。
+	// 审查 Minor-c:挪到这里之前,schema 文件缺失/损坏要拖到第一次真实请求才暴露,
+	// 而且失败信息 obscure(typebox 在 Value.Check 里报 "Cannot use 'in' operator to
+	// search for 'type' in null" 这类无法一眼看出病因的错误)。挪到构造期后,坏 schema
+	// 在 startServer() 装配阶段就响亮失败,不必等到请求进来。
+	const outputContractSchemas = new Map<string, unknown>();
 	for (const name of (await readdir(options.specsDir)).filter((n) => n.endsWith(".json"))) {
 		const parsed = JSON.parse(await readFile(join(options.specsDir, name), "utf8")) as SpecFile;
 		specFiles.set(parsed.id, parsed);
+		if (parsed.outputContract !== undefined) {
+			outputContractSchemas.set(
+				parsed.id,
+				JSON.parse(await readFile(resolve(options.specsDir, parsed.outputContract.schema), "utf8")),
+			);
+		}
 	}
 
 	// ToolsetRegistry **必须**按 run 新建(见 toolsets/registry.ts 的类注释):
@@ -158,12 +171,6 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		toolsets.register(spec.toolset, createMcpToolset(spec.mcpServers ?? []));
 
 		const workdir = join(options.workRoot, sessionId);
-		// C6(输出契约判官)需要的 schema 文件在这里读:SessionRuntime 那层不该碰文件系统,
-		// 只接收已解析好的 schema。字段缺省即不挂 C6。
-		const outputContractSchema =
-			spec.outputContract === undefined
-				? undefined
-				: JSON.parse(await readFile(resolve(options.specsDir, spec.outputContract.schema), "utf8"));
 		return createSessionRuntime({
 			spec,
 			profile,
@@ -171,7 +178,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			toolsets,
 			cwd: join(workdir, "workspace"),
 			agentDir: join(workdir, "agent"),
-			outputContractSchema,
+			outputContractSchema: outputContractSchemas.get(specId),
 		});
 	};
 }

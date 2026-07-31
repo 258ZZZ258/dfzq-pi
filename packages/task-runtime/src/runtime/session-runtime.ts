@@ -11,6 +11,16 @@ export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "pluginContext">
 };
 
 export async function createSessionRuntime(options: CreateSessionRuntimeOptions): Promise<Runtime> {
+	// 装配期失败要早要响(这是全仓的一贯纪律,assemble() 里的 validateSpec / 工具名交叉校验
+	// 都是这条纪律的例子):spec 声明了 outputContract 却没有配套的 outputContractSchema,
+	// 说明某个调用点忘了把 schema 文件读进来传下来(cli/main.ts 曾经就是这样,只有
+	// server/main.ts 接了线)——不能让 C6 因此悄悄不挂,那是这个"把静默错误变成响亮失败"
+	// 的判官最不该有的失效姿态。审查 Important-2:此前这里只是把它当空判官悄悄跳过。
+	if (options.spec.outputContract !== undefined && options.outputContractSchema === undefined) {
+		throw new Error(
+			`RuntimeSpec "${options.spec.id}": outputContract is declared but outputContractSchema was not supplied to createSessionRuntime`,
+		);
+	}
 	const state: LimitState = { turns: 0 };
 	let abortFn: () => void = () => {};
 	// `assemble()` hasn't run yet when `pluginContext` is built below, but its `getSession`

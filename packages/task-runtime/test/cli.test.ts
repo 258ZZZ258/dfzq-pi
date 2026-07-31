@@ -196,4 +196,82 @@ describe("cli", () => {
 			expect(trajectoryEvents.some((event) => event.type === "turn_end")).toBe(true);
 		},
 	);
+
+	// 审查 Important-2 的回归锁:此前这条 CLI 路径从不读 outputContract.schema、也不传
+	// outputContractSchema —— eval/drive.ts 正是 spawn 这个文件跑评测,声明了 outputContract
+	// 的 spec 经这条路径跑会让 C6 静默不挂。这里用真实子进程 + 真实 schema 文件证明:
+	// ① schema 真的从磁盘读出来了(相对 --spec 所在目录解析)② 真的传给了 createSessionRuntime
+	// ③ C6 真的被挂上、真的会拒绝不合 schema 的回答。maxRepairAttempts:0 让首次失败直接
+	// onExhausted:"error",不需要第二轮模型往返 —— mockServer.requests 长度顺带验证了这点。
+	it(
+		"reads outputContract.schema relative to the spec file and lets C6 reject a non-conforming answer",
+		{ timeout: CASE_TIMEOUT_MS },
+		async () => {
+			mockServer = await startMockOpenAiServer({ finalText: "这是一段没有 JSON 的散文" });
+
+			root = await mkdtemp(join(tmpdir(), "cli-c6-"));
+			const specPath = join(root, "spec.json");
+			const profilePath = join(root, "profile.json");
+
+			// schema 文件与 spec 文件同目录 —— 与 OutputContractSpec.schema 的字段文档
+			// ("相对 spec 文件所在目录")一致。
+			await writeFile(
+				join(root, "answer.schema.json"),
+				JSON.stringify({
+					type: "object",
+					required: ["conclusion"],
+					properties: { conclusion: { type: "string" } },
+				}),
+			);
+			await writeFile(
+				specPath,
+				JSON.stringify({
+					id: "demo",
+					model: { role: "main" },
+					toolset: "mcp",
+					tools: ["echo"],
+					limits: { maxTurns: 5 },
+					mcpServers: [{ id: "echo", command: process.execPath, args: [SERVER], env: {} }],
+					outputContract: { schema: "answer.schema.json", maxRepairAttempts: 0 },
+				}),
+			);
+			await writeFile(
+				profilePath,
+				JSON.stringify({
+					id: "test",
+					baseUrl: mockServer.baseUrl,
+					apiKeyEnv: "DFZQ_TEST_KEY",
+					api: "openai-completions",
+					roles: {
+						main: {
+							provider: "mock",
+							modelId: "mock-model",
+							contextWindow: 8192,
+							maxTokens: 1024,
+							reasoning: false,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						},
+					},
+				}),
+			);
+
+			// status !== "completed" 让 CLI 以 exitCode 2 退出(main.ts),execFile 因此 reject ——
+			// 与本文件 "reports the missing api key env var by name" 用例同一套处理方式,只是
+			// 这里还要继续解析 stdout 里的 RunResult(CLI 在非 completed 时仍打印合法结果)。
+			const error = (await run(
+				process.execPath,
+				[CLI, "run", "--spec", specPath, "--profile", profilePath, "--workdir", root, "--input", "hi"],
+				{ timeout: EXEC_TIMEOUT_MS, env: { ...process.env, DFZQ_TEST_KEY: "sk-test-unused" } },
+			).catch((e: unknown) => e)) as { code?: number; stdout?: string };
+
+			expect(error.code).toBe(2);
+			const lines = (error.stdout ?? "").trim().split("\n").filter(Boolean);
+			const result = JSON.parse(lines.at(-1) as string);
+			expect(result.status).toBe("error");
+			expect(result.errorMessage).toContain("未找到 JSON");
+
+			// maxRepairAttempts:0 生效:只有一次模型往返,没有为 C6 多发一次 reprompt。
+			expect(mockServer.requests).toHaveLength(1);
+		},
+	);
 });

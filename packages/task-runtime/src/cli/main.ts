@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { attachTrajectory } from "../observability/trajectory.ts";
@@ -47,6 +47,19 @@ async function main(): Promise<void> {
 	const profile = JSON.parse(await readFile(values.profile as string, "utf8")) as ProviderProfile;
 	const workdir = values.workdir as string;
 
+	// 审查 Important-2:此前这条 CLI 路径从不传 outputContractSchema —— eval/drive.ts 正是
+	// spawn 这个文件跑评测,声明了 outputContract 的 spec 经这条路走会让 C6 悄悄不挂。
+	// 与 server/main.ts 的 createDefaultRuntimeFactory 同一套逻辑:schema 路径相对 --spec
+	// 指向的文件所在目录解析(与 OutputContractSpec.schema 的字段文档一致)。
+	// ⚠️ eval/main.ts 会把 spec 重新落盘成 outDir 下的临时文件(spec.resolved.json)—— 如果
+	// 未来某个 spec 声明了 outputContract 并经那条路径跑,schema 路径需要像 mcpServers.args
+	// 那样提前解析成绝对路径再写进临时 spec,否则这里会去 outDir 里找一个不存在的文件。
+	// 目前仓库里没有任何 spec 声明 outputContract,这条留给引入它的人。
+	const outputContractSchema =
+		spec.outputContract === undefined
+			? undefined
+			: JSON.parse(await readFile(resolve(dirname(values.spec as string), spec.outputContract.schema), "utf8"));
+
 	const toolsets = new ToolsetRegistry();
 	toolsets.register(
 		spec.toolset,
@@ -69,6 +82,7 @@ async function main(): Promise<void> {
 		toolsets,
 		cwd: join(workdir, "workspace"),
 		agentDir: join(workdir, "agent"),
+		outputContractSchema,
 	});
 
 	const detach = values.trajectory ? await attachTrajectory(runtime, values.trajectory) : undefined;

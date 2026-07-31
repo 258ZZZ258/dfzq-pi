@@ -56,6 +56,14 @@ describe("extractJsonBlock", () => {
 	it("returns undefined when there is no JSON at all", () => {
 		expect(extractJsonBlock("完全是散文")).toBeUndefined();
 	});
+
+	// 审查订正:这是唯一真的会走到"原文本兜底"分支、并且**成功**的场景 —— 围栏内容本身
+	// 不含花括号(第一个候选在 start<0 处 continue),回退到原文本才截出紧跟其后的裸 JSON。
+	// 围栏内容含花括号但解析失败的那种"损坏围栏"输入,实测原文本兜底截不出干净的 JSON
+	// (原文本的 indexOf/lastIndexOf 跨度必然包住围栏里那段坏内容),不在本用例覆盖范围。
+	it("reads a bare JSON object that follows an unlabelled non-JSON fence", () => {
+		expect(extractJsonBlock('```\nsome cmd\n```\n{"a":1}')).toEqual({ a: 1 });
+	});
 });
 
 describe("output contract judge", () => {
@@ -108,6 +116,20 @@ describe("output contract judge", () => {
 		if (!verdict.ok) {
 			expect(verdict.detail).toContain("A-1");
 			expect(verdict.followUp).toContain("检索结果");
+		}
+	});
+
+	// 审查 Important-1 的回归锁:一句看起来完全合理的重构——
+	// `if (clauseIds.length === 0) return undefined;`("没检索到就别为难模型")——
+	// 会整段删掉风险 10 的兜底,而原有的反幻觉用例只用了非空 clauseIds(["B-9"]),
+	// 拦不住这种重构。clauseIds 全空、basis 引用了任意 clause_id 时必须照样判失败,
+	// 而且 detail 要能把人指向真正的病因(检索结果为空,不是模型编造)。
+	it("rejects a referenced clause_id when clauseIds is empty, and names the empty-retrieval cause", async () => {
+		const verdict = await judge.judge({ lastAssistantText: JSON.stringify(good), clauseIds: [] });
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) {
+			expect(verdict.detail).toContain("A-1");
+			expect(verdict.detail).toContain("本次检索结果为空");
 		}
 	});
 });

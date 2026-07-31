@@ -654,17 +654,21 @@ describe("SessionRuntime final-judge rejudging", () => {
 			expect(result.output).toContain("这是一段散文");
 		});
 
-		// 对称的另一半:spec 声明了 outputContract,但调用方(比如未来某个新调用点)忘了把
-		// 读好的 schema 传进来 —— 同样不能挂 C6,而不是拿 undefined 当 schema 去跑 typebox。
-		it("does not mount C6 when outputContractSchema is undefined, even if spec.outputContract is declared", async () => {
-			const runtime = await buildWithOutputContract(
-				createDefaultPluginRegistry(),
-				{ outputContract: { schema: "answer.schema.json" } },
-				undefined,
-				[fauxAssistantMessage("这是一段散文,不含任何 JSON")],
-			);
-			const result = await runtime.run("hello");
-			expect(result.status).toBe("completed");
+		// 审查 Important-2 订正:对称的另一半此前是"静默不挂 C6",而不是"响亮失败"——
+		// spec 声明了 outputContract,调用方(比如曾经的 cli/main.ts)忘了把读好的 schema
+		// 传进来,createSessionRuntime 现在必须在装配期就直接抛,而不是悄悄跑出一个
+		// completed 的 run、让 Java 拿到一个从没被校验过的输出。"装配期失败要早要响"是
+		// 全仓一贯纪律(assemble() 的 validateSpec、工具名交叉校验都是这条纪律的例子),
+		// 一个"存在意义就是把静默错误变成响亮失败"的判官更不能自己开这个口子。
+		it("throws instead of silently skipping C6 when spec.outputContract is declared but outputContractSchema is missing", async () => {
+			await expect(
+				buildWithOutputContract(
+					createDefaultPluginRegistry(),
+					{ outputContract: { schema: "answer.schema.json" } },
+					undefined,
+					[fauxAssistantMessage("这是一段散文,不含任何 JSON")],
+				),
+			).rejects.toThrow(/outputContract is declared but outputContractSchema was not supplied/);
 		});
 
 		// 顺序断言的真身:brief 的 Step 7 只用假判官证明了 runFinalJudges 按数组顺序派发,
@@ -722,6 +726,31 @@ describe("SessionRuntime final-judge rejudging", () => {
 			const result = await runtime.run("hello");
 			expect(result.status).toBe("error");
 			expect(result.errorMessage).toContain("未找到 JSON");
+		});
+
+		// 审查 Minor-b 的回归锁:`maxRepairAttempts ?? 2` 的默认值此前无测试守着 —— 把默认值
+		// 改成 `?? 99` 时 287 条全绿。这里不写 maxRepairAttempts,spec 只给 3 版恒不合格的
+		// 散文回答(= 初次 + 默认 2 次重试),断言 prompt 恰好被调用 3 次、status 为 error。
+		// 若默认值被改大(比如 99),maxTurns:10 会先被撞到,status 会变成 limit_exceeded
+		// 而不是 error,promptSpy 的调用次数也不会停在 3 —— 两条断言都能拦住这类回退。
+		it("defaults maxRepairAttempts to 2 when the spec omits it", async () => {
+			const promptSpy = vi.spyOn(AgentSession.prototype, "prompt");
+			cleanups.push(async () => {
+				promptSpy.mockRestore();
+			});
+			const runtime = await buildWithOutputContract(
+				createDefaultPluginRegistry(),
+				{ outputContract: { schema: "answer.schema.json" } }, // 不写 maxRepairAttempts
+				minimalContractSchema,
+				[
+					fauxAssistantMessage("第一版全是散文"),
+					fauxAssistantMessage("第二版还是散文"),
+					fauxAssistantMessage("第三版依然是散文"),
+				],
+			);
+			const result = await runtime.run("hello");
+			expect(result.status).toBe("error");
+			expect(promptSpy.mock.calls).toHaveLength(3);
 		});
 	});
 

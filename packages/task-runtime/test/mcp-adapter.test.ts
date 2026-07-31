@@ -1,6 +1,8 @@
+// biome-ignore-all lint/suspicious/noTemplateCurlyInString: expandEnvRefs 的被测语法就是字面量
+// "${VAR}" —— 这条规则防的是「本想写模板字符串却漏了反引号」,在这里每一处命中都是误报。
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createMcpToolset } from "../src/toolsets/mcp/adapter.ts";
+import { createMcpToolset, expandEnvRefs } from "../src/toolsets/mcp/adapter.ts";
 import { McpClient } from "../src/toolsets/mcp/client.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
 
@@ -36,7 +38,7 @@ function buildDemoRegistry(): ToolsetRegistry {
 	const registry = new ToolsetRegistry();
 	registry.register(
 		"mcp-demo",
-		createMcpToolset([{ id: "echo", command: process.execPath, args: [SERVER], env: {} }]),
+		createMcpToolset([{ id: "echo", command: process.execPath, args: [SERVER], env: {} }], null),
 	);
 	return registry;
 }
@@ -76,10 +78,13 @@ describe("createMcpToolset", () => {
 		const local = new ToolsetRegistry();
 		local.register(
 			"dup",
-			createMcpToolset([
-				{ id: "a", command: process.execPath, args: [SERVER], env: {} },
-				{ id: "b", command: process.execPath, args: [SERVER], env: {} },
-			]),
+			createMcpToolset(
+				[
+					{ id: "a", command: process.execPath, args: [SERVER], env: {} },
+					{ id: "b", command: process.execPath, args: [SERVER], env: {} },
+				],
+				null,
+			),
 		);
 		const tools = await resolve(local, "dup");
 		const names = tools.map((t) => t.name);
@@ -96,10 +101,13 @@ describe("createMcpToolset", () => {
 		const local = new ToolsetRegistry();
 		local.register(
 			"asymmetric",
-			createMcpToolset([
-				{ id: "a", command: process.execPath, args: [SERVER], env: { MCP_FIXTURE_EXTRA_TOOL: "only-a" } },
-				{ id: "b", command: process.execPath, args: [SERVER], env: { MCP_FIXTURE_EXTRA_TOOL: "only-b" } },
-			]),
+			createMcpToolset(
+				[
+					{ id: "a", command: process.execPath, args: [SERVER], env: { MCP_FIXTURE_EXTRA_TOOL: "only-a" } },
+					{ id: "b", command: process.execPath, args: [SERVER], env: { MCP_FIXTURE_EXTRA_TOOL: "only-b" } },
+				],
+				null,
+			),
 		);
 		const names = (await resolve(local, "asymmetric")).map((t) => t.name);
 
@@ -126,15 +134,18 @@ describe("createMcpToolset", () => {
 			const registry = new ToolsetRegistry();
 			registry.register(
 				"broken",
-				createMcpToolset([
-					{ id: "ok", command: process.execPath, args: [SERVER], env: {} },
-					{
-						id: "bad",
-						command: process.execPath,
-						args: [SERVER],
-						env: { MCP_FIXTURE_FAIL_INIT_WITH_STDERR: "1" },
-					},
-				]),
+				createMcpToolset(
+					[
+						{ id: "ok", command: process.execPath, args: [SERVER], env: {} },
+						{
+							id: "bad",
+							command: process.execPath,
+							args: [SERVER],
+							env: { MCP_FIXTURE_FAIL_INIT_WITH_STDERR: "1" },
+						},
+					],
+					null,
+				),
 			);
 
 			await expect(registry.resolve("broken")).rejects.toThrow(/failed to initialize/);
@@ -145,5 +156,123 @@ describe("createMcpToolset", () => {
 		} finally {
 			spawnSpy.mockRestore();
 		}
+	});
+});
+
+describe("expandEnvRefs", () => {
+	const base = { id: "policy-query", command: "x", args: ["-m", "query.mcp.server"], env: {} };
+
+	it("expands ${VAR} in command, cwd and env values", () => {
+		const out = expandEnvRefs(
+			{ ...base, command: "${PY}", cwd: "${ROOT}", env: { PGHOST: "${DBHOST}" } },
+			{ PY: "/venv/bin/python", ROOT: "/repo", DBHOST: "localhost" },
+		);
+		expect(out.command).toBe("/venv/bin/python");
+		expect(out.cwd).toBe("/repo");
+		expect(out.env).toEqual({ PGHOST: "localhost" });
+	});
+
+	it("leaves args untouched", () => {
+		// args 是模块路径与开关,不该依赖环境:放开会让「这个 server 到底跑的是什么」不可读。
+		const out = expandEnvRefs({ ...base, args: ["${PY}"] }, { PY: "/venv/bin/python" });
+		expect(out.args).toEqual(["${PY}"]);
+	});
+
+	it("throws on an undefined variable instead of expanding to empty", () => {
+		expect(() => expandEnvRefs({ ...base, command: "${MISSING}" }, {})).toThrow(/MISSING/);
+	});
+
+	it("throws on an empty-string variable", () => {
+		// 空串展开会让 command 变成 "",spawn 报一个与病因无关的 ENOENT。
+		expect(() => expandEnvRefs({ ...base, command: "${EMPTY}" }, { EMPTY: "" })).toThrow(/EMPTY/);
+	});
+
+	it("supports a literal path with no refs", () => {
+		const out = expandEnvRefs({ ...base, command: "/usr/bin/python3" }, {});
+		expect(out.command).toBe("/usr/bin/python3");
+	});
+
+	it("names the offending field so the error points at the spec, not at spawn", () => {
+		expect(() => expandEnvRefs({ ...base, cwd: "${NOPE}" }, {})).toThrow(/"policy-query"\.cwd/);
+	});
+});
+
+describe("per-run scope 注入(C10 下半段)", () => {
+	const SCOPE = { runId: "r-1", permTags: ["P1"], corpusTypes: ["external"], options: {} };
+	const server = {
+		id: "echo",
+		command: process.execPath,
+		args: [SERVER],
+		env: { MCP_FIXTURE_ECHO_ARGS: "1" },
+	};
+
+	function registryWith(scope: Parameters<typeof createMcpToolset>[1]): ToolsetRegistry {
+		const registry = new ToolsetRegistry();
+		registry.register("mcp-demo", createMcpToolset([server], scope));
+		return registry;
+	}
+
+	async function callEcho(tools: Awaited<ReturnType<typeof resolve>>, params: Record<string, unknown>) {
+		const echo = tools.find((t) => t.name === "echo-args");
+		if (!echo) throw new Error("echo-args tool missing");
+		const out = await echo.execute("c1", params as never, undefined, undefined, {} as never);
+		// echo-args 回显收到的完整 arguments 对象本身。
+		return JSON.parse((out.content[0] as { text: string }).text) as Record<string, unknown>;
+	}
+
+	it("merges scope into tools/call params as snake_case", async () => {
+		const tools = await resolve(registryWith(SCOPE), "mcp-demo");
+		const seen = await callEcho(tools, { text: "hi" });
+		// C1 侧的契约是 snake_case。camelCase→snake_case 只在这一处转,别在 C1 再转一次。
+		expect(seen.perm_tags).toEqual(["P1"]);
+		expect(seen.corpus_types).toEqual(["external"]);
+		expect(seen.run_id).toBe("r-1");
+		expect(seen.text).toBe("hi");
+	});
+
+	it("does not let tool params override the injected scope", async () => {
+		// 提权向量:模型即便猜到了字段名,也不能用工具参数盖掉授权位。
+		// 注入必须在 spread 的**右侧**;写反了这条立刻红。
+		const tools = await resolve(registryWith(SCOPE), "mcp-demo");
+		const seen = await callEcho(tools, {
+			text: "hi",
+			perm_tags: ["ADMIN"],
+			corpus_types: ["internal"],
+			run_id: "r-evil",
+		});
+		expect(seen.perm_tags).toEqual(["P1"]);
+		expect(seen.corpus_types).toEqual(["external"]);
+		expect(seen.run_id).toBe("r-1");
+	});
+
+	it("refuses to spawn when the scope has no runId", async () => {
+		// fail-closed 第 2 处(规格 §2.4):不完整的 scope 不该起子进程。
+		const provider = createMcpToolset([server], { ...SCOPE, runId: "" });
+		await expect(provider()).rejects.toThrow(/runId/i);
+	});
+
+	it("refuses to spawn when corpusTypes is empty", async () => {
+		const provider = createMcpToolset([server], { ...SCOPE, corpusTypes: [] });
+		await expect(provider()).rejects.toThrow(/corpusTypes/i);
+	});
+
+	it("re-checks the scope before every call, not just at spawn time", async () => {
+		// fail-closed 第 3 处:scope 对象在 provider 调用之后被改空,下一次 call 必须拦。
+		// 只有 spawn 期检查的话,这个向量完全打不到。
+		const mutable = { ...SCOPE, corpusTypes: ["external"] };
+		const tools = await resolve(registryWith(mutable), "mcp-demo");
+		mutable.corpusTypes = [];
+		const echo = tools.find((t) => t.name === "echo-args");
+		await expect(echo?.execute("c1", { text: "hi" } as never, undefined, undefined, {} as never)).rejects.toThrow(
+			/corpusTypes/i,
+		);
+	});
+
+	it("injects nothing when the scope is explicitly null", async () => {
+		// eval / CLI 路径不是权限场景。**必须显式写 null** —— 类型上不可省略,
+		// 于是生产路径漏传 scope 是编译错误,不会静默降级成「非权限场景」。
+		const tools = await resolve(registryWith(null), "mcp-demo");
+		const seen = await callEcho(tools, { text: "hi" });
+		expect(seen).toEqual({ text: "hi" });
 	});
 });

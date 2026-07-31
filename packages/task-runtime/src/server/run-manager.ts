@@ -7,7 +7,40 @@ import type { Gate, GateRejection, GateTicket } from "./gate.ts";
 // TERMINAL 白名单,避免两处未来各自漏改、方向还相反。
 import { isTerminal } from "./routes.ts";
 
-export type RuntimeFactory = (input: { specId: string; sessionId: string }) => Promise<Runtime>;
+/**
+ * Java jCasbin 预计算的授权位(设计文档 §6.4.1 的 `filters`)。**agent 不可见** ——
+ * 它不出现在任何工具的 JSON Schema 里,由 MCP adapter 在 schema 之外注入(规格 §2.3)。
+ */
+export interface RunFilters {
+	/**
+	 * 可缺省,且**缺省与空数组同义**:「无额外限制」是边界契约的明文,不是 fail-open
+	 * (audit-ai `query/query/api/routes_boundary.py:39-40` 原话)。这个默认语义属于消费端
+	 * (C1 / MCP 注入点),不属于这一层 —— 本层在此补 `[]` 会把 filters_json 的存档改写成
+	 * 与 Java 发来的请求体不同的东西,而那是事后审计授权范围的唯一凭证。
+	 */
+	permTags?: string[];
+	corpusTypes: string[];
+	projectId?: string | null;
+	owner?: string | null;
+}
+
+/** 查询层选项,透传给下游 audit-ai。刻意不收窄:加字段不该变成一次 HTTP 层改动。 */
+export interface RunOptions {
+	topK?: number;
+	includeSuperseded?: boolean;
+}
+
+export type RuntimeFactory = (input: {
+	specId: string;
+	sessionId: string;
+	/**
+	 * C1 的 per-run 白名单拿它当隔离键(规格 §3.3)。S3 按 specId 池化之后 MCP server
+	 * 会跨 run 复用,靠进程隔离的白名单会串 run —— 两个并发 run 能互取对方的条款详情。
+	 */
+	runId: string;
+	filters: RunFilters;
+	options: RunOptions;
+}) => Promise<Runtime>;
 
 export interface SubmitRequest {
 	taskKind: string;
@@ -16,9 +49,12 @@ export interface SubmitRequest {
 	clientRequestId: string;
 	requestId?: string;
 	sessionId: string;
-	/** 原样存档的授权位,本层不解析。 */
-	filtersJson: string;
-	optionsJson?: string;
+	/**
+	 * 授权位。**结构化** —— stringify 归本类做。此前调用方传 filtersJson、本类原样存档,
+	 * 于是 app.ts 与本类各持一份序列化职责;要把 filters 透给工厂就得在两处都解析回来。
+	 */
+	filters: RunFilters;
+	options?: RunOptions;
 }
 
 export type SubmitOutcome =
@@ -99,8 +135,8 @@ export class RunManager {
 			specId: req.specId,
 			taskKind: req.taskKind,
 			sessionId: req.sessionId,
-			filtersJson: req.filtersJson,
-			optionsJson: req.optionsJson,
+			filtersJson: JSON.stringify(req.filters),
+			optionsJson: req.options ? JSON.stringify(req.options) : undefined,
 			input: req.input,
 			createdAt: this.now(),
 		});
@@ -172,7 +208,14 @@ export class RunManager {
 
 		let runtime: Runtime;
 		try {
-			runtime = await this.runtimeFactory({ specId: req.specId, sessionId: req.sessionId });
+			runtime = await this.runtimeFactory({
+				specId: req.specId,
+				sessionId: req.sessionId,
+				runId,
+				filters: req.filters,
+				// 空对象而非 undefined:让下游解构 options.topK 时少一条判空分支。
+				options: req.options ?? {},
+			});
 		} catch (error) {
 			// 装配期失败要早、要响亮,且必须还回令牌 —— 否则一次装配失败永久占额。
 			const message = error instanceof Error ? error.message : String(error);
@@ -236,6 +279,7 @@ export class RunManager {
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
 			turns: 0,
 			durationMs: 0,
+			judgeAttempts: {},
 		};
 		try {
 			this.store.finish(runId, result, this.now());

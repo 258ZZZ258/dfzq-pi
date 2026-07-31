@@ -149,6 +149,49 @@ describe("POST /runs", () => {
 		const { runId } = (await res.json()) as { runId: string };
 		expect(JSON.parse(store.findByRunId(runId)?.filtersJson ?? "{}")).toEqual(filters);
 	});
+
+	it("stores filters verbatim even when optional keys are absent", async () => {
+		// 「verbatim」必须对缺省键也成立:把缺失的 permTags 补成 [] 会让存档与 Java 发来的
+		// 请求体不一致,而 filters_json 是事后审计「这个 run 当时被授权了什么」的唯一凭证。
+		// permTags 的默认语义(空 = 无额外限制,routes_boundary.py:39-40)属于消费端,不属于存档。
+		const { hono } = app();
+		const filters = { corpusTypes: ["internal"] };
+		const res = await hono.request(post(submitBody({ filters, waitMs: 5000 })));
+		const { runId } = (await res.json()) as { runId: string };
+		expect(JSON.parse(store.findByRunId(runId)?.filtersJson ?? "{}")).toEqual(filters);
+	});
+
+	describe("corpusTypes 的三档处置(规格 §2.5)", () => {
+		it("rejects audit_project with a code distinct from missing scope", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ filters: { corpusTypes: ["internal", "audit_project"] } })));
+			expect(res.status).toBe(422);
+			const body = (await res.json()) as { error: { code: string } };
+			// 不得与「未授权」同码 —— Java 侧要能分清「你没给授权」与「这个语料我们还没接入」。
+			expect(body.error.code).toBe("unsupported_corpus_type");
+			expect(body.error.code).not.toBe("missing_authorization_scope");
+		});
+
+		it("rejects unknown corpus types as invalid_body, not as unsupported", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ filters: { corpusTypes: ["internal", "nonesuch"] } })));
+			expect(res.status).toBe(422);
+			expect(await res.json()).toMatchObject({ error: { code: "invalid_body" } });
+		});
+
+		it("still reports empty corpusTypes as missing scope", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ filters: { corpusTypes: [] } })));
+			expect(await res.json()).toMatchObject({ error: { code: "missing_authorization_scope" } });
+		});
+
+		it("does not start a run when corpus types are rejected", async () => {
+			// A7 的核心:拒绝时不得起 run。只断言状态码不够 —— 422 也可能是 run 起了之后才回的。
+			const { hono, stub } = app();
+			await hono.request(post(submitBody({ filters: { corpusTypes: ["audit_project"] } })));
+			expect(stub.runCalls).toBe(0);
+		});
+	});
 });
 
 describe("auth", () => {

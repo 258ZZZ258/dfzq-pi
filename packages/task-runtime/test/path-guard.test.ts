@@ -68,9 +68,9 @@ afterEach(async () => {
 function instantiate(allowRoots: string[], runId = "run-1") {
 	let handler: ((event: unknown) => Promise<unknown>) | undefined;
 	const ctx: PluginContext = {
-		specId: "s1",
 		getRunId: () => runId,
 		getRunInput: () => "",
+		callTool: async () => ({}),
 		getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 		abort: () => {},
 		limitState: { turns: 0 },
@@ -277,9 +277,9 @@ describe("path-guard", () => {
 		let currentRunId = "run-1";
 		let handler: ((event: unknown) => Promise<unknown>) | undefined;
 		const ctx: PluginContext = {
-			specId: "s1",
 			getRunId: () => currentRunId,
 			getRunInput: () => "",
+			callTool: async () => ({}),
 			getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 			abort: () => {},
 			limitState: { turns: 0 },

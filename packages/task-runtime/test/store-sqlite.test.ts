@@ -35,6 +35,7 @@ function newRun(overrides: Partial<NewRun> = {}): NewRun {
 
 function result(overrides: Partial<RunResult> = {}): RunResult {
 	return {
+		judgeAttempts: {},
 		runId: "run-1",
 		specId: "demo",
 		status: "completed",

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Runtime } from "../src/runtime/contract.ts";
 import { Gate } from "../src/server/gate.ts";
-import { RunManager, type SubmitRequest } from "../src/server/run-manager.ts";
+import { RunManager, type RuntimeFactory, type SubmitRequest } from "../src/server/run-manager.ts";
 import type { RunStore } from "../src/store/contract.ts";
 import { createSqliteRunStore } from "../src/store/sqlite.ts";
 import { createStubRuntime, type StubRuntime } from "./helpers/stub-runtime.ts";
@@ -29,7 +29,7 @@ function request(overrides: Partial<SubmitRequest> = {}): SubmitRequest {
 		input: "hello",
 		clientRequestId: "cli-1",
 		sessionId: "sess-1",
-		filtersJson: '{"corpusTypes":["internal"]}',
+		filters: { permTags: [], corpusTypes: ["internal"] },
 		...overrides,
 	};
 }
@@ -557,5 +557,73 @@ describe("run manager", () => {
 		const resultB = await b.completion;
 		expect(resultB.status).toBe("completed");
 		expect(store.findByRunId(b.runId)?.status).toBe("completed");
+	});
+
+	describe("授权位透传(C10 上半段)", () => {
+		it("hands runId and structured filters/options to the runtime factory", async () => {
+			const seen: Array<Parameters<RuntimeFactory>[0]> = [];
+			const runtime = createStubRuntime();
+			const rm = new RunManager({
+				store,
+				gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 2 }),
+				runtimeFactory: async (input) => {
+					seen.push(input);
+					return runtime;
+				},
+				now: () => 1000,
+				newRunId: () => "run-1",
+			});
+
+			const outcome = await rm.submit(
+				request({
+					filters: { permTags: ["p1"], corpusTypes: ["internal"] },
+					options: { topK: 8, includeSuperseded: false },
+				}),
+			);
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			await outcome.completion;
+
+			expect(seen).toHaveLength(1);
+			// runId 必须与 submit 返回的一致 —— C1 的 per-run 白名单拿它当隔离键(规格 §3.3)。
+			// S3 池化后 MCP server 跨 run 复用,靠进程隔离的白名单会串 run。
+			expect(seen[0].runId).toBe(outcome.runId);
+			expect(seen[0].filters).toEqual({ permTags: ["p1"], corpusTypes: ["internal"] });
+			expect(seen[0].options).toEqual({ topK: 8, includeSuperseded: false });
+		});
+
+		it("defaults options to an empty object rather than undefined", async () => {
+			const seen: Array<Parameters<RuntimeFactory>[0]> = [];
+			const runtime = createStubRuntime();
+			const rm = new RunManager({
+				store,
+				gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 2 }),
+				runtimeFactory: async (input) => {
+					seen.push(input);
+					return runtime;
+				},
+				now: () => 1000,
+				newRunId: () => "run-1",
+			});
+
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			await outcome.completion;
+
+			// 下游解构 options.topK 时不该先判 undefined —— 空对象让消费方少一条分支。
+			expect(seen[0].options).toEqual({});
+		});
+
+		it("archives filters as JSON without asking the caller to stringify", async () => {
+			const rm = manager(createStubRuntime());
+			const outcome = await rm.submit(request({ filters: { permTags: [], corpusTypes: ["internal", "external"] } }));
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			await outcome.completion;
+
+			const row = store.findByRunId(outcome.runId);
+			expect(JSON.parse(row?.filtersJson ?? "null")).toEqual({
+				permTags: [],
+				corpusTypes: ["internal", "external"],
+			});
+		});
 	});
 });

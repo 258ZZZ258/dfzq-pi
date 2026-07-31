@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "⚠ basis.items.required 里的 clause_id 是反幻觉兜底的**唯一载体**。output-contract.ts 的 checkConditional 只对能从 basis 元素里读出字符串 clause_id 的项判臆造;元素不带这个键时 invented 为空、直接放行。删掉这个 required,风险 10 的整个兜底会静默消失,而所有测试照常通过 —— 全分支审查实测过:basis 非空 + clauseIds 全空,判官仍返回 ok。判官层不反过来校验 schema 形状是刻意的(那是越权,且 required 可以藏在 $ref/allOf/oneOf 后面)。守它的是验收用例 A8,不是代码。",
+  "type": "object",
+  "required": ["conclusion", "basis", "confidence", "finish_reason"],
+  "additionalProperties": false,
+  "properties": {
+    "conclusion": { "type": "string", "minLength": 1 },
+    "basis": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["clause_id"],
+        "additionalProperties": false,
+        "properties": {
+          "clause_id": { "type": "string" },
+          "source_code": { "type": ["string", "null"] },
+          "source_doc_id": { "type": ["string", "null"] },
+          "clause_path": { "type": ["string", "null"] },
+          "doc_title": { "type": ["string", "null"] },
+          "status": { "enum": ["effective", "superseded", "abolished"] },
+          "corpus_type": { "enum": ["internal", "external", "qa", "case"] }
+        }
+      }
+    },
+    "reasoning": { "type": "string" },
+    "confidence": { "enum": ["high", "medium", "low"] },
+    "finish_reason": { "enum": ["stop", "refused"] },
+    "exhausted_scope": { "type": "array", "items": { "type": "string" } },
+    "gaps": { "type": "array", "items": { "type": "string" } }
+  }
+}

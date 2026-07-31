@@ -6,7 +6,7 @@ import type { RunStore } from "../store/contract.ts";
 import { checkInternalToken, INTERNAL_TOKEN_HEADER } from "./middleware/auth.ts";
 import { clampWaitMs, validateSubmitBody } from "./middleware/validate.ts";
 import { isTerminal, recordToRunResult } from "./routes.ts";
-import type { RunManager } from "./run-manager.ts";
+import type { RunManager, RunOptions } from "./run-manager.ts";
 
 export interface AppOptions {
 	manager: RunManager;
@@ -90,8 +90,14 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			clientRequestId: body.clientRequestId,
 			requestId: body.requestId,
 			sessionId: body.sessionId ?? newSessionId(),
-			filtersJson: JSON.stringify(body.filters),
-			optionsJson: body.options ? JSON.stringify(body.options) : undefined,
+			// 结构化下传,**原样**:序列化归 RunManager(它同时要落库和透给工厂,两处只能有一份
+			// 口径)。这里不补任何默认值 —— filters_json 是事后审计「这个 run 当时被授权了什么」
+			// 的唯一凭证,补默认值会让存档与 Java 发来的请求体对不上。形状已由 validateSubmitBody 校验。
+			filters: body.filters,
+			// SubmitBodySchema 把 options 声明成 Record<string, unknown>,比 RunOptions 宽。
+			// 不为此收窄 schema —— options 是给下游 audit-ai 的透传位,收窄会让将来加一个
+			// 查询层字段变成一次 HTTP 层改动。
+			options: body.options as RunOptions | undefined,
 		});
 
 		if (outcome.kind === "rejected") {

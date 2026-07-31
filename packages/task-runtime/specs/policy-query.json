@@ -1,0 +1,78 @@
+{
+  "id": "policy-query",
+  "description": "制度查询与合规判断",
+  "model": {
+    "role": "main"
+  },
+  "thinkingLevel": "medium",
+  "toolset": "policy-query",
+  "tools": [
+    "search_policy",
+    "search_cases",
+    "enumerate_clauses",
+    "get_clause_detail",
+    "assess_sufficiency"
+  ],
+  "systemPrompt": "@specs/policy-query/system.md",
+  "skills": [
+    "policy-query/skills/citation-discipline.md",
+    "policy-query/skills/scenario-to-rule.md",
+    "policy-query/skills/evidence-standard.md",
+    "policy-query/skills/policy-validity.md"
+  ],
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  },
+  "limits": {
+    "maxTurns": 30,
+    "runTimeoutMs": 900000,
+    "maxTotalTokens": 3000000,
+    "maxCostUsd": 0.5
+  },
+  "stopPolicy": {
+    "name": "sufficiency-gate",
+    "options": {
+      "maxProbes": 2
+    }
+  },
+  "resultPolicy": {
+    "name": "result-budget",
+    "options": {
+      "maxHits": {
+        "search_policy": 20,
+        "search_cases": 20,
+        "enumerate_clauses": 50
+      },
+      "maxChars": {
+        "get_clause_detail": 8000,
+        "default": 4000
+      }
+    }
+  },
+  "outputContract": {
+    "schema": "policy-query/output-contract.schema.json",
+    "maxRepairAttempts": 2
+  },
+  "observability": {
+    "contextSnapshot": "hash"
+  },
+  "mcpServers": [
+    {
+      "id": "policy-query",
+      "command": "${DFZQ_AUDIT_AI_PYTHON}",
+      "args": [
+        "-m",
+        "query.mcp.server"
+      ],
+      "cwd": "${DFZQ_AUDIT_AI_ROOT}",
+      "env": {
+        "PIPELINE_CONFIG_DIR": "${PIPELINE_CONFIG_DIR}",
+        "POLICY_MCP_AUDIT_LOG": "${POLICY_MCP_AUDIT_LOG}",
+        "HF_HUB_OFFLINE": "1",
+        "PATH": "${PATH}"
+      }
+    }
+  ]
+}

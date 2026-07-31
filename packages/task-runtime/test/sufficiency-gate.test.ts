@@ -6,13 +6,13 @@ import { createSufficiencyGateDescriptor, extractMatters } from "../src/runtime/
 
 function makeContext(judges: FinalJudge[], runInput = "问题正文"): PluginContext {
 	return {
-		specId: "policy-query",
 		getRunId: () => "r1",
 		getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 		abort: () => {},
 		limitState: { turns: 0 },
 		registerFinalJudge: (judge) => judges.push(judge),
 		getRunInput: () => runInput,
+		callTool: async () => ({}),
 	};
 }
 
@@ -110,9 +110,75 @@ describe("createDefaultPluginRegistry + assess", () => {
 		expect(registry.has("sufficiency-gate")).toBe(true);
 	});
 
-	it("does NOT register sufficiency-gate when assess is missing", () => {
-		// 不静默放宽:C1 的 assess_sufficiency 还没接线时,声明了这个插件的 spec 必须
-		// 在装配期响亮失败,而不是悄悄跳过充分性判定。
-		expect(createDefaultPluginRegistry().has("sufficiency-gate")).toBe(false);
+	it("registers sufficiency-gate even without an injected assess", () => {
+		// 旧契约是「assess 缺省就不注册」,理由是不静默放宽。但代价太大:两个生产调用点
+		// (server/main.ts、cli/main.ts)都不传 deps ⇒ C3 在生产上**永不可达**,
+		// 而「永不可达」比「静默放宽」更糟 —— 它连声明这个插件的机会都没有。
+		//
+		// 新契约:插件缺省从 PluginContext.callTool 调 C1。「C1 有没有接上」由装配期的
+		// 工具名校验回答 —— spec 的 toolset 不提供 assess_sufficiency 时,
+		// callTool 会抛「this run's toolset does not provide」。fail-closed 没有丢,
+		// 只是从**注册期**挪到了**调用期**,而且错误信息更指向病因。
+		expect(createDefaultPluginRegistry().has("sufficiency-gate")).toBe(true);
+	});
+});
+
+describe("assessViaTool 的判定依据(C3 改语义后的核心)", () => {
+	function gateWith(toolResult: unknown) {
+		const judges: FinalJudge[] = [];
+		const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+		const descriptor = createSufficiencyGateDescriptor(); // 不注入 assess ⇒ 走 callTool
+		descriptor.factory(
+			{
+				getRunId: () => "r-1",
+				getSession: () => {
+					throw new Error("unused");
+				},
+				abort: () => {},
+				limitState: { turns: 0 },
+				registerFinalJudge: (j) => judges.push(j),
+				getRunInput: () => "第一个待查要点。第二个待查要点。",
+				callTool: async (name, args) => {
+					calls.push({ name, args });
+					return toolResult;
+				},
+			},
+			{},
+		);
+		return { judge: judges[0], calls };
+	}
+
+	const context = { clauseIds: ["a", "b"], lastText: "", attempt: 0 } as never;
+
+	it("rejects when some retrieved clauses were never fetched, even if the count says sufficient", async () => {
+		// **这条是改语义的全部意义**:C1 的 hit_count_sufficient 只是 len(candidates)>=min_hits
+		// 的计数,底层 assess() 不做任何语义判定。真正有判定力的是 unfetched ——
+		// 「检索到了却没取正文就下结论」。拿计数当判据 = 这个判官形同虚设。
+		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2 });
+		const verdict = await judge.judge(context);
+		expect(verdict.ok).toBe(false);
+		// JudgeVerdict 是可辨识联合,ok:true 那支没有 followUp —— 先窄化再读。
+		if (verdict.ok) throw new Error("expected a rejection");
+		expect(verdict.followUp).toContain("a");
+	});
+
+	it("passes when everything retrieved has been fetched", async () => {
+		const { judge } = gateWith({ hit_count_sufficient: false, unfetched: [], retrieved_count: 2 });
+		const verdict = await judge.judge(context);
+		expect(verdict.ok).toBe(true);
+	});
+
+	it("calls C1's assess_sufficiency with the extracted matters", async () => {
+		const { judge, calls } = gateWith({ unfetched: [] });
+		await judge.judge(context);
+		expect(calls[0]?.name).toBe("assess_sufficiency");
+		// extractMatters 会丢掉长度 < 4 的片段(它按中文标点切分,过短的多半是语气词),
+		// 所以这里的要点要够长 —— 写短了会拿到空数组而误以为是接线断了。
+		expect(calls[0]?.args.matters).toEqual(["第一个待查要点", "第二个待查要点"]);
+	});
+
+	it("treats a missing unfetched field as nothing outstanding rather than crashing", async () => {
+		const { judge } = gateWith({});
+		expect((await judge.judge(context)).ok).toBe(true);
 	});
 });

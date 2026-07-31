@@ -22,8 +22,17 @@ export interface AssembleOptions {
 	toolsets: ToolsetRegistry;
 	cwd: string;
 	agentDir: string;
-	/** 本次装配的 per-run 上下文,透传给每个插件工厂。 */
-	pluginContext: PluginContext;
+	/**
+	 * `spec.skills` 解析成的**绝对**路径。与 `outputContractSchema` 同一条纪律:
+	 * 相对路径的基准是 spec 文件所在目录,而 assemble() 不知道 spec 从哪来 ——
+	 * 所以解析归调用方(`createDefaultRuntimeFactory` / `cli/main.ts`)。
+	 */
+	skillPaths?: string[];
+	/**
+	 * 本次装配的 per-run 上下文。**不含 `callTool`** —— 那一项只有 assemble() 造得出
+	 * (它同时握着已解析的工具与待实例化的插件),由本函数补齐后再交给插件工厂。
+	 */
+	pluginContext: Omit<PluginContext, "callTool">;
 	/** 测试缝:绕过 ProviderProfile,直接用已注册的 faux 模型 */
 	modelOverride?: {
 		modelRuntime: ModelRuntime;
@@ -34,7 +43,33 @@ export interface AssembleOptions {
 export interface Assembled {
 	session: AgentSession;
 	specId: string;
+	/**
+	 * 本次装配的资源加载器。暴露它只为**可观测** —— 「spec 声明的 skill 到底加载上没有」
+	 * 除了 `getSkills()` 没有别的验法(skill 不是工具,不出现在 getActiveToolNames 里,
+	 * 它只影响 system prompt 里的 `<available_skills>` 摘要)。
+	 */
+	resources: DefaultResourceLoader;
 	dispose: () => Promise<void>;
+}
+
+/**
+ * 从工具结果里取文本。
+ *
+ * pi 的 `AgentToolResult.content` 类型是 `(TextContent | ImageContent)[]`,但**测试 fixture
+ * 里普遍写成裸字符串**(`test/helpers` 与几个 `*.test.ts` 的 echo,第一刀台账 §6.1 记为
+ * 「fixture 自相矛盾」的 deferred minor)。两种形状都要认:只认数组会让所有用 fixture 的
+ * 插件测试拿到空串,只认字符串会在生产上炸 —— 后者正是第一刀 C4 踩过的坑
+ * (类型断言压过去 ⇒ 运行时 `content.trim()` 抛 TypeError,而 pi 的 emitToolResult
+ * catch 住并悄悄丢弃,整个插件在生产上静默失效)。
+ */
+function extractText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) =>
+			part && typeof part === "object" && "text" in part ? String((part as { text: unknown }).text) : "",
+		)
+		.join("");
 }
 
 function formatNames(names: readonly string[]): string {
@@ -119,7 +154,32 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			{ name: LIMITS_PLUGIN_NAME, options: { limits: spec.limits } satisfies LimitsOptions },
 			...specPluginRefs,
 		]);
-		const extensionFactories = instantiatePlugins(pluginEntries, options.pluginContext);
+		// callTool 在这里补上而不是让调用方给:只有 assemble() 同时握着「已解析的工具」
+		// 与「要实例化的插件」。tools 来自上面的 toolsets.resolve()(:70),插件在 :122
+		// 才实例化 —— 时序成立。
+		const byName = new Map(tools.map((tool) => [tool.name, tool]));
+		const pluginContext: PluginContext = {
+			...options.pluginContext,
+			callTool: async (name, args) => {
+				const tool = byName.get(name);
+				if (!tool) {
+					// 装配错误要响要早:插件声明了依赖某工具,而 spec 的 toolset 没提供它。
+					throw new Error(
+						`Plugin requested tool "${name}", which this run's toolset does not provide ` +
+							`(available: ${formatNames([...byName.keys()])})`,
+					);
+				}
+				const result = await tool.execute("plugin", args as never, undefined, undefined, {} as never);
+				const text = extractText(result.content);
+				try {
+					return JSON.parse(text);
+				} catch {
+					// 工具返回非 JSON 时把原文交回去 —— 由插件决定怎么理解,不在这层猜。
+					return text;
+				}
+			},
+		};
+		const extensionFactories = instantiatePlugins(pluginEntries, pluginContext);
 
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,
@@ -127,7 +187,10 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			settingsManager,
 			// 剥光通用能力(照抄 packages/evals/src/pi-harness.ts)
 			noExtensions: true, // 只过滤磁盘扫描,不影响 extensionFactories
+			// noSkills 只过滤磁盘扫描,不挡下面的 additionalSkillPaths(resource-loader.ts:467-469)。
+			// 两者并存是刻意的:底座剥光通用能力,任务需要的能力由 spec 自己声明。
 			noSkills: true,
+			additionalSkillPaths: options.skillPaths,
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true, // 安全项:阻止 AGENTS.md / CLAUDE.md 被加载(prompt injection 直通车)
@@ -159,6 +222,7 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 		return {
 			session,
 			specId: spec.id,
+			resources: resourceLoader,
 			dispose: async () => {
 				session.dispose();
 				await disposeToolset();

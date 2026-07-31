@@ -146,9 +146,18 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 	// search for 'type' in null" 这类无法一眼看出病因的错误)。挪到构造期后,坏 schema
 	// 在 startServer() 装配阶段就响亮失败,不必等到请求进来。
 	const outputContractSchemas = new Map<string, unknown>();
+	// spec.skills 与 outputContract.schema 同一条纪律:相对路径的基准是 spec 目录,
+	// 而 assemble() 不知道 spec 从哪来 —— 解析归这里,构造期做一次、跨 run 复用。
+	const skillPaths = new Map<string, string[]>();
 	for (const name of (await readdir(options.specsDir)).filter((n) => n.endsWith(".json"))) {
 		const parsed = JSON.parse(await readFile(join(options.specsDir, name), "utf8")) as SpecFile;
 		specFiles.set(parsed.id, parsed);
+		if (parsed.skills?.length) {
+			skillPaths.set(
+				parsed.id,
+				parsed.skills.map((rel) => resolve(options.specsDir, rel)),
+			);
+		}
 		if (parsed.outputContract !== undefined) {
 			outputContractSchemas.set(
 				parsed.id,
@@ -163,12 +172,24 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 	// 所以在本工厂外面建一次、跨 run 复用。
 	const plugins = createDefaultPluginRegistry();
 
-	return async ({ specId, sessionId }) => {
+	// ⚠ run 的 options 必须改名:外层 `options` 是 DefaultFactoryOptions(含 workRoot),
+	// 同名解构会把它遮蔽掉,下面的 join(options.workRoot, ...) 会解析到错的目录。
+	return async ({ specId, sessionId, runId, filters, options: runOptions }) => {
 		const spec = specFiles.get(specId);
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
 		const toolsets = new ToolsetRegistry();
-		toolsets.register(spec.toolset, createMcpToolset(spec.mcpServers ?? []));
+		toolsets.register(
+			spec.toolset,
+			createMcpToolset(spec.mcpServers ?? [], {
+				runId,
+				// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
+				// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
+				permTags: filters.permTags ?? [],
+				corpusTypes: filters.corpusTypes,
+				options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
+			}),
+		);
 
 		const workdir = join(options.workRoot, sessionId);
 		return createSessionRuntime({
@@ -179,6 +200,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			cwd: join(workdir, "workspace"),
 			agentDir: join(workdir, "agent"),
 			outputContractSchema: outputContractSchemas.get(specId),
+			skillPaths: skillPaths.get(specId),
 		});
 	};
 }

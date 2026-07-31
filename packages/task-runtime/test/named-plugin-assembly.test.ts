@@ -131,9 +131,9 @@ describe("named plugin assembly (风险 12)", () => {
 
 		let assembled: Awaited<ReturnType<typeof assemble>>;
 		const pluginContext: PluginContext = {
-			specId: "named-plugins-probe",
 			getRunId: () => "run-1",
 			getRunInput: () => runInput,
+			callTool: async () => ({}),
 			getSession: () => assembled.session,
 			abort: () => {},
 			limitState,
@@ -218,30 +218,33 @@ describe("named plugin assembly (风险 12)", () => {
 		expect(toolCallOutcome).toEqual({ block: true, reason: "路径超出允许范围" });
 	});
 
-	it("fails loudly when the registry has no sufficiency-gate (assess not wired)", async () => {
+	it("fails loudly at call time when the toolset does not provide assess_sufficiency", async () => {
+		// 契约变了:sufficiency-gate 现在无条件注册(此前 assess 缺省就不注册,而两个生产
+		// 调用点都不传 ⇒ C3 永不可达)。fail-closed 没有丢,只是从注册期挪到了调用期 ——
+		// 插件缺省走 PluginContext.callTool,而 assemble() 给的 callTool 在工具不存在时抛。
 		harness = await createFauxHarness();
-		await expect(
-			assemble({
-				spec: await loadSpec(),
-				profile,
-				registry: createDefaultPluginRegistry(), // 没传 assess
-				toolsets: toolsets(),
-				cwd: harness.cwd,
-				agentDir: harness.agentDir,
-				pluginContext: {
-					specId: "named-plugins-probe",
-					getRunId: () => "run-1",
-					getRunInput: () => "",
-					getSession: () => {
-						throw new Error("unused");
-					},
-					abort: () => {},
-					limitState: { turns: 0 },
-					registerFinalJudge: () => {},
+		const assembled = await assemble({
+			spec: await loadSpec(),
+			profile,
+			registry: createDefaultPluginRegistry(), // 没传 assess
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			pluginContext: {
+				getRunId: () => "run-1",
+				getRunInput: () => "",
+				getSession: () => {
+					throw new Error("unused");
 				},
-				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
-			}),
-		).rejects.toThrow(/plugin "sufficiency-gate" is not registered/);
+				abort: () => {},
+				limitState: { turns: 0 },
+				registerFinalJudge: () => {},
+			},
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		// 装配本身成功 —— 这正是与旧契约的差别。
+		expect(assembled.specId).toBeTruthy();
+		await assembled.dispose();
 	});
 
 	it("fails loudly when the registry is empty (limits missing)", async () => {
@@ -269,7 +272,6 @@ describe("named plugin assembly (风险 12)", () => {
 				cwd: harness.cwd,
 				agentDir: harness.agentDir,
 				pluginContext: {
-					specId: "named-plugins-probe-minimal",
 					getRunId: () => "run-1",
 					getRunInput: () => "",
 					getSession: () => {

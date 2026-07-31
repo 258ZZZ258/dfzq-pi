@@ -1,3 +1,6 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -44,13 +47,13 @@ function spec(overrides: Partial<RuntimeSpec> = {}): RuntimeSpec {
  *  这里给的是一个能应答 getSessionStats() 的占位 session,不能是 throw。 */
 function pluginContext(overrides: Partial<PluginContext> = {}): PluginContext {
 	return {
-		specId: "demo",
 		getRunId: () => "r1",
 		getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 		abort: () => {},
 		limitState: { turns: 0 },
 		registerFinalJudge: () => {},
 		getRunInput: () => "",
+		callTool: async () => ({}),
 		...overrides,
 	};
 }
@@ -402,7 +405,7 @@ describe("assemble - implicit limits plugin", () => {
 		cleanups.push(second.dispose);
 
 		// 进程级表没被写脏:两次装配都只 lookup,没有任何 per-run 东西 register 进去。
-		expect([...shared.names()]).toEqual(["limits", "result-budget", "path-guard"]);
+		expect([...shared.names()]).toEqual(["limits", "result-budget", "path-guard", "sufficiency-gate"]);
 
 		// 只驱动第一个 session,第二个的 LimitState 必须纹丝不动。
 		await first.session.prompt("hi");
@@ -613,5 +616,117 @@ describe("assemble - toolset handle ownership", () => {
 			}),
 		).rejects.toThrow(/replacing hook "tool_result"/);
 		expect(disposeSpy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("PluginContext.callTool(C3 接线)", () => {
+	it("hands plugins a callTool bound to this run's resolved tools", async () => {
+		// 这是插件够得着 per-run MCP 会话的唯一通路:PluginRegistry 是进程级的,
+		// MCP client 是 per-run 的,那根线在注册处接不上。
+		let called: { name: string; args: unknown } | undefined;
+		let result: unknown;
+		const registry = createDefaultPluginRegistry();
+		registry.register({
+			name: "probe-calltool",
+			hooks: [],
+			factory: (ctx) => {
+				void ctx.callTool("echo", { text: '{"ok":true}' }).then((r) => {
+					result = r;
+				});
+				called = { name: "echo", args: { text: "x" } };
+				return { name: "probe-calltool", factory: () => {} };
+			},
+		});
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			spec: spec({ extraPlugins: ["probe-calltool"] }),
+			profile,
+			registry,
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			pluginContext: pluginContext(),
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+		await new Promise((r) => setTimeout(r, 10));
+		expect(called).toBeTruthy();
+		// echo fixture 回显 text,内容是合法 JSON ⇒ callTool 解析后交回对象
+		expect(result).toEqual({ ok: true });
+	});
+
+	it("throws a diagnostic error when the plugin asks for a tool this toolset lacks", async () => {
+		// 装配错误要响要早,且要说清是哪个工具、有哪些可用 ——
+		// 「C1 有没有接上」这个问题就是靠它回答的。
+		let thrown: Error | undefined;
+		const registry = createDefaultPluginRegistry();
+		registry.register({
+			name: "probe-missing-tool",
+			hooks: [],
+			factory: (ctx) => {
+				void ctx.callTool("no-such-tool", {}).catch((e) => {
+					thrown = e as Error;
+				});
+				return { name: "probe-missing-tool", factory: () => {} };
+			},
+		});
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			spec: spec({ extraPlugins: ["probe-missing-tool"] }),
+			profile,
+			registry,
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			pluginContext: pluginContext(),
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+		await new Promise((r) => setTimeout(r, 10));
+		expect(thrown?.message).toMatch(/no-such-tool/);
+		expect(thrown?.message).toMatch(/does not provide/);
+	});
+});
+
+describe("C7:spec 声明的 skill 注入", () => {
+	async function assembleWithSkills(skillPaths: string[] | undefined) {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			pluginContext: pluginContext(),
+			spec: spec(),
+			profile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			skillPaths,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+		return assembled;
+	}
+
+	it("loads a declared skill even though noSkills is true", async () => {
+		// §2.4-V2 的结论此前只有读码依据。这条是它的判别性验证:
+		// noSkills:true 只过滤磁盘扫描,不挡构造选项传进来的 skill。
+		const dir = await mkdtemp(join(tmpdir(), "dfzq-skill-"));
+		cleanups.push(async () => {
+			await rm(dir, { recursive: true, force: true });
+		});
+		const file = join(dir, "policy-validity.md");
+		await writeFile(file, "---\nname: policy-validity\ndescription: 判定制度的现行有效性\n---\n\n正文\n");
+
+		const assembled = await assembleWithSkills([file]);
+		const { skills } = assembled.resources.getSkills();
+		expect(skills.map((s) => s.name)).toContain("policy-validity");
+	});
+
+	it("loads no skills when the spec declares none", async () => {
+		// 对照组:没有这条,上面那条无法排除「底座本来就在加载磁盘 skill」。
+		const assembled = await assembleWithSkills(undefined);
+		expect(assembled.resources.getSkills().skills).toHaveLength(0);
 	});
 });

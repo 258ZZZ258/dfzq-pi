@@ -40,6 +40,14 @@ export interface RunResult {
 	usage: RunUsage;
 	turns: number;
 	durationMs: number;
+	/**
+	 * 每个终局判官实际重判了几次(判官名 → 次数)。没有判官时为空对象。
+	 *
+	 * 为什么要上到结果层:验收要区分「一次答对」与「靠重判才合规」——
+	 * 只看 status=completed 是分不出来的,而后者说明 prompt 或工具描述有问题。
+	 * 此前 runFinalJudges 算了这个数但被 session-runtime 整个丢弃,只有单测能观测到。
+	 */
+	judgeAttempts: Record<string, number>;
 }
 
 export interface RuntimeSnapshot {

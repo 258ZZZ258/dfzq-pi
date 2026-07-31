@@ -5,9 +5,9 @@ import { resultBudgetDescriptor } from "../src/runtime/plugins/result-budget.ts"
 
 function makeContext(): PluginContext {
 	return {
-		specId: "s1",
 		getRunId: () => "r1",
 		getRunInput: () => "",
+		callTool: async () => ({}),
 		getSession: () => ({ getSessionStats: () => ({ tokens: { total: 0 }, cost: 0 }) }) as never,
 		abort: () => {},
 		limitState: { turns: 0 },

@@ -29,6 +29,13 @@ async function main(): Promise<void> {
 		},
 	});
 
+	if (positionals[0] === "serve") {
+		// 动态 import:serve 分支会拉进 hono 与 node:sqlite,不该让单跑 CLI 也付这份启动开销。
+		const { serveMain } = await import("./serve.ts");
+		await serveMain(process.env);
+		return;
+	}
+
 	if (positionals[0] !== "run") {
 		throw new Error("usage: task-runtime run --spec <file> --profile <file> --workdir <dir> --input <text>");
 	}

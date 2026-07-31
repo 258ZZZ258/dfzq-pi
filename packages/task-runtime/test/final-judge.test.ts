@@ -66,6 +66,25 @@ describe("runFinalJudges", () => {
 		expect(reprompt.mock.calls[0]?.[0]).toBe("first 不通过");
 	});
 
+	// Task 8 (C6):C6 必须在装配期**追加在**插件登记的判官(如 C3 的 sufficiency-gate)之后。
+	// 这里不需要真 session —— 只要证明 runFinalJudges 按 judges 数组顺序派发,而 session-runtime.ts
+	// 的接线保证了这个数组顺序(assemble() 内部的 registerFinalJudge 先跑,C6 在 assemble()
+	// 返回之后才 push)。两者都不通过时,先派发的必须是排在前面的 sufficiency-gate。
+	it("dispatches sufficiency-gate's followUp before output-contract's when both judges fail (C3 before C6)", async () => {
+		const reprompt = repromptMock();
+		await runFinalJudges({
+			judges: [
+				judge("sufficiency-gate", [{ ok: false }, { ok: true }]),
+				judge("output-contract", [{ ok: false }, { ok: true }]),
+			],
+			getLastAssistantText: () => "text",
+			getClauseIds: () => [],
+			reprompt,
+			shouldStop: () => false,
+		});
+		expect(reprompt.mock.calls[0]?.[0]).toBe("sufficiency-gate 不通过");
+	});
+
 	it("passes over an exhausted judge whose onExhausted is pass", async () => {
 		const reprompt = repromptMock();
 		const outcome = await runFinalJudges({

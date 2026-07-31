@@ -2,9 +2,13 @@ import { randomUUID } from "node:crypto";
 import { type Assembled, type AssembleOptions, assemble } from "./assembler.ts";
 import type { LimitKind, LimitState, RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
 import { collectClauseIds, type FinalJudge, runFinalJudges } from "./final-judge.ts";
+import { createOutputContractJudge } from "./output-contract.ts";
 import type { PluginContext } from "./plugin-registry.ts";
 
-export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "pluginContext">;
+export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "pluginContext"> & {
+	/** spec.outputContract.schema 指向的文件已由调用方读好。缺省即不挂 C6 判官。 */
+	outputContractSchema?: unknown;
+};
 
 export async function createSessionRuntime(options: CreateSessionRuntimeOptions): Promise<Runtime> {
 	const state: LimitState = { turns: 0 };
@@ -38,6 +42,18 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	};
 
 	assembled = await assemble({ ...options, pluginContext });
+	// **最后**追加 C6:判官按登记顺序跑,插件登记的(C3)排在前面 —— 证据不足时先补证据,
+	// 没必要先修 JSON 格式。C6 必须在插件登记完(assemble() 内部发生)之后才推进 judges,
+	// 所以放在这里而不是 pluginContext 声明的地方。
+	const contractSchema = options.outputContractSchema;
+	const outputContractJudge =
+		contractSchema === undefined || options.spec.outputContract === undefined
+			? undefined
+			: createOutputContractJudge({
+					schema: contractSchema,
+					maxRepairAttempts: options.spec.outputContract.maxRepairAttempts ?? 2,
+				});
+	if (outputContractJudge) judges.push(outputContractJudge);
 	const session = assembled.session;
 	// abortFn is invoked from two synchronous callbacks -- the limits plugin's `turn_end`
 	// hook and the runTimeoutMs setTimeout below -- neither of which can be made to `await`

@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { type ServerType, serve } from "@hono/node-server";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
@@ -158,6 +158,12 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		toolsets.register(spec.toolset, createMcpToolset(spec.mcpServers ?? []));
 
 		const workdir = join(options.workRoot, sessionId);
+		// C6(输出契约判官)需要的 schema 文件在这里读:SessionRuntime 那层不该碰文件系统,
+		// 只接收已解析好的 schema。字段缺省即不挂 C6。
+		const outputContractSchema =
+			spec.outputContract === undefined
+				? undefined
+				: JSON.parse(await readFile(resolve(options.specsDir, spec.outputContract.schema), "utf8"));
 		return createSessionRuntime({
 			spec,
 			profile,
@@ -165,6 +171,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			toolsets,
 			cwd: join(workdir, "workspace"),
 			agentDir: join(workdir, "agent"),
+			outputContractSchema,
 		});
 	};
 }

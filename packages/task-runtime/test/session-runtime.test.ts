@@ -610,6 +610,121 @@ describe("SessionRuntime final-judge rejudging", () => {
 		expect(result.errorMessage).toContain("assess 调用失败");
 	});
 
+	// Task 8:C6(输出契约判官)的接线锁。
+	describe("C6 output-contract judge wiring", () => {
+		const minimalContractSchema = {
+			type: "object",
+			required: ["conclusion"],
+			additionalProperties: false,
+			properties: { conclusion: { type: "string" } },
+		};
+
+		async function buildWithOutputContract(
+			registry: ReturnType<typeof createDefaultPluginRegistry>,
+			specOverrides: Partial<RuntimeSpec>,
+			outputContractSchema: unknown,
+			responses: unknown[],
+		) {
+			const harness = await createFauxHarness();
+			cleanups.push(harness.cleanup);
+			harness.faux.setResponses(responses as never);
+			const runtime = await createSessionRuntime({
+				spec: { ...spec({ maxTurns: 10 }), ...specOverrides },
+				profile,
+				registry,
+				toolsets: toolsets(),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+				outputContractSchema,
+			});
+			cleanups.push(runtime.dispose);
+			return runtime;
+		}
+
+		// 既有 spec(没有 outputContract 字段)必须一字不变:哪怕调用方手滑传了
+		// outputContractSchema,只要 spec.outputContract 是 undefined,C6 就不能挂上 ——
+		// 否则一段散文式的回答会被判"未找到 JSON"而不是照常 completed。
+		it("does not mount C6 when spec.outputContract is undefined, even if outputContractSchema is supplied", async () => {
+			const runtime = await buildWithOutputContract(createDefaultPluginRegistry(), {}, minimalContractSchema, [
+				fauxAssistantMessage("这是一段散文,不含任何 JSON"),
+			]);
+			const result = await runtime.run("hello");
+			expect(result.status).toBe("completed");
+			expect(result.output).toContain("这是一段散文");
+		});
+
+		// 对称的另一半:spec 声明了 outputContract,但调用方(比如未来某个新调用点)忘了把
+		// 读好的 schema 传进来 —— 同样不能挂 C6,而不是拿 undefined 当 schema 去跑 typebox。
+		it("does not mount C6 when outputContractSchema is undefined, even if spec.outputContract is declared", async () => {
+			const runtime = await buildWithOutputContract(
+				createDefaultPluginRegistry(),
+				{ outputContract: { schema: "answer.schema.json" } },
+				undefined,
+				[fauxAssistantMessage("这是一段散文,不含任何 JSON")],
+			);
+			const result = await runtime.run("hello");
+			expect(result.status).toBe("completed");
+		});
+
+		// 顺序断言的真身:brief 的 Step 7 只用假判官证明了 runFinalJudges 按数组顺序派发,
+		// 这里换成 session-runtime.ts 真实的接线路径 —— 一个通过插件在 assemble() 内部
+		// registerFinalJudge 的判官(充当 C3),配上真的 outputContractSchema(真正的 C6)。
+		// 第一版回答完全没有 JSON,对两个判官来说都会不通过;若 C6 排在前面,第一次 reprompt
+		// 发的就会是 C6 的"未找到 JSON"文案。用 prompt 的 spy 直接读派发的文本,证明先发出去
+		// 的是排在前面的插件判官的 followUp。
+		it("dispatches the plugin-registered judge's followUp before C6's when both would reject the first draft", async () => {
+			const promptSpy = vi.spyOn(AgentSession.prototype, "prompt");
+			cleanups.push(async () => {
+				promptSpy.mockRestore();
+			});
+
+			// 第一次不通过、第二次通过 —— 与 buildWithJudge 用的 verdicts 列表是同一套模式,
+			// 只是这里要走真实的 createSessionRuntime + 真实的 C6,所以手写一个带计数的判官。
+			let sufficiencyCalls = 0;
+			const registry = registryWithCustomJudge("sufficiency-gate", async () => {
+				sufficiencyCalls += 1;
+				if (sufficiencyCalls === 1) return { ok: false, followUp: "sufficiency-gate 要求先补充证据" };
+				return { ok: true };
+			});
+			const runtime = await buildWithOutputContract(
+				registry,
+				{ stopPolicy: "sufficiency-gate", outputContract: { schema: "answer.schema.json", maxRepairAttempts: 2 } },
+				minimalContractSchema,
+				[fauxAssistantMessage("第一版全是散文"), fauxAssistantMessage(JSON.stringify({ conclusion: "允许" }))],
+			);
+
+			const result = await runtime.run("hello");
+
+			expect(promptSpy.mock.calls[0]?.[0]).toBe("hello");
+			// 关键断言:第一次 reprompt 派发的是 sufficiency-gate 的文案,不是 C6 的
+			// "未找到 JSON 块"—— 尽管第一版回答对 C6 来说也确实不合格。
+			expect(promptSpy.mock.calls[1]?.[0]).toBe("sufficiency-gate 要求先补充证据");
+
+			// sufficiency-gate 第二次通过、C6 也认可第二版 JSON —— run 应当顺利收尾。
+			expect(result.status).toBe("completed");
+			expect(result.output).toContain('"conclusion":"允许"');
+		});
+
+		// C6 的 onExhausted:"error" 落地:重试次数耗尽仍不合格时,run 必须报 error 而不是
+		// 悄悄放行一个 Java 解析不了的输出。
+		it("reports status=error once maxRepairAttempts is exhausted and the output still fails the schema", async () => {
+			const runtime = await buildWithOutputContract(
+				createDefaultPluginRegistry(),
+				{ outputContract: { schema: "answer.schema.json", maxRepairAttempts: 1 } },
+				minimalContractSchema,
+				[
+					fauxAssistantMessage("第一版全是散文"),
+					fauxAssistantMessage("第二版还是散文"),
+					fauxAssistantMessage("不该出现的第三版"),
+				],
+			);
+			const result = await runtime.run("hello");
+			expect(result.status).toBe("error");
+			expect(result.errorMessage).toContain("未找到 JSON");
+		});
+	});
+
 	// 审查 M-2 的回归锁:`thrown !== undefined 跳过重判`这条不变量此前只靠读代码验证。
 	it("skips rejudging entirely when session.prompt() itself throws", async () => {
 		const promptSpy = vi.spyOn(AgentSession.prototype, "prompt").mockRejectedValueOnce(new Error("prompt boom"));

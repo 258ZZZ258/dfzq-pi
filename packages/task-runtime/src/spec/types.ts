@@ -21,6 +21,13 @@ export interface ObservabilitySpec {
 	redact?: string[];
 }
 
+export interface OutputContractSpec {
+	/** JSON Schema 文件路径(相对 spec 文件所在目录,或绝对路径)。 */
+	schema: string;
+	/** 允许的退回重试次数,默认 2。 */
+	maxRepairAttempts?: number;
+}
+
 export interface RuntimeSpec {
 	id: string;
 	description?: string;
@@ -55,6 +62,9 @@ export interface RuntimeSpec {
 	 * 依赖 S2 才有的观测组件,所以显式标注而不是假装接上。)
 	 */
 	observability?: ObservabilitySpec;
+
+	/** 缺省即不挂 C6(输出契约判官)—— 既有 spec 的行为不变。 */
+	outputContract?: OutputContractSpec;
 }
 
 export function pluginName(ref: PluginRef): string {

@@ -72,6 +72,9 @@ async function main(): Promise<void> {
 					...(process.env.EVAL_TASK_LOG ? { EVAL_TASK_LOG: process.env.EVAL_TASK_LOG } : {}),
 				},
 			})),
+			// eval / CLI 不是权限场景:没有 POST /runs 的 filters,也没有 runId。
+			// 显式 null 而不是省略 —— 参数不可省略,于是生产路径漏传 scope 是编译错误。
+			null,
 		),
 	);
 

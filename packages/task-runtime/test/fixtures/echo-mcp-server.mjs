@@ -56,6 +56,17 @@ const TOOLS = [
 // 它自己有的工具,用来测"两个 server 部分撞名(echo/boom/leak 共有 + 各自独有一个)"的非对称
 // 前缀场景 —— 之前的撞名测试两个 server 都是同一份 TOOLS,全部对称撞名,测不出"不撞名的名字
 // 不该加前缀"这条分支。没有显式 tools/call 处理分支:落到文件末尾的通用 echo-like 兜底即可。
+// Task 7:echo 只回显 text,验不到「注入到 params 里的授权位有没有真的到 server 侧」。
+// echo-args 把收到的**完整 arguments** 原样回显,是 scope 注入与提权测试的唯一观测点。
+// 用 env 开关而不是无条件挂上:既有测试断言了工具名全集 ["boom","echo","leak"]。
+if (process.env.MCP_FIXTURE_ECHO_ARGS) {
+	TOOLS.push({
+		name: "echo-args",
+		description: "Echo the full arguments object back as JSON.",
+		inputSchema: { type: "object", properties: { text: { type: "string" } } },
+	});
+}
+
 if (process.env.MCP_FIXTURE_EXTRA_TOOL) {
 	TOOLS.push({
 		name: process.env.MCP_FIXTURE_EXTRA_TOOL,
@@ -142,6 +153,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 				fs.writeSync(2, chunk);
 			}
 			send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "spammed" }] } });
+			return;
+		}
+		if (msg.params.name === "echo-args") {
+			send({
+				jsonrpc: "2.0",
+				id: msg.id,
+				result: { content: [{ type: "text", text: JSON.stringify(msg.params.arguments ?? {}) }] },
+			});
 			return;
 		}
 		send({

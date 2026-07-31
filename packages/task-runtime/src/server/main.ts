@@ -163,12 +163,24 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 	// 所以在本工厂外面建一次、跨 run 复用。
 	const plugins = createDefaultPluginRegistry();
 
-	return async ({ specId, sessionId }) => {
+	// ⚠ run 的 options 必须改名:外层 `options` 是 DefaultFactoryOptions(含 workRoot),
+	// 同名解构会把它遮蔽掉,下面的 join(options.workRoot, ...) 会解析到错的目录。
+	return async ({ specId, sessionId, runId, filters, options: runOptions }) => {
 		const spec = specFiles.get(specId);
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
 		const toolsets = new ToolsetRegistry();
-		toolsets.register(spec.toolset, createMcpToolset(spec.mcpServers ?? []));
+		toolsets.register(
+			spec.toolset,
+			createMcpToolset(spec.mcpServers ?? [], {
+				runId,
+				// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
+				// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
+				permTags: filters.permTags ?? [],
+				corpusTypes: filters.corpusTypes,
+				options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
+			}),
+		);
 
 		const workdir = join(options.workRoot, sessionId);
 		return createSessionRuntime({

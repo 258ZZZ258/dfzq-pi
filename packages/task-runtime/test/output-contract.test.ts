@@ -42,27 +42,49 @@ const good = {
 
 describe("extractJsonBlock", () => {
 	it("reads a bare JSON object", () => {
-		expect(extractJsonBlock('{"a":1}')).toEqual({ a: 1 });
+		expect(extractJsonBlock('{"a":1}')).toEqual({ kind: "ok", value: { a: 1 } });
 	});
 
 	it("reads a fenced ```json block", () => {
-		expect(extractJsonBlock('前言\n```json\n{"a":1}\n```\n后记')).toEqual({ a: 1 });
+		expect(extractJsonBlock('前言\n```json\n{"a":1}\n```\n后记')).toEqual({ kind: "ok", value: { a: 1 } });
 	});
 
 	it("reads an unlabelled fenced block", () => {
-		expect(extractJsonBlock('```\n{"a":1}\n```')).toEqual({ a: 1 });
-	});
-
-	it("returns undefined when there is no JSON at all", () => {
-		expect(extractJsonBlock("完全是散文")).toBeUndefined();
+		expect(extractJsonBlock('```\n{"a":1}\n```')).toEqual({ kind: "ok", value: { a: 1 } });
 	});
 
 	// 审查订正:这是唯一真的会走到"原文本兜底"分支、并且**成功**的场景 —— 围栏内容本身
 	// 不含花括号(第一个候选在 start<0 处 continue),回退到原文本才截出紧跟其后的裸 JSON。
-	// 围栏内容含花括号但解析失败的那种"损坏围栏"输入,实测原文本兜底截不出干净的 JSON
-	// (原文本的 indexOf/lastIndexOf 跨度必然包住围栏里那段坏内容),不在本用例覆盖范围。
 	it("reads a bare JSON object that follows an unlabelled non-JSON fence", () => {
-		expect(extractJsonBlock('```\nsome cmd\n```\n{"a":1}')).toEqual({ a: 1 });
+		expect(extractJsonBlock('```\nsome cmd\n```\n{"a":1}')).toEqual({ kind: "ok", value: { a: 1 } });
+	});
+
+	// absent 与 unparsable 必须分开:前者无解析错误可报(模型输出纯散文),后者有。
+	// 合并成一个 undefined 正是本任务要消除的信息损失。
+	it("reports absent when there is no brace at all", () => {
+		expect(extractJsonBlock("完全是散文")).toEqual({ kind: "absent" });
+	});
+
+	it("reports unparsable with the parser message when braces exist but JSON is broken", () => {
+		const broken = '{"conclusion":"甲" "basis":[]}'; // 缺逗号,与第 7 次真 run 同型
+		const result = extractJsonBlock(broken);
+		expect(result.kind).toBe("unparsable");
+		if (result.kind === "unparsable") {
+			expect(result.error).toMatch(/JSON/);
+			expect(result.snippet).toContain('"basis"');
+		}
+	});
+
+	// 长输入时 snippet 必须围绕出错位置截,而不是恒取开头 —— 第 7 次真 run 的错误在
+	// char 2532,恒取开头等于把人指向一段完全正确的文本。
+	it("centres the snippet on the parser's reported position", () => {
+		const filler = '{"pad":"' + "x".repeat(500) + '" "boom":1}';
+		const result = extractJsonBlock(filler);
+		expect(result.kind).toBe("unparsable");
+		if (result.kind === "unparsable") {
+			expect(result.snippet).toContain('"boom"');
+			expect(result.snippet.length).toBeLessThanOrEqual(161);
+		}
 	});
 });
 

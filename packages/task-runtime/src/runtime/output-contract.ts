@@ -1,9 +1,26 @@
 import { Value } from "typebox/value";
 import type { FinalJudge, JudgeContext, JudgeVerdict } from "./final-judge.ts";
 
+export type JsonBlockResult =
+	| { kind: "ok"; value: unknown }
+	| { kind: "unparsable"; error: string; snippet: string }
+	| { kind: "absent" };
+
+const SNIPPET_RADIUS = 80;
+
+/** 从 V8 的 "…at position 2532 (line 80 column 10)" 里取位置;取不到返回 0。 */
+function parseErrorPosition(message: string): number {
+	const m = /at position (\d+)/.exec(message);
+	return m ? Number(m[1]) : 0;
+}
+
 /**
  * 从助手文本里挖出 JSON。允许三种形态:裸对象、```json 围栏、无标签围栏。
- * 挖不到返回 undefined —— 调用方据此判"未找到 JSON",不要和"JSON 不合 schema"混为一谈。
+ *
+ * **三态而非二态**:`absent`(压根没有花括号,模型输出的是散文)与 `unparsable`
+ * (有花括号但 JSON 坏了)必须分开 —— 前者没有解析错误可报,后者有,而 C6 的 followUp
+ * 要靠后者告诉模型错在第几个字符。合并成一个 undefined 就是把这条信息扔掉,那正是
+ * 第 7 次真 run 只能拿到「未找到 JSON 块」的原因。
  *
  * candidates 的顺序是 `[围栏内容, 原文本]`——**实测过**这不是两次对称的尝试:
  * - 围栏内容本身不含花括号(比如模型贴的是一段非 JSON 的代码块)时,第一个候选在
@@ -14,23 +31,30 @@ import type { FinalJudge, JudgeContext, JudgeVerdict } from "./final-judge.ts";
  *   **包住**围栏里那段坏内容(原文本本来就包含整个围栏),回退候选截出来的还是同一段坏
  *   JSON。**实测这种情况下 `catch` 分支恢复不了**——保留第二个候选只是为了上面那种
  *   "围栏非 JSON + 裸 JSON 兜底" 的场景,不是为了"从损坏的围栏里抢救"。
+ *   ⇒ 因此 `unparsable` 报的是**最后一个候选**的错误。
  */
-export function extractJsonBlock(text: string): unknown {
+export function extractJsonBlock(text: string): JsonBlockResult {
 	const fenced = /```(?:json)?\s*\n([\s\S]*?)\n?```/i.exec(text);
 	const candidates = fenced?.[1] === undefined ? [text] : [fenced[1], text];
+	let lastFailure: { error: string; snippet: string } | undefined;
 	for (const candidate of candidates) {
 		const trimmed = candidate.trim();
 		const start = trimmed.indexOf("{");
 		const end = trimmed.lastIndexOf("}");
 		if (start < 0 || end <= start) continue;
+		const slice = trimmed.slice(start, end + 1);
 		try {
-			return JSON.parse(trimmed.slice(start, end + 1));
-		} catch {
-			// 只有"围栏内容含花括号但解析失败"这种输入会走到这里;实测这种情况下原文本
-			// 兜底同样会失败(见上面函数注释),这里只是诚实地"再试一次",不是号称能恢复。
+			return { kind: "ok", value: JSON.parse(slice) };
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const at = parseErrorPosition(message);
+			lastFailure = {
+				error: message,
+				snippet: slice.slice(Math.max(0, at - SNIPPET_RADIUS), at + SNIPPET_RADIUS),
+			};
 		}
 	}
-	return undefined;
+	return lastFailure ? { kind: "unparsable", ...lastFailure } : { kind: "absent" };
 }
 
 interface ContractShape {
@@ -97,14 +121,15 @@ export function createOutputContractJudge(options: { schema: unknown; maxRepairA
 		// 输出不合契约是硬失败:Java 拿不到能解析的结果,不能假装成功。
 		onExhausted: "error",
 		judge: async (context: JudgeContext): Promise<JudgeVerdict> => {
-			const json = extractJsonBlock(context.lastAssistantText);
-			if (json === undefined) {
+			const extracted = extractJsonBlock(context.lastAssistantText);
+			if (extracted.kind !== "ok") {
 				return {
 					ok: false,
 					detail: "未找到 JSON 块",
 					followUp: "输出不符合契约:未找到 JSON 块。请仅输出符合 schema 的 JSON,不要夹带其他文字。",
 				};
 			}
+			const json = extracted.value;
 
 			// typebox 的 Value.Check 直接吃 draft-07 裸 schema(enum / additionalProperties /
 			// type:["string","null"] 均正确),不必再引第二个校验库。错误对象的路径字段是

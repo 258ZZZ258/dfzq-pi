@@ -63,6 +63,61 @@ interface ContractShape {
 	exhausted_scope?: unknown;
 }
 
+interface KeyDiff {
+	missing: string[];
+	extra: string[];
+}
+
+/**
+ * 沿 instancePath 同步走 schema 与 value,算该层对象的键差集。
+ *
+ * **这不是 schema 解析器,只认 `properties` 与 `items` 两种走法。** 遇到
+ * `$ref` / `allOf` / `oneOf` / `anyOf` 立刻放弃(返回 undefined),followUp 退回只带
+ * instancePath。宁可少给一份差集,也不给一份错的 —— 错的差集会让模型去改一个没错的字段。
+ *
+ * `extra` **只在 `additionalProperties === false` 时才报**:schema 允许额外属性时,
+ * 多出来的键根本不是错误,报出来是诬告。
+ */
+function keyDiffAt(schema: unknown, value: unknown, instancePath: string): KeyDiff | undefined {
+	const segments = instancePath.split("/").filter((s) => s.length > 0);
+	let node: Record<string, unknown> | undefined = isRecord(schema) ? schema : undefined;
+	let current: unknown = value;
+	for (const segment of segments) {
+		if (node === undefined) return undefined;
+		if (node.$ref !== undefined || node.allOf !== undefined || node.oneOf !== undefined || node.anyOf !== undefined) {
+			return undefined;
+		}
+		if (/^\d+$/.test(segment) && isRecord(node.items)) {
+			node = node.items;
+			current = Array.isArray(current) ? current[Number(segment)] : undefined;
+			continue;
+		}
+		const properties = isRecord(node.properties) ? node.properties : undefined;
+		const next = properties?.[segment];
+		if (!isRecord(next)) return undefined;
+		node = next;
+		current = isRecord(current) ? current[segment] : undefined;
+	}
+	if (node === undefined || !isRecord(current)) return undefined;
+	const properties = isRecord(node.properties) ? node.properties : undefined;
+	if (properties === undefined) return undefined;
+	const required = Array.isArray(node.required) ? node.required.filter((k): k is string => typeof k === "string") : [];
+	const missing = required.filter((key) => !(key in current));
+	const extra = node.additionalProperties === false ? Object.keys(current).filter((key) => !(key in properties)) : [];
+	return missing.length === 0 && extra.length === 0 ? undefined : { missing, extra };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function describeKeyDiff(diff: KeyDiff): string {
+	const parts: string[] = [];
+	if (diff.missing.length > 0) parts.push(`缺少 ${diff.missing.join("、")}`);
+	if (diff.extra.length > 0) parts.push(`多出 ${diff.extra.join("、")}`);
+	return parts.join(";");
+}
+
 /**
  * §4.2 的条件约束 + 反幻觉。返回错误说明,通过时返回 undefined。
  *
@@ -122,11 +177,21 @@ export function createOutputContractJudge(options: { schema: unknown; maxRepairA
 		onExhausted: "error",
 		judge: async (context: JudgeContext): Promise<JudgeVerdict> => {
 			const extracted = extractJsonBlock(context.lastAssistantText);
-			if (extracted.kind !== "ok") {
+			if (extracted.kind === "absent") {
 				return {
 					ok: false,
 					detail: "未找到 JSON 块",
 					followUp: "输出不符合契约:未找到 JSON 块。请仅输出符合 schema 的 JSON,不要夹带其他文字。",
+				};
+			}
+			if (extracted.kind === "unparsable") {
+				const detail = `JSON 解析失败:${extracted.error}`;
+				return {
+					ok: false,
+					detail,
+					followUp:
+						`输出不符合契约:${detail}\n出错位置附近的原文:\n${extracted.snippet}\n` +
+						`请修正这处语法错误后重新输出完整 JSON。`,
 				};
 			}
 			const json = extracted.value;
@@ -136,10 +201,18 @@ export function createOutputContractJudge(options: { schema: unknown; maxRepairA
 			// instancePath,不是 path。
 			if (!Value.Check(options.schema as never, json)) {
 				const first = [...Value.Errors(options.schema as never, json)][0];
-				const where =
-					first?.instancePath === "" || first?.instancePath === undefined ? "(root)" : first.instancePath;
+				const instancePath = first?.instancePath ?? "";
+				const where = instancePath === "" ? "(root)" : instancePath;
 				const detail = `${where} ${first?.message ?? "schema 校验失败"}`;
-				return { ok: false, detail, followUp: `输出不符合契约:${detail}。请仅输出符合 schema 的 JSON。` };
+				// 差集按**第一条错误所指的那一层**算,不是恒取顶层:第 5 次真 run 的错误在
+				// /basis/0,恒取顶层会给出一份与病因无关的差集,把模型引向没错的字段。
+				const diff = keyDiffAt(options.schema, json, instancePath);
+				const diffText = diff ? `。该层键差异:${describeKeyDiff(diff)}` : "";
+				return {
+					ok: false,
+					detail,
+					followUp: `输出不符合契约:${detail}${diffText}。请仅输出符合 schema 的 JSON。`,
+				};
 			}
 
 			const conditional = checkConditional(json as ContractShape, context.clauseIds);

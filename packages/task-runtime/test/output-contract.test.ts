@@ -99,17 +99,66 @@ describe("output contract judge", () => {
 		expect(verdict.ok).toBe(true);
 	});
 
-	it("rejects text with no JSON block", async () => {
+	it("rejects prose with the absent-block wording and no fake parser detail", async () => {
 		const verdict = await judge.judge({ lastAssistantText: "散文", clauseIds: [] });
 		expect(verdict.ok).toBe(false);
-		if (!verdict.ok) expect(verdict.detail).toContain("未找到 JSON");
+		if (!verdict.ok) {
+			expect(verdict.detail).toContain("未找到 JSON");
+			expect(verdict.followUp).not.toMatch(/position/);
+		}
 	});
 
-	it("rejects a schema violation", async () => {
+	// 第 7 次真 run 的形态:有花括号、JSON 坏了。followUp 必须带解析位置,
+	// 否则模型只知道"不对",不知道错在哪个字符。
+	it("rejects broken JSON with the parser message and the surrounding snippet", async () => {
+		const verdict = await judge.judge({
+			lastAssistantText: '{"conclusion":"甲" "basis":[]}',
+			clauseIds: [],
+		});
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) {
+			expect(verdict.detail).toContain("JSON 解析失败");
+			expect(verdict.followUp).toContain('"basis"');
+		}
+	});
+
+	// 第 7 次真 run 的字段名形态:顶层键全是模型自己发明的。
+	it("names the missing and extra top-level keys when the model invents its own field names", async () => {
+		const invented = { topic: "开户", summary: "不允许", clauses: [] };
+		const verdict = await judge.judge({ lastAssistantText: JSON.stringify(invented), clauseIds: [] });
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) {
+			expect(verdict.followUp).toContain("conclusion");
+			expect(verdict.followUp).toContain("topic");
+		}
+	});
+
+	// 第 5 次真 run 的形态:错在 /basis/0。差集必须算在那一层,
+	// 恒取顶层会给出一份与病因无关的差集。
+	it("computes the key diff at the failing instancePath, not always at the root", async () => {
+		const withText = {
+			...good,
+			basis: [{ clause_id: "A-1", text: "第一条 …条款原文…" }],
+		};
+		const verdict = await judge.judge({ lastAssistantText: JSON.stringify(withText), clauseIds: ["A-1"] });
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) {
+			expect(verdict.followUp).toContain("text");
+			// 顶层是合规的 —— 差集不得把顶层必填键报成缺失。
+			expect(verdict.followUp).not.toContain("缺少 conclusion");
+		}
+	});
+
+	// 非对象层的错误(enum 违规)没有键差集可算,followUp 退回只带 instancePath。
+	// 硬造一份差集比不给更糟 —— 模型会去改一个没错的字段。
+	it("falls back to the instancePath alone when the failing node is not an object", async () => {
 		const bad = { ...good, confidence: "very-high" };
 		const verdict = await judge.judge({ lastAssistantText: JSON.stringify(bad), clauseIds: ["A-1"] });
 		expect(verdict.ok).toBe(false);
-		if (!verdict.ok) expect(verdict.detail).toContain("/confidence");
+		if (!verdict.ok) {
+			expect(verdict.detail).toContain("/confidence");
+			expect(verdict.followUp).not.toContain("缺少");
+		}
 	});
 
 	it("rejects finish_reason:stop with an empty basis", async () => {

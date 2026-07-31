@@ -50,6 +50,7 @@ function pluginContext(overrides: Partial<PluginContext> = {}): PluginContext {
 		abort: () => {},
 		limitState: { turns: 0 },
 		registerFinalJudge: () => {},
+		getRunInput: () => "",
 		...overrides,
 	};
 }

@@ -34,6 +34,8 @@ export interface PluginContext {
 	 * 的唯一通路。登记顺序即执行顺序。
 	 */
 	registerFinalJudge: (judge: FinalJudge) => void;
+	/** 本 run 的输入正文。matters:"auto" 从这里抽。run() 未开始时返回空串。 */
+	getRunInput: () => string;
 }
 
 export type PluginFactory = (ctx: PluginContext, options?: Record<string, unknown>) => InlineExtension;

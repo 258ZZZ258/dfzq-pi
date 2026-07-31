@@ -31,6 +31,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	// and the declaration live in the same function scope.
 	let assembled!: Assembled;
 	let currentRunId = "";
+	let currentRunInput = "";
 
 	// 终局判官表 + 本 run 见过的 clause_id。两者都由下面的 pluginContext / session.subscribe
 	// 填,由 run() 末尾的 runFinalJudges 消费。judges 是**装配期**填一次(插件工厂里登记),
@@ -49,6 +50,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		abort: () => abortFn(),
 		limitState: state,
 		registerFinalJudge: (judge) => judges.push(judge),
+		getRunInput: () => currentRunInput,
 	};
 
 	assembled = await assemble({ ...options, pluginContext });
@@ -96,6 +98,21 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		// 兜底不在这里 —— C6 的反幻觉校验会在 basis 非空而 clauseIds 空时判失败,
 		// 把静默错误变成响亮的契约校验失败。
 		//
+		// isError:true 的结果不采(C3 语义决策,Task 7 记档、Task 9 到期处理):pi 的
+		// AgentTool 契约是"失败就 throw,不要把错误编进 content"(agent/src/types.ts 对
+		// AgentTool.execute 的文档字符串),框架侧对应的唯一产出通路是 agent-loop.ts 的
+		// createErrorToolResult(...),它合成的 result 固定是
+		// `{ content: [{ type: "text", text: message }], details: {} }`——message 并非任意文本:
+		// packages/task-runtime/src/toolsets/mcp/adapter.ts 在 MCP 工具返回业务级 isError:true 时
+		// `throw new Error(result.text)`,而 mcp/client.ts 的 callTool() 对业务级错误(而非协议/
+		// 传输层错误)把 `result.text` 设成 MCP server 原样返回的 content 拼接文本、不加任何前缀
+		// (`MCP tool "x" failed: ...` 前缀只在协议层 catch 分支里加,业务级分支没有)—— 于是一个
+		// "clause_id 查了但没找到"的错误结果,只要 server 端把查询到的 clause_id 回显在这段文本里
+		// (常见错误响应形态),就会被 tryParseJson 解析出来、当成"已检索到"计入 clauseIds。这会让
+		// C3(充分性判定)把一次失败的查询算作覆盖,也会让 C6 的反幻觉校验错误地认可一个从未真正
+		// 取到内容、只在错误回显里出现过的 clause_id。过滤 isError:true 让 clauseIds 只承载"确实
+		// 执行成功的工具结果",这对 C3/C6 是同一个方向的收紧,不是两个互相冲突的诉求。
+		//
 		// try/catch 的理由与下面 listener fan-out 那圈**完全相同**,而且这里更靠前:这段代码
 		// 同样跑在 pi 无 try/catch 的 AgentSession._emit 里,抛出去会直接穿透 agent loop 打死
 		// 在跑的 run。result 是 AgentToolResult = { content, details },其中 details 是工具私有
@@ -118,7 +135,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		//
 		// 换成恒抛的 getter 就没有判别性了 —— 那种输入无论有没有这圈都以 error 收场,因为上面那次
 		// structuredClone 照样会撞上它。
-		if (event.type === "tool_execution_end") {
+		if (event.type === "tool_execution_end" && !(event as { isError?: boolean }).isError) {
 			try {
 				collectClauseIds((event as { result?: unknown }).result, clauseIds);
 			} catch (error) {
@@ -158,6 +175,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	async function run(input: string, opts?: RunOptions): Promise<RunResult> {
 		const runId = opts?.runId ?? randomUUID();
 		currentRunId = runId;
+		currentRunInput = input;
 		// Reset per-run: without this, a second run() on the same Runtime would inherit the
 		// previous run's turn count / tripped limit and could trip immediately.
 		state.turns = 0;

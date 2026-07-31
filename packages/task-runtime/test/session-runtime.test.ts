@@ -799,6 +799,40 @@ function toolsetsWithClauses(): ToolsetRegistry {
 	return registry;
 }
 
+/** 在 toolsetsWithClauses() 之外再加一个必失败的工具:抛出的 Error message 是一段能被
+ *  tryParseJson 解开的 JSON,且里面回显了调用参数里的 clause_id —— 照着
+ *  toolsets/mcp/adapter.ts 的真实链路:MCP server 对业务级失败返回 isError:true 时,
+ *  mcp/client.ts 的 callTool() 把 server 原样返回的 content 文本(常见形态就是回显查询参数,
+ *  比如"未找到 clause_id: X"的错误 payload)不加前缀地塞进 result.text,adapter.ts 据此
+ *  throw new Error(result.text);pi 的 agent-loop 把它包成 createErrorToolResult(message) =
+ *  `{ content:[{type:"text",text:message}], details:{} }`、isError:true。这里直接在 execute()
+ *  里 throw 同形态的 message,不必真起一个 MCP server。 */
+function toolsetsWithClauseAndFailure(): ToolsetRegistry {
+	const registry = new ToolsetRegistry();
+	registry.register("clauses", async () => [
+		{
+			name: "lookup",
+			label: "Lookup",
+			description: "Look a clause up.",
+			parameters: Type.Object({ q: Type.String() }),
+			execute: async (_id: string, params: { q: string }) => {
+				const payload = JSON.stringify({ hits: [{ clause_id: params.q, text: "……" }] });
+				return { output: payload, content: [{ type: "text", text: payload }], details: {} };
+			},
+		} as never,
+		{
+			name: "lookupFail",
+			label: "Lookup (fails)",
+			description: "Look a clause up but always fail, echoing the queried id in the error payload.",
+			parameters: Type.Object({ q: Type.String() }),
+			execute: async (_id: string, params: { q: string }) => {
+				throw new Error(JSON.stringify({ error: "not_found", clause_id: params.q }));
+			},
+		} as never,
+	]);
+	return registry;
+}
+
 // 审查 I-4:clauseIds 的接线此前零覆盖 —— grep 只命中 collectClauseIds 的纯函数单测,没有任何
 // 测试证明 tool_execution_end 真的会填充它、它真的送达判官、clear() 真的挡住跨 run 串数据。
 // 这三条正是风险 10 说的"上游改字段名会静默失效"的失效面,而 C3/C6 直接压在上面。
@@ -896,5 +930,38 @@ describe("SessionRuntime - clauseIds wiring (review I-4)", () => {
 		expect(reads).toBeGreaterThanOrEqual(1);
 		expect(seen[0]).toEqual([]);
 		expect(errorSpy).toHaveBeenCalled();
+	});
+});
+
+// Task 9 语义决策:一次失败的工具调用(pi 的 tool_execution_end.isError === true)不该给
+// C3/C6 贡献 clause_id,哪怕它的错误文本里回显了查询参数。见 toolsetsWithClauseAndFailure()
+// 顶上的注释——这不是假想场景,是 toolsets/mcp/adapter.ts + mcp/client.ts 现有链路会真的产生
+// 的形状:MCP server 对一次业务级失败(比如"没这个 clause_id")返回 isError:true 时,
+// client.callTool() 原样保留 server 的 content 文本、不加任何前缀地塞进 result.text,
+// adapter.ts 据此 throw,pi 把它包成 { content:[{type:"text",text:message}], details:{} }。
+// 若这段回显文本恰好能被 tryParseJson 解开(常见错误 payload 形态),不过滤 isError 就会把
+// "查了但没查到"算成"已检索到",直接喂给 C3 的充分性判定和 C6 的反幻觉校验。
+describe("SessionRuntime - clause_id collection ignores isError results (Task 9)", () => {
+	it("does not let a failed tool call's echoed clause_id count as evidence", async () => {
+		const seen: string[][] = [];
+		const runtime = await buildWithRegistry(
+			registryWithCustomJudge("recording-judge", async (context) => {
+				seen.push([...context.clauseIds]);
+				return { ok: true };
+			}),
+			{ toolset: "clauses", tools: ["lookup", "lookupFail"], stopPolicy: "recording-judge" },
+			[
+				fauxAssistantMessage([fauxToolCall("lookup", { q: "A-1" }), fauxToolCall("lookupFail", { q: "Z-9" })], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("答完了"),
+			],
+			toolsetsWithClauseAndFailure(),
+		);
+
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("completed");
+		// lookup 成功、真的贡献了 A-1;lookupFail 抛错、isError:true,它回显的 Z-9 不该出现。
+		expect(seen[0]).toEqual(["A-1"]);
 	});
 });

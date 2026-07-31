@@ -20,6 +20,7 @@ function instantiate(
 		abort,
 		limitState: state,
 		registerFinalJudge: () => {},
+		getRunInput: () => "",
 	};
 	const extension = limitsDescriptor.factory(ctx, { limits });
 	const factory = typeof extension === "function" ? extension : extension.factory;
@@ -53,6 +54,7 @@ describe("limits plugin", () => {
 			abort: () => {},
 			limitState: { turns: 0 },
 			registerFinalJudge: () => {},
+			getRunInput: () => "",
 		};
 		expect(() => limitsDescriptor.factory(ctx)).toThrow(/was instantiated without its LimitsOptions\.limits/);
 		expect(() => limitsDescriptor.factory(ctx, {})).toThrow(/was instantiated without its LimitsOptions\.limits/);

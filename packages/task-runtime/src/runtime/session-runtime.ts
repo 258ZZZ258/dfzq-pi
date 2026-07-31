@@ -75,10 +75,15 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		// 在跑的 run。result 是 AgentToolResult = { content, details },其中 details 是工具私有
 		// 结构、不进 provider 请求、因此**不受"必须可序列化"约束**,装得下任意对象(含环)。
 		// collectClauseIds 自身已有环检测与深度上限(两条都有各自的判别性测试),这圈是最后
-		// 一道保险,**故意没有配测试**:能让 collectClauseIds 抛而 pi 自己不抛的 payload 造不
-		// 出来。实测过 details 里放一个 throwing getter —— 这圈确实接住了,但 pi 随后自己枚举
-		// details 时也撞上同一个 getter,run 照样以 stopReason:"error" / "getter boom" 收场。
-		// 也就是说这圈挡不住那种输入的最终结果,只保证**不是我们这行**打死 agent loop。
+		// 一道保险,由 session-runtime.test.ts 的
+		// `keeps the run alive when collecting clause_ids throws inside pi's unprotected _emit` 锁住。
+		//
+		// 这圈保证的是「**不是我们这行**打死 agent loop」,不是「这种输入不会失败」——
+		// 两者的差别正是那条测试的 fixture 要拿捏的地方,getter **只抛第一次**:我们的
+		// subscriber 比 pi 先读到 details,第一次读由这圈吃掉;pi 后来那次读拿到正常值
+		// (agent-loop.ts 的 `details: finalized.result.details` 只是引用读,并不枚举自有属性),
+		// 于是 run 照常跑完。换成恒抛的 getter 就没有判别性了 —— 那种输入无论有没有这圈都以
+		// error 收场,因为下游总有人会再读一次。
 		if (event.type === "tool_execution_end") {
 			try {
 				collectClauseIds((event as { result?: unknown }).result, clauseIds);

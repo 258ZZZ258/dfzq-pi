@@ -69,8 +69,10 @@ export async function runFinalJudges(deps: RejudgeDeps): Promise<RejudgeOutcome>
 				verdict = await judge.judge(context);
 			} catch (error) {
 				// 判官自身抛(比如 assess 的 MCP 调用失败)不该把整个 run 变成静默成功。就地转成
-				// errorMessage 返回而不是让 promise reject:reject 会把已经花掉的 attempts 一起
-				// 丢掉,而 attempts 是"这个 run 到底重判了几次"的唯一记录。
+				// errorMessage 返回而不是让 promise reject:reject 会把已经花掉的 attempts 一起丢掉。
+				// attempts 眼下**还没有消费方** —— RunResult 上没有这个字段,run 层只取
+				// outcome.errorMessage,所以目前只有单测看得见它。保住它是为了让 RejudgeOutcome
+				// 自身诚实(报告"重判了几次"是它的职责),要不要上到 RunResult 留给 C3/C6 定。
 				return { attempts, errorMessage: `${judge.name}: ${describeError(error)}` };
 			}
 			if (verdict.ok) continue;
@@ -143,8 +145,13 @@ const MAX_DEPTH = 64;
  *   深度 64 之内就有 5^64 条路径 —— 不抛栈溢出,但等价于挂死。
  * - 只有环检测:纯链状的超深结构(无环)一个节点都不重复,seen 永远不命中,照样栈溢出。
  *
- * seen 是 visited 而非 path 集合(进了不再退出):共享子树只走一次。这不会漏 clause_id ——
- * 第一次访问就已经把那棵子树的全部 id 收进同一个 out 了 —— 顺带把 DAG 的重复展开也消掉。
+ * seen 是 visited 而非 path 集合(进了不再退出):共享子树只走一次,顺带把 DAG 的重复展开
+ * 也消掉。**一个已知的不精确**:两条防护会互相干扰 —— 若某节点的首次访问恰好落在
+ * depth == MAX_DEPTH,它会被记进 seen 但其子节点在 depth+1 被截断;之后即使从更浅的路径
+ * 再次到达它,也会被 seen 直接跳过,那棵子树的 id 就丢了。实测扫描 50–70 层的包裹深度,
+ * 恰好 63 层复现一次。真实形态约 6 层够不着,且行为本就落在下面声明的"越界静默降级"里,
+ * 所以不额外补偿(补偿要么记 (node, depth) 对、要么改成 path 集合,两者都会把 DAG 去重
+ * 一起赔进去)。
  *
  * 越界时**静默降级**(该子树不再贡献 clause_id)而不是抛:这个函数跑在 pi 无 try/catch 的
  * _emit 里(见 session-runtime.ts 的调用点),抛出去会打死在跑的 run。漏采的后果由 C6 的

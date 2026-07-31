@@ -686,4 +686,71 @@ describe("SessionRuntime - clauseIds wiring (review I-4)", () => {
 		expect(second.status).toBe("completed");
 		expect(seen[1]).toEqual([]);
 	});
+
+	// 锁住 session-runtime.ts 里 collectClauseIds 外面那圈 try/catch。它保护的是"不让我们这行
+	// 打死在跑的 agent loop" —— 那段代码跑在 pi 无 try/catch 的 AgentSession._emit 里。
+	//
+	// fixture 的关键是 getter **只抛第一次**:我们的 subscriber 在 pi 之前先读到 details,
+	// 于是第一次读由我们吃掉;pi 后来那次读(agent-loop.ts 的 `details: finalized.result.details`
+	// 只是引用读,本来也不枚举自有属性)拿到正常值,run 照常跑完。
+	// 恒抛的 getter 做不到这件事 —— 那种 fixture 无论有没有 try/catch 都以 error 收场,
+	// 不具判别性(初版报告据此断言"造不出隔离 fixture",是错的,复审构造出来了)。
+	it("keeps the run alive when collecting clause_ids throws inside pi's unprotected _emit", async () => {
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		cleanups.push(async () => {
+			errorSpy.mockRestore();
+		});
+
+		let reads = 0;
+		const boobytrapped = {};
+		Object.defineProperty(boobytrapped, "boobytrap", {
+			enumerable: true,
+			get() {
+				reads += 1;
+				if (reads === 1) throw new Error("one-shot boom");
+				return {};
+			},
+		});
+
+		const hostile = new ToolsetRegistry();
+		hostile.register("clauses", async () => [
+			{
+				name: "lookup",
+				label: "Lookup",
+				description: "Look a clause up.",
+				parameters: Type.Object({ q: Type.String() }),
+				// details 是工具私有结构,不进 provider 请求,因此不受"必须可序列化"约束 ——
+				// 装得下带 getter 的对象。
+				execute: async () => ({
+					output: "ok",
+					content: [{ type: "text", text: "ok" }],
+					details: boobytrapped,
+				}),
+			} as never,
+		]);
+
+		const seen: string[][] = [];
+		const runtime = await buildWithRegistry(
+			registryWithCustomJudge("recording-judge", async (context) => {
+				seen.push([...context.clauseIds]);
+				return { ok: true };
+			}),
+			{ toolset: "clauses", tools: ["lookup"], stopPolicy: "recording-judge" },
+			[
+				fauxAssistantMessage([fauxToolCall("lookup", { q: "A-1" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage("答完了"),
+			],
+			hostile,
+		);
+
+		const result = await runtime.run("hello");
+		// 去掉那圈 try/catch,这三条会变成 status:"error" / errorMessage:"one-shot boom"。
+		expect(result.status).toBe("completed");
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.output).toContain("答完了");
+		// 采集失败降级成一条日志,判官照常被驱动、拿到空的 clauseIds。
+		expect(reads).toBeGreaterThanOrEqual(1);
+		expect(seen[0]).toEqual([]);
+		expect(errorSpy).toHaveBeenCalled();
+	});
 });

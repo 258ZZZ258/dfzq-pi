@@ -12,30 +12,37 @@ import { pathGuardDescriptor } from "../src/runtime/plugins/path-guard.ts";
  * 复审 NC-3(2026-07-31)明确要求:这条缺陷的本质是"guard 自己看着没问题",所以测试不能
  * 只测 guard 自己的返回值,必须拿 pi **真实的** `resolveReadPathAsync` 做端到端断言。这个
  * 函数没有出现在 `@earendil-works/pi-coding-agent` 的公开 `exports`(package.json 只导出
- * `.` 和 `./rpc-entry`),没法用普通的包名 import。这里直接从已安装包的 dist 目录动态
- * import——**用一个拼出来的、非字符串字面量的 specifier**,不是图省事:仓库根 `npm run check`
- * 里的 `check:ts-imports`(scripts/check-ts-relative-imports.mjs)会静态扫描所有 `.ts`
- * 文件,拒绝任何"以 .js 结尾的相对路径字面量" import——那条规则的本意是防止本仓自己的
- * 源码文件互相用 .js 扩展名 import(应该用 .ts),不是针对"测试临时探进第三方包内部读一个
- * 函数"这种场景,但它是纯字符串匹配,认不出两者的区别,所以用非字面量的动态 import 绕开它。
- * 这条耦合本身是脆的:pi 升级、把这几个文件挪了地方,这个测试会跟着炸——这是"直接验证真实
- * 消费方行为"和"耦合到未公开的内部实现"这对权衡下,复审明确要的那一侧。
+ * `.` 和 `./rpc-entry`),没法用普通的包名 import。
+ *
+ * 用 `import.meta.resolve()` 先拿到这个包**真正会被 task-runtime 加载的那份入口**——走
+ * 与生产代码 `import "@earendil-works/pi-coding-agent"` 同一条 Node ESM 解析路径,不用
+ * 假设"这个包没有被提升到仓库根 node_modules"(复审发现的版本分叉正是这类假设会踩的坑:
+ * `packages/task-runtime` 依赖 `^0.82.1`,解析到的是它自己 node_modules 下注册表实装的
+ * 0.82.1,不是根 node_modules 那个指向 `packages/coding-agent`、版本是 0.83.0 的软链——
+ * `import.meta.resolve` 不管包实际装在哪一层,给出的都是 task-runtime 自己会加载的那份)。
+ * 从入口(`dist/index.js`)推算包目录、再拼接到内部没有公开导出的
+ * `dist/core/tools/path-utils.js`——这一段仍然是"押注 dist 内部目录布局不变",没有更好的
+ * 办法(pi 没把 `resolveReadPathAsync` 放进公开 exports)。这个押注不会静默错:布局一旦
+ * 漂移,`import()` 会直接 `ERR_MODULE_NOT_FOUND` 硬失败,不是悄悄导入到别的东西、让测试
+ * 继续假装在验证真实行为。
+ *
+ * **用一个拼出来的、非字符串字面量的 specifier 传给 `import()`,不是图省事**:仓库根
+ * `npm run check` 里的 `check:ts-imports`(scripts/check-ts-relative-imports.mjs)用
+ * `typescript` 的 `ts.createSourceFile` 走 **AST**(不是字符串匹配),只检查
+ * `ImportDeclaration` / `ExportDeclaration` / 动态 `import()` 调用 / `ImportTypeNode`
+ * 上**是字符串字面量**的 specifier 是否以 `.js` 结尾的相对路径——它的检查范围本来就不含
+ * "非字面量的 import 参数",不是"認不出"字面量和计算表达式的区别、被绕过去了,而是它压根
+ * 没打算检查计算表达式(那条规则的本意是防止本仓自己的源码文件互相用 .js 扩展名 import,
+ * 相对路径 + 字面量 + .js 结尾是这类误用唯一会出现的形态)。这条耦合本身是脆的:pi 升级、
+ * 把这几个内部文件挪了地方,这个测试会跟着炸——这是"直接验证真实消费方行为"和"耦合到
+ * 未公开的内部实现"这对权衡下,复审明确要的那一侧。
  */
 async function loadPiReadPathResolver(): Promise<{
 	resolveReadPathAsync: (filePath: string, cwd: string) => Promise<string>;
 }> {
-	const here = dirname(fileURLToPath(import.meta.url));
-	const target = join(
-		here,
-		"..",
-		"node_modules",
-		"@earendil-works",
-		"pi-coding-agent",
-		"dist",
-		"core",
-		"tools",
-		"path-utils.js",
-	);
+	const entryUrl = import.meta.resolve("@earendil-works/pi-coding-agent");
+	const packageRoot = dirname(dirname(fileURLToPath(entryUrl))); // 剥掉 "dist/index.js"
+	const target = join(packageRoot, "dist", "core", "tools", "path-utils.js");
 	return (await import(pathToFileURL(target).href)) as {
 		resolveReadPathAsync: (filePath: string, cwd: string) => Promise<string>;
 	};

@@ -31,7 +31,10 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 
 	// 错误归一化:统一响应形状,绝不泄漏栈与内部文件路径(设计文档 §5.2-8)。
 	app.onError((error, c) => {
-		console.error(`[task-runtime] unhandled: ${error instanceof Error ? error.message : String(error)}`);
+		// 客户端 body 是刻意不透明的(不泄漏栈/内部路径)—— 这行 console.error 是 500 的
+		// 唯一诊断信息。传整个 error 对象(而不是只拼 message)才能保住堆栈,与仓库既有
+		// 风格一致(见 run-manager.ts 里同样传整个 error/markErrorFailure 对象的 console.error)。
+		console.error("[task-runtime] unhandled:", error);
 		return c.json(errorBody("internal_error", "internal error"), 500);
 	});
 
@@ -63,8 +66,10 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 		try {
 			raw = await c.req.json();
 		} catch {
-			// JSON 解析失败必须是 400,不能冒成 500。
-			return c.json(errorBody("invalid_body", "request body is not valid JSON"), 400);
+			// JSON 解析失败必须是 400,不能冒成 500。专用 code(而不是复用下面 422 schema
+			// 校验的 invalid_body):Java 一旦上线,"400 JSON 解析失败"与"422 schema 不合法"
+			// 是两类不同的客户端错误,现在分开成本是一行,上线后再分开就是破坏性变更。
+			return c.json(errorBody("malformed_json", "request body is not valid JSON"), 400);
 		}
 
 		const validated = validateSubmitBody(raw);
@@ -99,7 +104,12 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 		if (outcome.kind === "idempotent") {
 			const row = store.findByRunId(outcome.runId);
 			if (row && isTerminal(row.status)) return c.json(recordToRunResult(row), 200);
-			return c.json({ runId: outcome.runId, status: outcome.status }, 202);
+			// row?.status 而不是 outcome.status(创建时的快照):markError/markRunning 等落库
+			// 写入若失败,drive() 的 finally 仍会无条件 live.delete,行却可能停在非终态 ——
+			// 「行非终态且不在 live」因此是可达的(finding #2 之后),不能再假设这里必是
+			// outcome 创建时那个状态。row 理论上不该是 undefined(idempotent 分支的行必然已由
+			// insertQueued 写入过),但仍以 outcome.status 兜底,不让这里因为 store 读失败而炸。
+			return c.json({ runId: outcome.runId, status: row?.status ?? outcome.status }, 202);
 		}
 
 		// 等待窗口。超时只影响本次响应,run 继续在后台推进(设计文档 §6.4.2)。

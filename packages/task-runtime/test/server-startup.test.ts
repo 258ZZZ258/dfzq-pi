@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { startServer } from "../src/server/main.ts";
 import * as sqliteModule from "../src/store/sqlite.ts";
 import { createSqliteRunStore } from "../src/store/sqlite.ts";
-import { createStubRuntime } from "./helpers/stub-runtime.ts";
+import { createStubRuntime, type StubRuntime } from "./helpers/stub-runtime.ts";
 
 const CASE_TIMEOUT_MS = 30_000;
 
@@ -104,12 +104,21 @@ describe("server startup", () => {
 			// ★ 其余 HTTP 用例走 app.request(),绕过 @hono/node-server 适配层与真实 socket。
 			// 而出口判据说的是「Java 能发任务/取结果/取消」—— 那是真实 HTTP。适配层的接线 bug
 			// (body 解析、header 大小写、状态码透传)只有这条用例能抓到。
+			//
+			// 第一个 run 走正常完成路径(下面 submit/fetch/已终态取消-409 三步用它);第二个
+			// run 特意造成 hang,专供后面「取消受理 → abort 传导 → 终态转 aborted」用 ——
+			// 判据①「取消」的动词那一半此前只在 app.request() 层证明过,真实 socket 上从未验证。
+			const stubs: StubRuntime[] = [];
 			const server = await startServer({
 				port: 0,
 				dbPath: join(root, "runs.db"),
 				specsDir: join(root, "specs"),
 				internalToken: "t",
-				runtimeFactory: async () => createStubRuntime(),
+				runtimeFactory: async () => {
+					const stub = createStubRuntime(stubs.length === 0 ? {} : { hang: true });
+					stubs.push(stub);
+					return stub;
+				},
 			});
 			stop = server.close;
 			const base = `http://127.0.0.1:${server.port}`;
@@ -153,6 +162,43 @@ describe("server startup", () => {
 				signal: AbortSignal.timeout(5_000),
 			});
 			expect(unauth.status).toBe(401);
+
+			// 判据①「取消」的真实语义:202 受理 → abort() 传导 → 终态转 aborted。
+			// 上面 409 那一步只证明了取消的错误路径,这里补上正常路径。
+			const hangSubmit = await fetch(`${base}/runs`, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({
+					taskKind: "demo",
+					input: "hang",
+					clientRequestId: "real-hang-1",
+					filters: { corpusTypes: ["internal"] },
+					waitMs: 50,
+				}),
+				signal: AbortSignal.timeout(10_000),
+			});
+			expect(hangSubmit.status).toBe(202);
+			const hangSubmitted = (await hangSubmit.json()) as { runId: string; status: string };
+			expect(hangSubmitted.status).toBe("running");
+
+			const hangCancel = await fetch(`${base}/runs/${hangSubmitted.runId}/cancel`, {
+				method: "POST",
+				headers: { "X-Internal-Token": "t" },
+				signal: AbortSignal.timeout(5_000),
+			});
+			expect(hangCancel.status).toBe(202);
+
+			// 推动 stub 完成:cancel() 内部已经 await 过 abort()(即 settle()),这里再拨一次
+			// 是安全的空操作,只是为了让"取消已经真正传导"这件事不依赖时序巧合。
+			stubs[1]?.resolveNow();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+
+			const hangFetched = await fetch(`${base}/runs/${hangSubmitted.runId}`, {
+				headers: { "X-Internal-Token": "t" },
+				signal: AbortSignal.timeout(5_000),
+			});
+			expect(hangFetched.status).toBe(200);
+			expect(await hangFetched.json()).toMatchObject({ runId: hangSubmitted.runId, status: "aborted" });
 		},
 		CASE_TIMEOUT_MS,
 	);

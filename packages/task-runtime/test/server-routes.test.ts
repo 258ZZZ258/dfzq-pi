@@ -120,7 +120,7 @@ describe("POST /runs", () => {
 		expect(await res.json()).toMatchObject({ error: { code: "unknown_task_kind" } });
 	});
 
-	it("returns 400 for malformed JSON", async () => {
+	it("returns 400 for malformed JSON, with a dedicated code distinct from schema-validation's invalid_body", async () => {
 		const { hono } = app();
 		const res = await hono.request(
 			new Request("http://local/runs", {
@@ -130,6 +130,7 @@ describe("POST /runs", () => {
 			}),
 		);
 		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({ error: { code: "malformed_json" } });
 	});
 
 	it("returns the same runId for a repeated clientRequestId", async () => {
@@ -309,5 +310,45 @@ describe("queued runs over HTTP", () => {
 		stubs[0].resolveNow();
 		// 放行后 B 装配、跑完;等两条链落库
 		await new Promise((resolve) => setTimeout(resolve, 50));
+	});
+});
+
+// 规格 §2.7 测试表点名要求的用例(finding #6):"全局队满 → 503 + Retry-After 头"此前在
+// HTTP 层零覆盖。同时钉一遍 finding #1:拒绝之后用同一个 clientRequestId 重试必须真的
+// 跑起来,不是拿到一行被 markError 钉死的终态行。
+describe("queue_full over HTTP", () => {
+	it("returns 503 with a Retry-After header and code queue_full, and a same-clientRequestId retry actually runs", async () => {
+		const stubs: StubRuntime[] = [];
+		const manager = new RunManager({
+			store,
+			// maxQueueDepth: 0 —— 一旦并发名额占满,下一个请求立刻 queue_full,不必先排队。
+			gate: new Gate({ maxConcurrent: 1, maxQueueDepth: 0, retryAfterSeconds: 7 }),
+			runtimeFactory: async () => {
+				const stub = createStubRuntime(stubs.length === 0 ? { hang: true } : {});
+				stubs.push(stub);
+				return stub;
+			},
+		});
+		const hono = createApp({ manager, router: new SpecRouter([SPEC]), store, internalToken: TOKEN });
+
+		const first = await hono.request(post(submitBody({ sessionId: "s1", waitMs: 0 })));
+		expect(first.status).toBe(202);
+
+		const rejectedBody = submitBody({ clientRequestId: "cli-queue-full", sessionId: "s2", waitMs: 0 });
+		const rejected = await hono.request(post(rejectedBody));
+		expect(rejected.status).toBe(503);
+		expect(rejected.headers.get("Retry-After")).toBe("7");
+		expect(await rejected.json()).toMatchObject({ error: { code: "queue_full" } });
+
+		// 放行 A,释放并发名额。
+		stubs[0].resolveNow();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+
+		// 同一个 clientRequestId 重试:这次必须真的准入、真的装配、真的跑完,而不是命中
+		// 拒绝分支之前被 markError 钉死的那一行。
+		const retried = await hono.request(post({ ...rejectedBody, waitMs: 5000 }));
+		expect(retried.status).toBe(200);
+		expect(await retried.json()).toMatchObject({ status: "completed" });
+		expect(stubs).toHaveLength(2);
 	});
 });

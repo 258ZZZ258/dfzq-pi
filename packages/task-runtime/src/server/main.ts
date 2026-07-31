@@ -75,7 +75,16 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 		// bind 失败(比如 EADDRINUSE):调用方拿到的是一个 reject 的 promise,不会拿到
 		// close() 去关掉上面已经打开的 store 句柄 —— 必须在这里自己关,不能悄悄泄漏
 		// (与 assembler.ts 装配失败时自己 dispose 已开 toolset 句柄同一条纪律)。
-		store.close();
+		//
+		// 但 store.close() 自身也可能抛(仓库已三次立过「次生错误不得盖过原始错误」的规矩:
+		// sqlite.ts 吞 ROLLBACK 次生异常、run-manager.ts catch markError 失败、
+		// session-runtime.ts)。这里若不吞掉,会用一个面目全非的次生报错替换掉本该抛出的
+		// error(比如 EADDRINUSE),让「端口被占用」变成一个毫不相关的 store 关闭失败。
+		try {
+			store.close();
+		} catch (closeError) {
+			console.error("[task-runtime] failed to close the store after a bind failure", closeError);
+		}
 		throw error;
 	}
 	const address = server.address();

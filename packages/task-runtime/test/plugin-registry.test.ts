@@ -61,6 +61,19 @@ describe("PluginRegistry", () => {
 		);
 	});
 
+	// 复审 M-4:同一个插件名字被声明两次(比如 spec 的 stopPolicy 与 extraPlugins 都写了同一个
+	// 名字)此前完全不受拦 —— 替换型 hook 校验只看 hooks 数组,counter 只挂观察型的 turn_end,
+	// 两次声明对它来说"看起来"毫无冲突。但 lookupAll 会把它解析成两个独立的 PluginEntry,
+	// instantiatePlugins 会把同一个 factory 调用两次:对 sufficiency-gate 这类往
+	// PluginContext.registerFinalJudge 里塞状态的插件,后果是 judges 数组里出现两个同名判官、
+	// assess() 调用与探测轮次悄悄翻倍。这里单独用 counter(纯观察型 hook)证明"重名本身"就该被拒,
+	// 不依赖也不会与替换型 hook 冲突校验混在一起。
+	it("rejects the same plugin name declared twice, even when its only hook is an observing one", () => {
+		expect(() => makeRegistry().resolveAll(["counter", "counter"], makeContext())).toThrow(
+			/plugin "counter" is declared more than once/,
+		);
+	});
+
 	it("passes options through to the factory", () => {
 		const registry = new PluginRegistry();
 		let seen: unknown;

@@ -54,13 +54,42 @@ export interface PluginEntry {
 }
 
 /**
- * 实例化一组已定位的插件,并做替换型 hook 冲突校验。
+ * 实例化一组已定位的插件,并做替换型 hook 冲突校验 + 重名校验。
  *
  * 做成自由函数而不是 PluginRegistry 的方法:调用方(assembler)要把 spec 声明的插件与
  * 无条件挂载的 limits 拼成同一张表,再做**一次**冲突校验 —— 分两次校验等于两个插件
  * 各自认为自己独占了同一个替换型 hook。
  */
 export function instantiatePlugins(entries: readonly PluginEntry[], ctx: PluginContext): InlineExtension[] {
+	// 复审 M-4:同一个插件名字被 spec 的两个字段各声明一次(比如 stopPolicy 和 extraPlugins
+	// 都写了 "sufficiency-gate"),会被 lookupAll 解析成两个独立的 PluginEntry —— 它们指向
+	// 同一个 PluginDescriptor,若不拦下来这里会把它的 factory 调用两次。对只挂观察型 hook 或
+	// 不挂 hook 的插件(sufficiency-gate 正是这种,hooks:[])来说,下面的替换型 hook 校验完全
+	// 看不见这次重复,后果不是报错而是**静默翻倍**:sufficiency-gate 会往 judges 数组里塞两个
+	// 同名的 FinalJudge,assess() 调用次数与允许的探测轮次都悄悄变成两倍。这与 assembler.ts
+	// 对 limits 的专项拒绝(那条锁的是"limits 不得被 spec 显式声明"这一个特定名字)是同一类
+	// 缺陷的通用形态,这里补齐通用路径的对等保护:任何名字出现第二次都在装配期响亮拒绝,
+	// 不做静默去重(静默去重会让写错 spec 的人永远不知道自己写错了,这是全仓一贯纪律)。
+	//
+	// 这一遍统计放在真正实例化**之前**、单独一次遍历完成:若放进下面那个实例化循环里边走
+	// 边查(在第二次撞见重名时才 throw),第一个同名条目已经真的被实例化过了 —— 对
+	// sufficiency-gate 这类插件,那意味着 throw 之前 judges 数组已经被写进去一条,装配失败
+	// 但状态没能保持"从未发生过"。提前到一次独立的统计遍历,保证重名一旦被发现,没有任何
+	// 一个插件(包括名字重复的那个本身)被实例化过 —— 与全仓"装配期失败要早要响"的其他
+	// 例子(validateSpec、工具名交叉校验)是同一个标准。
+	const nameCounts = new Map<string, number>();
+	for (const { descriptor } of entries) {
+		nameCounts.set(descriptor.name, (nameCounts.get(descriptor.name) ?? 0) + 1);
+	}
+	for (const [name, count] of nameCounts) {
+		if (count <= 1) continue;
+		throw new Error(
+			`plugin "${name}" is declared more than once. Each declared ref instantiates the plugin's factory ` +
+				`separately, which would silently double any per-run state it registers (e.g. a final judge would ` +
+				`be registered twice under the same name, doubling its probe budget). Remove the duplicate declaration.`,
+		);
+	}
+
 	const claimed = new Map<string, string>();
 	const out: InlineExtension[] = [];
 	for (const { descriptor, options } of entries) {

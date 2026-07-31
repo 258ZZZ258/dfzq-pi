@@ -100,7 +100,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		//
 		// isError:true 的结果不采(C3 语义决策,Task 7 记档、Task 9 到期处理):pi 的
 		// AgentTool 契约是"失败就 throw,不要把错误编进 content"(agent/src/types.ts 对
-		// AgentTool.execute 的文档字符串),框架侧对应的唯一产出通路是 agent-loop.ts 的
+		// AgentTool.execute 的文档字符串),**本仓当前**唯一产出通路是 agent-loop.ts 的
 		// createErrorToolResult(...),它合成的 result 固定是
 		// `{ content: [{ type: "text", text: message }], details: {} }`——message 并非任意文本:
 		// packages/task-runtime/src/toolsets/mcp/adapter.ts 在 MCP 工具返回业务级 isError:true 时
@@ -112,6 +112,16 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		// C3(充分性判定)把一次失败的查询算作覆盖,也会让 C6 的反幻觉校验错误地认可一个从未真正
 		// 取到内容、只在错误回显里出现过的 clause_id。过滤 isError:true 让 clauseIds 只承载"确实
 		// 执行成功的工具结果",这对 C3/C6 是同一个方向的收紧,不是两个互相冲突的诉求。
+		//
+		// **已知的例外通路,机制上可达、本仓当前不可达**:pi 允许一个声明了 `tool_result` 这个
+		// 替换型 hook(见 plugin-registry.ts 的 REPLACING_HOOKS)的扩展把 isError 反过来翻
+		// 成 true 而 content 保留原本成功的内容(coding-agent/agent-session.ts 的 hook 派发 +
+		// agent-loop.ts 的落地点;`tool_result` hook 的返回值类型文档明写"if provided, replaces
+		// the tool result error flag")。这条过滤没有对这种情形做任何特殊处理 —— 若真的发生,会把
+		// 一次本来成功、真正取到内容的结果误判成"不予采信"。**现存插件只有 limits(挂
+		// turn_end)与本文件的 sufficiency-gate(不挂 hook),没有任何插件声明 tool_result**,
+		// 所以这条路径目前打不通;若将来有插件借 tool_result 翻转 isError,需要同步复核这条过滤
+		// 是否还站得住。
 		//
 		// try/catch 的理由与下面 listener fan-out 那圈**完全相同**,而且这里更靠前:这段代码
 		// 同样跑在 pi 无 try/catch 的 AgentSession._emit 里,抛出去会直接穿透 agent loop 打死
@@ -135,9 +145,9 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		//
 		// 换成恒抛的 getter 就没有判别性了 —— 那种输入无论有没有这圈都以 error 收场,因为上面那次
 		// structuredClone 照样会撞上它。
-		if (event.type === "tool_execution_end" && !(event as { isError?: boolean }).isError) {
+		if (event.type === "tool_execution_end" && !event.isError) {
 			try {
-				collectClauseIds((event as { result?: unknown }).result, clauseIds);
+				collectClauseIds(event.result, clauseIds);
 			} catch (error) {
 				console.error(
 					`[SessionRuntime] collectClauseIds threw for spec "${specId}"; this run's clauseIds may be incomplete`,

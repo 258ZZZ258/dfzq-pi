@@ -409,6 +409,48 @@ describe("assemble - implicit limits plugin", () => {
 		expect(stateA.turns).toBe(1);
 		expect(stateB.turns).toBe(0);
 	});
+
+	// 复审 M-4:above 那两条 it.each 只锁了"limits 这一个特定名字"的重复声明 —— 那是
+	// assembler.ts 里的专项拒绝(限定检查 spec.stopPolicy/extraPlugins 有没有再写一遍
+	// "limits")。这里证明通用路径(instantiatePlugins 的重名校验)对**任意**插件名都成立,
+	// 不依赖那条专项检查:一个真的往 ctx.registerFinalJudge 塞状态的插件(照着 sufficiency-gate
+	// 的形状)同时被 stopPolicy 与 extraPlugins 声明,若没有这条保护,会被实例化两次、
+	// 把同一个判官注册两次 —— 这正是复审点名的"assess 调用与探测轮次悄悄翻倍"的具体后果,
+	// 不只是一个抽象的错误分支。
+	it("rejects the same custom plugin declared via two different spec fields, before it can register per-run state twice", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const registry = createDefaultPluginRegistry();
+		const judges: unknown[] = [];
+		registry.register({
+			name: "probe",
+			hooks: [],
+			factory: (ctx) => {
+				ctx.registerFinalJudge({
+					name: "probe",
+					maxAttempts: 1,
+					onExhausted: "pass",
+					judge: async () => ({ ok: true }),
+				});
+				return { name: "probe", factory: () => {} };
+			},
+		});
+
+		await expect(
+			assemble({
+				pluginContext: pluginContext({ registerFinalJudge: (judge) => judges.push(judge) }),
+				spec: spec({ stopPolicy: "probe", extraPlugins: ["probe"] }),
+				profile,
+				registry,
+				toolsets: toolsets(),
+				cwd: harness.cwd,
+				agentDir: harness.agentDir,
+				modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			}),
+		).rejects.toThrow(/plugin "probe" is declared more than once/);
+		// 装配期就地拒绝 —— judges 里一次注册都不该出现,不是"注册了两次,只是报个警告"。
+		expect(judges).toHaveLength(0);
+	});
 });
 
 describe("assemble - resolveModel (no modelOverride)", () => {

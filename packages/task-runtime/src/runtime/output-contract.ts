@@ -60,8 +60,13 @@ function checkConditional(json: ContractShape, clauseIds: readonly string[]): st
 	if (invented.length > 0) {
 		const detail = `basis 里的 clause_id 未出现在本次检索结果中:${invented.join("、")}`;
 		// retrieved 全空是这个兜底最容易被误读的情形:文案读起来像"模型编造了引用",但真实
-		// 病因往往是风险 10 那类耦合 —— 上游改了事件字段名导致 collectClauseIds 静默采空。
-		// 追一句诊断,把人指向真正的病因而不是错怪模型。
+		// 病因至少有三种,不止风险 10 那一类耦合:
+		//   1. 上游改了事件字段名,导致 collectClauseIds 静默采空(风险 10);
+		//   2. 本 run 的全部工具调用都失败了(session-runtime.ts 现在会过滤
+		//      tool_execution_end.isError:true 的结果,Task 9 的 C3 语义决策)——查了但一次都
+		//      没查到,retrieved 全空是如实反映,不是采集出了 bug;
+		//   3. 本 run 压根没调用过任何工具。
+		// 追一句诊断,把人指向"去查这三种可能",而不是先入为主地怪模型编造引用。
 		return retrieved.size === 0 ? `${detail}(本次检索结果为空)` : detail;
 	}
 	return undefined;

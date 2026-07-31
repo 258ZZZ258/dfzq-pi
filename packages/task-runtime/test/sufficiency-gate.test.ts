@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import type { FinalJudge } from "../src/runtime/final-judge.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
-import { createSufficiencyGateDescriptor } from "../src/runtime/plugins/sufficiency-gate.ts";
+import { createSufficiencyGateDescriptor, extractMatters } from "../src/runtime/plugins/sufficiency-gate.ts";
 
 function makeContext(judges: FinalJudge[], runInput = "问题正文"): PluginContext {
 	return {
@@ -15,6 +15,25 @@ function makeContext(judges: FinalJudge[], runInput = "问题正文"): PluginCon
 		getRunInput: () => runInput,
 	};
 }
+
+// 复审 I-1:extractMatters 是 brief 列明的导出接口,C1 接线之前它是 matters:"auto" 的唯一实现,
+// 空 matters 会让 gate 静默退化成 no-op(assess 拿到 [] 很容易被判 sufficient:true)。这里直接
+// 钉住它的边界行为,不再只靠"sufficiency-gate"describe 里那两条从不断言 matters 的 auto 用例。
+describe("extractMatters", () => {
+	it("returns an empty array for empty input", () => {
+		expect(extractMatters("")).toEqual([]);
+	});
+
+	// 4 字阈值会吃掉 brief 自己举例用的三字事项名("适当性")—— 已知边界,记录而非本任务修复项:
+	// C1 尚未接线,无法验证 assess 对短 matters 的真实容忍度。
+	it("drops a matter name shorter than the 4-character threshold", () => {
+		expect(extractMatters("适当性")).toEqual([]);
+	});
+
+	it("splits on the Chinese period / (半角或全角)分号 / newline, dropping fragments under 4 characters", () => {
+		expect(extractMatters("第一句话。第二句;第三")).toEqual(["第一句话"]);
+	});
+});
 
 describe("sufficiency-gate", () => {
 	it("registers exactly one final judge and claims no hooks", () => {
@@ -60,6 +79,17 @@ describe("sufficiency-gate", () => {
 		createSufficiencyGateDescriptor(assess).factory(makeContext(judges), { matters: ["合规性"] });
 		await judges[0]!.judge({ lastAssistantText: "结论", clauseIds: ["A-1", "A-2"] });
 		expect(assess).toHaveBeenCalledWith(["A-1", "A-2"], ["合规性"]);
+	});
+
+	// 复审 I-1:此前两条走 auto 路径的用例(options = {})都没断言传给 assess 的 matters ——
+	// 只有显式 matters 的用例断言过。这条把 auto 路径本身钉住:matters 未声明或声明为 "auto"
+	// 时,assess 收到的必须是 extractMatters(ctx.getRunInput()) 的结果,不是空数组或原文整段。
+	it('resolves matters:"auto" via extractMatters against the run\'s input', async () => {
+		const judges: FinalJudge[] = [];
+		const assess = vi.fn(async () => ({ sufficient: true, covered: [], missing: [] }));
+		createSufficiencyGateDescriptor(assess).factory(makeContext(judges, "问题正文"), {});
+		await judges[0]!.judge({ lastAssistantText: "结论", clauseIds: [] });
+		expect(assess).toHaveBeenCalledWith([], ["问题正文"]);
 	});
 
 	it("defaults maxProbes to 2", () => {

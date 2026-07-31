@@ -73,6 +73,16 @@ describe("named plugin assembly (风险 12)", () => {
 	//     maxAttempts 反映了 fixture 的 maxProbes,再**调用它的 judge()**,证明它真的调用了
 	//     我们传给 createDefaultPluginRegistry 的那个 assess 函数,且 matters:"auto" 真的从
 	//     我们传的 ctx.getRunInput() 抽取——而不是断言 assemble() 没抛。
+	//     **这只证明"sufficiency-gate 的 factory 在装配期正确使用了 assess 与
+	//     ctx.getRunInput()",不证明"真实的终局重判循环(runFinalJudges,final-judge.ts)会
+	//     驱动它"——runFinalJudges 只在 session-runtime.ts 的 run() 里被调用,本文件从未触达
+	//     那条路径(只调了 assemble(),没有跑 SessionRuntime.run())。后一半由
+	//     test/session-runtime.test.ts 里
+	//     "dispatches the plugin-registered judge's followUp before C6's when both would
+	//     reject the first draft"覆盖:那条用例走 stopPolicy:"sufficiency-gate" 的命名解析 +
+	//     真实 SessionRuntime.run() 的 reprompt 循环,直接断言派发出去的 followUp 文案。两条
+	//     测试合起来才是"sufficiency-gate 从装配到被真实驱动"的完整证据链,任何一条单独看都
+	//     只覆盖半程。
 	//   - limits:驱动一次真实 session.prompt(),断言 limitState.turns 真的 +1——证明它在
 	//     "spec 同时声明三个命名插件"这条合并主路上没有掉队(assembler.test.ts 现有的隐式
 	//     limits 用例都不声明任何命名插件,不覆盖这条合并路径)。
@@ -83,6 +93,31 @@ describe("named plugin assembly (风险 12)", () => {
 	//     `assembled.session.extensionRunner` 上同名的公开方法,是生产路径实际会走的同一条
 	//     调用,不是另起一套假 ExtensionAPI。用 fixture 里的真实 options(maxChars.default:
 	//     4000、allowRoots 与 <runId> 展开)分别验证一次真实截断和一次真实拦截。
+	//
+	//     **但"同一条调用"跑在哪个包版本上,有一层需要如实说明的缝**:
+	//     `packages/task-runtime/vitest.config.ts` 把 `@earendil-works/pi-coding-agent`
+	//     这个 bare specifier 整体 alias 到本 monorepo 的 `../coding-agent/src/index.ts`
+	//     (workspace 本地源码,当前 0.83.0);而 task-runtime 的 `package.json` 声明、生产环境
+	//     真正安装的是 npm 依赖 `^0.82.1`(`packages/task-runtime/node_modules/
+	//     @earendil-works/pi-coding-agent` 下是注册表实装的 0.82.1,不是软链)。这意味着本文件
+	//     (以及 assembler.ts 本身、以及全仓几乎所有跑 assemble() 的测试)在 vitest 下执行时,
+	//     `assembled.session` 实际是 0.83.0 本地源码构造出来的实例,不是 0.82.1——`assemble()`
+	//     内部 `import ... from "@earendil-works/pi-coding-agent"` 这条静态 import 本身就会被
+	//     同一个 alias 解析到本地源码,不是这份测试文件单独能绕开的(要绕开需要改
+	//     vitest.config.ts,这超出本任务范围;或者用 vi.mock 整体接管这个 specifier 并在内部
+	//     用 import.meta.resolve() 转发到真实依赖,那样几乎要重新代理一遍
+	//     `@earendil-works/pi-coding-agent` 的公开面,复杂度和脆弱度都不值——本文件因此选择
+	//     照实记录这层差异,而不是假装解决了它)。
+	//     已手工逐行比对过 `packages/coding-agent/src/core/agent-session.ts` 的
+	//     `_installAgentToolHooks`/`hasExtensionHandlers`/`extensionRunner` getter,与
+	//     `packages/coding-agent/src/core/extensions/runner.ts` 的 `emitToolCall`/
+	//     `emitToolResult`,和 `node_modules/@earendil-works/pi-coding-agent/dist/` 下
+	//     0.82.1 的编译产物(即 path-guard.ts 清单第 4 条与 path-guard.test.ts 里
+	//     `loadPiReadPathResolver()` 用 `import.meta.resolve()` 专门绕开这层 alias 去读的
+	//     那份真实依赖)——**这几个方法在两个版本里逻辑逐字节一致**,所以本文件今天验证的不是
+	//     错误的东西。但没有任何机制锁定这一点:如果将来只有已发布的 npm 依赖变了、workspace
+	//     本地源码没跟着同步(两者已经存在版本差,不是假设),这里会继续全绿——不是因为验证到
+	//     了真实情况,而是因为它压根没跑到那份真实依赖上。
 	it("assembles a spec that declares stopPolicy / resultPolicy / approvalPolicy together, and each plugin is actually live", async () => {
 		harness = await createFauxHarness();
 		const judges: FinalJudge[] = [];
@@ -120,6 +155,9 @@ describe("named plugin assembly (风险 12)", () => {
 
 		// --- stopPolicy: sufficiency-gate ---------------------------------------------
 		// 三个命名插件都装配成功(装不上会在 assemble 里抛),C3 登记了它的判官。
+		// 下面这一段(直到 assess 断言为止)证明的是"装配期 factory 接线正确",不是"真实
+		// 重判循环会驱动它"——那一半由 test/session-runtime.test.ts 覆盖,分工细节见本
+		// describe 顶部的注释。
 		expect(judges.map((judge) => judge.name)).toEqual(["sufficiency-gate"]);
 		const gate = judges[0];
 		if (!gate) throw new Error("sufficiency-gate judge was not registered");
@@ -146,6 +184,9 @@ describe("named plugin assembly (风险 12)", () => {
 		// --- resultPolicy: result-budget -------------------------------------------------
 		// 直接调用真实 AgentSession 暴露的 extensionRunner.emitToolResult —— 这与
 		// _installAgentToolHooks 里 afterToolCall 驱动真实工具结果时调用的是同一个方法。
+		// 注意:vitest 下这条"同一个方法"实际来自 vitest.config.ts 的 alias(本地 0.83.0
+		// workspace 源码),不是 task-runtime 生产环境加载的 ^0.82.1——两者今天在这几个方法上
+		// 逐字节一致(已核对),但无机制锁定,细节见本 describe 顶部注释。
 		const longText = "x".repeat(5000);
 		const toolResultOutcome = await assembled.session.extensionRunner.emitToolResult({
 			type: "tool_result",

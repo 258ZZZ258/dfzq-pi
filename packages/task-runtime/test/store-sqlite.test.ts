@@ -169,4 +169,20 @@ describe("sqlite run store", () => {
 	it("markError throws for an unknown runId instead of a silent no-op", () => {
 		expect(() => store.markError("no-such-run", "boom", 1300)).toThrow(/no-such-run/);
 	});
+
+	it("deleteRun removes the row so a later insertQueued with the same clientRequestId is a fresh insert", () => {
+		store.insertQueued(newRun());
+		store.deleteRun("run-1");
+		expect(store.findByRunId("run-1")).toBeUndefined();
+
+		// 撤销幂等占用的核心断言:同一 clientRequestId 再次 insertQueued 必须真的 inserted:true,
+		// 而不是命中 ON CONFLICT DO NOTHING 拿到一行已经不存在的旧行(finding #1)。
+		const retried = store.insertQueued(newRun({ runId: "run-2" }));
+		expect(retried.inserted).toBe(true);
+		expect(retried.run.runId).toBe("run-2");
+	});
+
+	it("deleteRun on an unknown runId does not throw", () => {
+		expect(() => store.deleteRun("no-such-run")).not.toThrow();
+	});
 });

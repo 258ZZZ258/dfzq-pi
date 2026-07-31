@@ -56,6 +56,15 @@ export interface RunStore {
 	markRunning(runId: string, startedAt: number): void;
 	finish(runId: string, result: RunResult, finishedAt: number): void;
 	markError(runId: string, message: string, finishedAt: number): void;
+	/**
+	 * 按主键删除该行。语义是「撤销 insertQueued 的原子占用」——目前唯一调用方是
+	 * RunManager.submit() 的闸门拒绝分支:insertQueued 原子占了 clientRequestId 唯一索引,
+	 * 但闸门随后拒绝时不该把这次尝试钉成终态行,而是把幂等键还给客户端,让同一
+	 * clientRequestId 重试时能重新走 insertQueued(设计裁定,见 run-manager.ts submit() 的
+	 * 拒绝分支注释)。删不到行(runId 不存在)不抛——拒绝路径是唯一调用方,不存在的行
+	 * 意味着别的路径已经先一步清理掉了,吞掉比抛错更安全。
+	 */
+	deleteRun(runId: string): void;
 	/** 启动时 status IN ('queued','running') → error,返回受影响行数。 */
 	recoverStaleRuns(now: number): number;
 	appendEvents(runId: string, events: StoredEvent[]): void;

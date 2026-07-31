@@ -109,6 +109,7 @@ export function createSqliteRunStore(path: string): RunStore {
 		WHERE run_id = ?
 	`);
 	const setError = db.prepare("UPDATE runs SET status = 'error', error_message = ?, finished_at = ? WHERE run_id = ?");
+	const del = db.prepare("DELETE FROM runs WHERE run_id = ?");
 	const recover = db.prepare(`
 		UPDATE runs SET status = 'error', error_message = 'process restarted', finished_at = ?
 		WHERE status IN ('queued', 'running')
@@ -174,6 +175,11 @@ export function createSqliteRunStore(path: string): RunStore {
 		markError(runId: string, message: string, finishedAt: number) {
 			const changes = Number(setError.run(message, finishedAt, runId).changes);
 			if (changes === 0) throw new Error(`markError: run "${runId}" not found`);
+		},
+		deleteRun(runId: string) {
+			// 与其余写入方法不同,这里删不到行不抛:契约里已写明「拒绝路径是唯一调用方,
+			// 幂等更安全」——不存在的行没有什么可撤销的。
+			del.run(runId);
 		},
 		recoverStaleRuns(now: number) {
 			return Number(recover.run(now).changes);

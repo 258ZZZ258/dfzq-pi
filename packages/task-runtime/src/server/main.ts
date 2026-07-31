@@ -46,15 +46,60 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 	// 监听端口干净地关掉),且 port:0 场景下调用方也拿不到真实分配到的端口。
 	// listeningListener 的第二个参数就是为此设计的回调,这里用它把 serve() 的"同步返回
 	// 但异步绑定"语义,转成本函数对外承诺的"resolve 时已确定监听"语义。
-	const server = await new Promise<ServerType>((resolve) => {
-		const instance = serve({ fetch: app.fetch, port: options.port, hostname: "127.0.0.1" }, () => resolve(instance));
-	});
+	//
+	// "listening" 不是唯一可能触发的事件 —— 端口被占用(EADDRINUSE)等 bind 失败会触发
+	// "error" 而不是 "listening"。listeningListener 只挂在 "listening" 上,若不单独接管
+	// "error",bind 失败时这个 Promise 永远不 resolve 也不 reject:Node 对没有监听者的
+	// server "error" 事件的默认语义是直接扔出去炸进程(EventEmitter 的 unhandled 'error'
+	// 规则),就算调用方装了全局 uncaughtException 兜底吞掉了它,startServer() 也会
+	// 永久挂起 —— "服务启不来"却不给调用方任何可 catch 的信号,比崩溃更难查。
+	// 因此这里必须显式监听一次性的 "error" 并转成 reject;成功监听后要把它摘掉,否则
+	// 装配完成后的真实运行期错误(比如极端情况下的 EMFILE)会被这个已经 settle 过的
+	// listener 悄悄吃掉,而不是回退到 Node 默认的"响亮崩溃"行为。
+	let server: ServerType;
+	try {
+		server = await new Promise<ServerType>((resolve, reject) => {
+			let instance!: ServerType;
+			const onError = (error: unknown) => {
+				instance.off("listening", onListening);
+				reject(error);
+			};
+			const onListening = () => {
+				instance.off("error", onError);
+				resolve(instance);
+			};
+			instance = serve({ fetch: app.fetch, port: options.port, hostname: "127.0.0.1" }, onListening);
+			instance.once("error", onError);
+		});
+	} catch (error) {
+		// bind 失败(比如 EADDRINUSE):调用方拿到的是一个 reject 的 promise,不会拿到
+		// close() 去关掉上面已经打开的 store 句柄 —— 必须在这里自己关,不能悄悄泄漏
+		// (与 assembler.ts 装配失败时自己 dispose 已开 toolset 句柄同一条纪律)。
+		store.close();
+		throw error;
+	}
 	const address = server.address();
 	const port = typeof address === "object" && address ? address.port : options.port;
 
+	// close() 必须能安全重入,与 store.close()(见 store/sqlite.ts)同一条纪律 ——
+	// 调用方(以及测试的 afterEach)可能在已经 close 过一次之后再 close 一次;不设防的话
+	// 第二次调用会在 server 上撞 ERR_SERVER_NOT_RUNNING。
+	let closed = false;
 	return {
 		port,
 		close: async () => {
+			if (closed) return;
+			closed = true;
+			// 优雅下线(非重启)时仍有在途 run:没有排空协议(不在 S1a 判据内,见 brief),
+			// 这些 run 会随进程一起消失。默认行为是完全静默 —— 调用方看到的只是 close()
+			// resolve 了,run 的结果再也不会出现,直到下次启动 recoverStaleRuns() 才会把
+			// 它们标成 error。把这一步变响亮,好让运维在日志里能看到"为什么"。
+			if (manager.activeRuns > 0) {
+				console.error(
+					`[task-runtime] closing with ${manager.activeRuns} run(s) still in flight; their results will be ` +
+						"lost and the rows will be marked as error by recoverStaleRuns() on next startup",
+				);
+			}
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			});
@@ -94,10 +139,23 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		const spec = specFiles.get(specId);
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
-		// PluginRegistry 与 ToolsetRegistry 都**按 run 新建**。createSessionRuntime 把 limits
-		// 描述符作为*实例*传给 assemble(),该描述符闭包捕获本次 run 的 LimitState 与 abort 句柄;
-		// 复用同一个 registry 会撞 `Plugin "limits" is already registered`,并让并发 run 互相串
-		// 状态(见 plugin-registry.ts / toolsets/registry.ts 的类注释)。
+		// ToolsetRegistry **必须**按 run 新建:下面 toolsets.register(spec.toolset, ...) 在
+		// 本闭包里每次 run 都会重新调用一次。若跨 run 复用同一个 ToolsetRegistry 实例,第二次
+		// run 再 register 同一个 spec.toolset id 会直接撞 `Toolset "X" is already registered`
+		// (见 toolsets/registry.ts 的类注释)。
+		//
+		// PluginRegistry 按 run 新建则是**当前无实际影响的保守做法**,不要和上面那条理由混为
+		// 一谈:limits 描述符是作为*实例*直接传给 assemble({ builtinPlugins }) 的(见
+		// session-runtime.ts),从不经过 registry.register() ——本工厂也从未往这个
+		// PluginRegistry 里 register 过任何东西,所以它在这条路径上永远是空表,复用与否对
+		// limits 毫无影响。
+		//
+		// TODO(继承自 cli/main.ts 的既有模式,非本任务引入):正因为这个 PluginRegistry 从不被
+		// 填充,任何声明了 contextStrategy / stopPolicy / resultPolicy / approvalPolicy /
+		// extraPlugins 的 spec,经这里装配时会在 assemble() 内部的 validateSpec 阶段报
+		// `plugin "..." is not registered`。当前 fixture 都没用到这些字段,这个缺口处于休眠
+		// 状态,但第一次真实使用命名插件时必现——需要在 createDefaultRuntimeFactory(或其
+		// DefaultFactoryOptions)里补一个"进程级插件描述符从哪来"的装配入口。
 		const toolsets = new ToolsetRegistry();
 		toolsets.register(spec.toolset, createMcpToolset(spec.mcpServers ?? []));
 

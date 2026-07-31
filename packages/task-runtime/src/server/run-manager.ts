@@ -202,7 +202,18 @@ export class RunManager {
 			return result;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			this.store.markError(runId, message, this.now());
+			try {
+				this.store.markError(runId, message, this.now());
+			} catch (markErrorFailure) {
+				// markError 自身也可能抛(典型场景:进程正在优雅下线,store 已经 close()
+				// 过)。这里不能让它盖过下面要 throw 的原始 error ——原始 error 才是这个 run
+				// 真正失败的原因;但也绝不能无声吞掉:不然这一行会永久停在 running/queued
+				// 态,且没有任何日志能解释为什么(见 server/main.ts 的 close() 同一条纪律)。
+				console.error(
+					`[RunManager] failed to mark run "${runId}" as error after it failed; the run row is left stale`,
+					markErrorFailure,
+				);
+			}
 			throw error;
 		} finally {
 			// 结果已落盘 → 可立即驱逐 runtime(设计文档 §4.1)。

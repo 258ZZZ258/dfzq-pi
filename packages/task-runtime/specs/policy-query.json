@@ -27,8 +27,9 @@
   },
   "limits": {
     "maxTurns": 30,
-    "runTimeoutMs": 600000,
-    "maxTotalTokens": 400000
+    "runTimeoutMs": 900000,
+    "maxTotalTokens": 3000000,
+    "maxCostUsd": 0.5
   },
   "stopPolicy": {
     "name": "sufficiency-gate",

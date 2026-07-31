@@ -161,6 +161,23 @@ describe("output contract judge", () => {
 		}
 	});
 
+	// 上面那条"falls back"用例是重言式:confidence 是裸 enum,schema 那一层压根没有
+	// properties 键,不管 keyDiffAt 对不对都会走到"properties === undefined"提前返回。
+	// 真正需要盯住的是 keyDiffAt 里 `!isRecord(current)` 那个防崩溃守卫——failing 节点的
+	// schema 有 properties(basis 元素是 object schema),但实际值不是对象:第 5 次真 run
+	// 的另一种跑偏,模型把整个 basis 元素写成裸字符串而不是对象。少了这个守卫,
+	// `required.filter((key) => !(key in current))` 会对着字符串做 `in`,直接抛
+	// TypeError,而不是退回一份只带 instancePath 的 followUp。
+	it("does not throw and falls back to the instancePath alone when a basis element is not an object", async () => {
+		const bad = { ...good, basis: ["纯文本"] };
+		const verdict = await judge.judge({ lastAssistantText: JSON.stringify(bad), clauseIds: ["A-1"] });
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) {
+			expect(verdict.detail).toContain("/basis/0");
+			expect(verdict.followUp).not.toContain("缺少");
+		}
+	});
+
 	it("rejects finish_reason:stop with an empty basis", async () => {
 		const bad = { ...good, basis: [] };
 		const verdict = await judge.judge({ lastAssistantText: JSON.stringify(bad), clauseIds: [] });

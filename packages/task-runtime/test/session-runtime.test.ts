@@ -4,11 +4,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import type { RuntimeEvent } from "../src/runtime/contract.ts";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
+import type { FinalJudge } from "../src/runtime/final-judge.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 import { createSessionRuntime } from "../src/runtime/session-runtime.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
-import { createFauxHarness, fauxAssistantMessage } from "./helpers/faux.ts";
+import { createFauxHarness, fauxAssistantMessage, fauxToolCall } from "./helpers/faux.ts";
 
 const profile: ProviderProfile = {
 	id: "test",
@@ -416,6 +417,43 @@ describe("SessionRuntime - PluginContext wiring (review I-1)", () => {
 	});
 });
 
+/** 装一个带任意判官的 runtime。spec 默认 maxTurns:10 + demo/echo,按需覆盖。 */
+async function buildWithRegistry(
+	registry: ReturnType<typeof createDefaultPluginRegistry>,
+	specOverrides: Partial<RuntimeSpec>,
+	responses: unknown[],
+	toolsetRegistry: ToolsetRegistry = toolsets(),
+) {
+	const harness = await createFauxHarness();
+	cleanups.push(harness.cleanup);
+	harness.faux.setResponses(responses as never);
+	const runtime = await createSessionRuntime({
+		spec: { ...spec({ maxTurns: 10 }), ...specOverrides },
+		profile,
+		registry,
+		toolsets: toolsetRegistry,
+		cwd: harness.cwd,
+		agentDir: harness.agentDir,
+		modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+	});
+	cleanups.push(runtime.dispose);
+	return runtime;
+}
+
+/** 登记一个判官的最小测试插件。`judge` 直接给,免得每条用例都抄一遍 register 样板。 */
+function registryWithCustomJudge(name: string, judge: FinalJudge["judge"], overrides: Partial<FinalJudge> = {}) {
+	const registry = createDefaultPluginRegistry();
+	registry.register({
+		name,
+		hooks: [],
+		factory: (ctx) => {
+			ctx.registerFinalJudge({ name, maxAttempts: 3, onExhausted: "pass", judge, ...overrides });
+			return { name, factory: () => {} };
+		},
+	});
+	return registry;
+}
+
 /** 只用来登记一个可编程判官的测试插件。verdicts 用完后重复最后一项。 */
 function registryWithJudge(verdicts: Array<{ ok: boolean }>) {
 	const registry = createDefaultPluginRegistry();
@@ -549,5 +587,103 @@ describe("SessionRuntime final-judge rejudging", () => {
 		// 判官抛异常不能变成静默成功 —— run 层的 .catch 把它转成 errorMessage。
 		expect(result.status).toBe("error");
 		expect(result.errorMessage).toContain("assess 调用失败");
+	});
+
+	// 审查 I-2 的回归锁。判官 await 期间 runTimeout 到期、之后判官又抛 —— judgeError 与
+	// state.tripped 同时置位。classify() 自己确立的优先级是 limit 压倒 error,所以 status
+	// 必须是 limit_exceeded;写成 `judgeError ? "error" : classify(...)` 会产出
+	// status:"error" 配 limit:"runTimeout" 这种自相矛盾的结果,下游按 status==="limit_exceeded"
+	// 记预算超支的会直接漏记。C6 明确用 onExhausted:"error",这个分歧必然会遇上。
+	it("lets a tripped limit outrank a judge error in the RunResult status", async () => {
+		const runtime = await buildWithRegistry(
+			registryWithCustomJudge("slow-throwing-judge", async () => {
+				await new Promise((resolve) => setTimeout(resolve, 150));
+				throw new Error("assess 调用失败");
+			}),
+			{ limits: { runTimeoutMs: 50 }, stopPolicy: "slow-throwing-judge" },
+			[fauxAssistantMessage("第一版")],
+		);
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("limit_exceeded");
+		expect(result.limit).toBe("runTimeout");
+		// 诊断信息不丢:判官的失败原因仍然留在 errorMessage 里。
+		expect(result.errorMessage).toContain("assess 调用失败");
+	});
+
+	// 审查 M-2 的回归锁:`thrown !== undefined 跳过重判`这条不变量此前只靠读代码验证。
+	it("skips rejudging entirely when session.prompt() itself throws", async () => {
+		const promptSpy = vi.spyOn(AgentSession.prototype, "prompt").mockRejectedValueOnce(new Error("prompt boom"));
+		cleanups.push(async () => {
+			promptSpy.mockRestore();
+		});
+		let judgeCalls = 0;
+		const runtime = await buildWithRegistry(
+			registryWithCustomJudge("counting-judge", async () => {
+				judgeCalls += 1;
+				return { ok: false, followUp: "请继续查证" };
+			}),
+			{ stopPolicy: "counting-judge" },
+			[fauxAssistantMessage("不该出现")],
+		);
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("error");
+		expect(result.errorMessage).toBe("prompt boom");
+		// prompt 自身就炸了,重判一次都不能进 —— 再发只会拿到第二次爆炸。
+		expect(judgeCalls).toBe(0);
+	});
+});
+
+/** 吐一段带 clause_id 的 JSON 的工具集。形态照着真实 MCP 工具结果:结构化数据塞在一段 JSON
+ *  字符串里,而不是直接挂在结果对象上 —— collectClauseIds 的 tryParseJson 分支正是为它写的。 */
+function toolsetsWithClauses(): ToolsetRegistry {
+	const registry = new ToolsetRegistry();
+	registry.register("clauses", async () => [
+		{
+			name: "lookup",
+			label: "Lookup",
+			description: "Look a clause up.",
+			parameters: Type.Object({ q: Type.String() }),
+			execute: async (_id: string, params: { q: string }) => {
+				// AgentToolResult.content 是 (TextContent | ImageContent)[](packages/agent/src/types.ts),
+				// clause_id 只藏在这段 text 的 JSON 里 —— 正是 collectClauseIds 的 tryParseJson 分支
+				// 要走通的那条路,也是 MCP 工具结果的常见形态。
+				const payload = JSON.stringify({ hits: [{ clause_id: params.q, text: "……" }] });
+				return { output: payload, content: [{ type: "text", text: payload }], details: {} };
+			},
+		} as never,
+	]);
+	return registry;
+}
+
+// 审查 I-4:clauseIds 的接线此前零覆盖 —— grep 只命中 collectClauseIds 的纯函数单测,没有任何
+// 测试证明 tool_execution_end 真的会填充它、它真的送达判官、clear() 真的挡住跨 run 串数据。
+// 这三条正是风险 10 说的"上游改字段名会静默失效"的失效面,而 C3/C6 直接压在上面。
+describe("SessionRuntime - clauseIds wiring (review I-4)", () => {
+	it("feeds clause_ids from tool results into JudgeContext and clears them between runs", async () => {
+		const seen: string[][] = [];
+		const runtime = await buildWithRegistry(
+			registryWithCustomJudge("recording-judge", async (context) => {
+				seen.push([...context.clauseIds]);
+				return { ok: true };
+			}),
+			{ toolset: "clauses", tools: ["lookup"], stopPolicy: "recording-judge" },
+			[
+				fauxAssistantMessage([fauxToolCall("lookup", { q: "A-1" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage("第一次答完"),
+				fauxAssistantMessage("第二次答完"),
+			],
+			toolsetsWithClauses(),
+		);
+
+		const first = await runtime.run("hello");
+		expect(first.status).toBe("completed");
+		// ① tool_execution_end 真的填充了 clauseIds ② 它真的送达了判官
+		expect(seen[0]).toEqual(["A-1"]);
+
+		// ③ run() 开头的 clauseIds.clear() 真的挡住跨 run 串数据:第二次 run 没有工具调用,
+		//    判官看到的必须是空集,而不是上一次的 A-1。
+		const second = await runtime.run("hello again");
+		expect(second.status).toBe("completed");
+		expect(seen[1]).toEqual([]);
 	});
 });

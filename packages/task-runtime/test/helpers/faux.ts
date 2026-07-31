@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { fauxAssistantMessage, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 export interface FauxHarness {
@@ -64,4 +64,4 @@ export async function createFauxHarness(): Promise<FauxHarness> {
 	};
 }
 
-export { fauxAssistantMessage };
+export { fauxAssistantMessage, fauxToolCall };

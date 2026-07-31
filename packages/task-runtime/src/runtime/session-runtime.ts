@@ -69,8 +69,25 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		// 与 reconcile.ts 同一类耦合(风险 10):上游改字段名会让 clauseIds 静默变空。
 		// 兜底不在这里 —— C6 的反幻觉校验会在 basis 非空而 clauseIds 空时判失败,
 		// 把静默错误变成响亮的契约校验失败。
+		//
+		// try/catch 的理由与下面 listener fan-out 那圈**完全相同**,而且这里更靠前:这段代码
+		// 同样跑在 pi 无 try/catch 的 AgentSession._emit 里,抛出去会直接穿透 agent loop 打死
+		// 在跑的 run。result 是 AgentToolResult = { content, details },其中 details 是工具私有
+		// 结构、不进 provider 请求、因此**不受"必须可序列化"约束**,装得下任意对象(含环)。
+		// collectClauseIds 自身已有环检测与深度上限(两条都有各自的判别性测试),这圈是最后
+		// 一道保险,**故意没有配测试**:能让 collectClauseIds 抛而 pi 自己不抛的 payload 造不
+		// 出来。实测过 details 里放一个 throwing getter —— 这圈确实接住了,但 pi 随后自己枚举
+		// details 时也撞上同一个 getter,run 照样以 stopReason:"error" / "getter boom" 收场。
+		// 也就是说这圈挡不住那种输入的最终结果,只保证**不是我们这行**打死 agent loop。
 		if (event.type === "tool_execution_end") {
-			collectClauseIds((event as { result?: unknown }).result, clauseIds);
+			try {
+				collectClauseIds((event as { result?: unknown }).result, clauseIds);
+			} catch (error) {
+				console.error(
+					`[SessionRuntime] collectClauseIds threw for spec "${specId}"; this run's clauseIds may be incomplete`,
+					error,
+				);
+			}
 		}
 		const enveloped: RuntimeEvent = {
 			runId: currentRunId,
@@ -145,7 +162,10 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 					// 这是重判不会变成无限循环的第二道保险(第一道是 Σ maxAttempts)。
 					shouldStop: () => state.tripped !== undefined,
 				}).catch((error: unknown) => {
-					// 判官自身抛(比如 assess 的 MCP 调用失败)不该把整个 run 变成静默成功。
+					// 最后一道网。判官抛与 reprompt 抛都已经在 runFinalJudges 内部就地转成了
+					// errorMessage(那里能保住已花掉的 attempts),所以这圈只可能被上面这几个
+					// deps 闭包自己抛出的异常触发 —— 那种情况下确实没有 attempts 可报。
+					// 无论如何都不能让它变成静默成功。
 					return { attempts: {}, errorMessage: error instanceof Error ? error.message : String(error) };
 				});
 				judgeError = outcome.errorMessage;
@@ -169,7 +189,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		return {
 			runId,
 			specId,
-			status: judgeError ? ("error" as const) : classify(state.tripped, assistant?.stopReason, thrown),
+			status: classify(state.tripped, assistant?.stopReason, thrown, judgeError),
 			output: session.getLastAssistantText() ?? undefined,
 			errorMessage: judgeError ?? (thrown instanceof Error ? thrown.message : assistant?.errorMessage),
 			stopReason: assistant?.stopReason,
@@ -221,9 +241,22 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	};
 }
 
-function classify(tripped: LimitKind | undefined, stopReason: string | undefined, thrown: unknown) {
+/**
+ * judgeError 走 classify 而不是在调用点写 `judgeError ? "error" : classify(...)`:后者会把
+ * classify 自己确立的优先级**反过来** —— limit 压倒 error 是这里的第一条分支。限额在判官轮内
+ * 触发、同时某个 onExhausted:"error" 的判官耗尽(或判官抛异常)时,那种写法会产出
+ * `status:"error"` 配 `limit:"runTimeout"` 这种自相矛盾的 RunResult,下游按
+ * `status === "limit_exceeded"` 记预算超支的会直接漏记。C6 明确用 onExhausted:"error",
+ * 这个分歧必然会遇上。
+ */
+function classify(
+	tripped: LimitKind | undefined,
+	stopReason: string | undefined,
+	thrown: unknown,
+	judgeError?: string,
+) {
 	if (tripped) return "limit_exceeded" as const;
-	if (thrown) return "error" as const;
+	if (thrown || judgeError) return "error" as const;
 	if (stopReason === "aborted") return "aborted" as const;
 	if (stopReason && stopReason !== "stop") return "error" as const;
 	return "completed" as const;

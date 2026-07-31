@@ -45,7 +45,16 @@ export async function runFinalJudges(deps: RejudgeDeps): Promise<RejudgeOutcome>
 	for (const judge of deps.judges) attempts[judge.name] = 0;
 
 	for (;;) {
-		// 限额触发后 session 已经 abort,再发 prompt 只会拿到一个立刻失败的 run。
+		// 限额已触发就必须立刻收手。危害远不止"多跑一轮"—— 那次多发的 prompt 是**完全无界**的:
+		//   1. abort 在 pi 里**不是粘滞状态**:packages/agent/src/agent.ts 的 abort() 只 abort
+		//      当前 activeRun 的 AbortController,session 上不留任何 aborted 标记。新的
+		//      session.prompt() 会开一个全新的 AbortController,正常跑起来。
+		//   2. runTimeout 的 setTimeout 是**一次性**的(session-runtime.ts 的 run()),已经触发过
+		//      就不会再触发第二次。
+		//   3. limits 插件的 turn_end 钩子开头是 `if (state.tripped) return`(plugins/limits.ts),
+		//      一旦置位就**永久**停止计数与 abort。
+		// 三条叠起来:限额触发之后再发的这一次 prompt,既没有 turn 上限、也没有挂钟上限、
+		// 更没有在途的 abort —— run() 会一直阻塞到模型自己停下来。
 		if (deps.shouldStop()) return { attempts };
 
 		const context: JudgeContext = {
@@ -55,7 +64,15 @@ export async function runFinalJudges(deps: RejudgeDeps): Promise<RejudgeOutcome>
 
 		let dispatched = false;
 		for (const judge of deps.judges) {
-			const verdict = await judge.judge(context);
+			let verdict: JudgeVerdict;
+			try {
+				verdict = await judge.judge(context);
+			} catch (error) {
+				// 判官自身抛(比如 assess 的 MCP 调用失败)不该把整个 run 变成静默成功。就地转成
+				// errorMessage 返回而不是让 promise reject:reject 会把已经花掉的 attempts 一起
+				// 丢掉,而 attempts 是"这个 run 到底重判了几次"的唯一记录。
+				return { attempts, errorMessage: `${judge.name}: ${describeError(error)}` };
+			}
 			if (verdict.ok) continue;
 
 			if ((attempts[judge.name] ?? 0) >= judge.maxAttempts) {
@@ -65,14 +82,30 @@ export async function runFinalJudges(deps: RejudgeDeps): Promise<RejudgeOutcome>
 				continue; // pass:放过这个判官,继续看后面的
 			}
 
+			// 轮首那次 shouldStop() 与这里之间隔着一个 `await judge.judge(context)`,限额完全
+			// 可能在那段 await 里翻 true —— 而 C3/C6 的判官要走 MCP assess 调用(秒级),
+			// runTimeoutMs 恰好在判官 await 期间到期是常规结局,不是边角情况。少了这次复查,
+			// 上面注释里那个"完全无界的 prompt"就会从这扇门进来。
+			// 复查放在 attempts 自增**之前**:这一轮并没有真的花掉一次尝试,不该记账。
+			if (deps.shouldStop()) return { attempts };
+
 			attempts[judge.name] = (attempts[judge.name] ?? 0) + 1;
-			await deps.reprompt(verdict.followUp);
+			try {
+				await deps.reprompt(verdict.followUp);
+			} catch (error) {
+				// 同上:续跑失败也要保住已经花掉的 attempts。
+				return { attempts, errorMessage: `${judge.name}: reprompt failed: ${describeError(error)}` };
+			}
 			dispatched = true;
 			break; // 重跑**全部**判官 —— 补完证据后输出格式也可能变了
 		}
 
 		if (!dispatched) return { attempts };
 	}
+}
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /** 只有对象和数组才尝试解析,所以字符串不会递归成无穷。 */
@@ -94,21 +127,52 @@ function tryParseJson(text: string): unknown {
  * 全深度找 key —— 找不到时 C6 的反幻觉校验会替我们响亮失败(basis 非空而 clauseIds 空)。
  */
 export function collectClauseIds(value: unknown, out: Set<string>): void {
-	if (Array.isArray(value)) {
-		for (const item of value) collectClauseIds(item, out);
-		return;
-	}
+	walk(value, out, new WeakSet<object>(), 0);
+}
+
+/**
+ * 递归深度上限。真实形态里 clause_id 很浅(content[] → text 里的 JSON → hits[] → clause_id,
+ * 大约 6 层),64 对合法数据是够不着的天花板,只用来兜住病态输入。
+ */
+const MAX_DEPTH = 64;
+
+/**
+ * 环检测(seen)与深度上限(depth)**两条都要**,少任何一条都堵不住 RangeError:
+ *
+ * - 只有深度上限:环 + 分叉会先炸在**指数级**上。一个节点带 5 个孩子且各自回指祖先时,
+ *   深度 64 之内就有 5^64 条路径 —— 不抛栈溢出,但等价于挂死。
+ * - 只有环检测:纯链状的超深结构(无环)一个节点都不重复,seen 永远不命中,照样栈溢出。
+ *
+ * seen 是 visited 而非 path 集合(进了不再退出):共享子树只走一次。这不会漏 clause_id ——
+ * 第一次访问就已经把那棵子树的全部 id 收进同一个 out 了 —— 顺带把 DAG 的重复展开也消掉。
+ *
+ * 越界时**静默降级**(该子树不再贡献 clause_id)而不是抛:这个函数跑在 pi 无 try/catch 的
+ * _emit 里(见 session-runtime.ts 的调用点),抛出去会打死在跑的 run。漏采的后果由 C6 的
+ * 反幻觉校验兜住 —— basis 非空而 clauseIds 空时判失败。
+ */
+function walk(value: unknown, out: Set<string>, seen: WeakSet<object>, depth: number): void {
+	if (depth > MAX_DEPTH) return;
+
 	if (typeof value === "string") {
 		const parsed = tryParseJson(value);
-		if (parsed !== undefined) collectClauseIds(parsed, out);
+		if (parsed !== undefined) walk(parsed, out, seen, depth + 1);
 		return;
 	}
 	if (typeof value !== "object" || value === null) return;
+
+	// 环 / DAG 去重要在展开之前做,数组同样是对象,一并覆盖。
+	if (seen.has(value)) return;
+	seen.add(value);
+
+	if (Array.isArray(value)) {
+		for (const item of value) walk(item, out, seen, depth + 1);
+		return;
+	}
 	for (const [key, nested] of Object.entries(value)) {
 		if (key === "clause_id") {
 			if (typeof nested === "string" && nested.length > 0) out.add(nested);
 			continue;
 		}
-		collectClauseIds(nested, out);
+		walk(nested, out, seen, depth + 1);
 	}
 }

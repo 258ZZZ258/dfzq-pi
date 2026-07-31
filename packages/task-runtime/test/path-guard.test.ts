@@ -1,10 +1,45 @@
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 import { pathGuardDescriptor } from "../src/runtime/plugins/path-guard.ts";
+
+/**
+ * 复审 NC-3(2026-07-31)明确要求:这条缺陷的本质是"guard 自己看着没问题",所以测试不能
+ * 只测 guard 自己的返回值,必须拿 pi **真实的** `resolveReadPathAsync` 做端到端断言。这个
+ * 函数没有出现在 `@earendil-works/pi-coding-agent` 的公开 `exports`(package.json 只导出
+ * `.` 和 `./rpc-entry`),没法用普通的包名 import。这里直接从已安装包的 dist 目录动态
+ * import——**用一个拼出来的、非字符串字面量的 specifier**,不是图省事:仓库根 `npm run check`
+ * 里的 `check:ts-imports`(scripts/check-ts-relative-imports.mjs)会静态扫描所有 `.ts`
+ * 文件,拒绝任何"以 .js 结尾的相对路径字面量" import——那条规则的本意是防止本仓自己的
+ * 源码文件互相用 .js 扩展名 import(应该用 .ts),不是针对"测试临时探进第三方包内部读一个
+ * 函数"这种场景,但它是纯字符串匹配,认不出两者的区别,所以用非字面量的动态 import 绕开它。
+ * 这条耦合本身是脆的:pi 升级、把这几个文件挪了地方,这个测试会跟着炸——这是"直接验证真实
+ * 消费方行为"和"耦合到未公开的内部实现"这对权衡下,复审明确要的那一侧。
+ */
+async function loadPiReadPathResolver(): Promise<{
+	resolveReadPathAsync: (filePath: string, cwd: string) => Promise<string>;
+}> {
+	const here = dirname(fileURLToPath(import.meta.url));
+	const target = join(
+		here,
+		"..",
+		"node_modules",
+		"@earendil-works",
+		"pi-coding-agent",
+		"dist",
+		"core",
+		"tools",
+		"path-utils.js",
+	);
+	return (await import(pathToFileURL(target).href)) as {
+		resolveReadPathAsync: (filePath: string, cwd: string) => Promise<string>;
+	};
+}
 
 let root: string;
 let allowed: string;
@@ -125,6 +160,42 @@ describe("path-guard", () => {
 		expect(await handler({ toolName: "read", input: { path: raw } })).toMatchObject({ block: true });
 	});
 
+	it("blocks a Unicode-space twin-name escape that pi's real resolveReadPathAsync resolves outside the allowed root (NC-3)", async () => {
+		// 端到端判别性验证(复审 NC-3,2026-07-31)。向量:白名单内放一个用"貌似空格"字符
+		// (NBSP,U+00A0)命名的真实目录,旁边放一个用普通空格命名、指向白名单外的符号链接。
+		// pi 的 resolveToCwd 在解析之前会无条件把 NBSP 之类的 Unicode 空格替换成普通空格
+		// (paths.ts 的 normalizePath),guard 不做这件事——guard 对原始字符串(含 NBSP)算出
+		// 的 realpath 落在白名单内的真实目录上,pi 对"替换后的字符串"(含普通空格)算出的
+		// 目标却是那个符号链接指向的白名单外文件。
+		const nbsp = String.fromCharCode(0xa0); // U+00A0 NO-BREAK SPACE,显式写码点,不在源码里放不可见字节
+		const realDirName = `a${nbsp}b`; // 白名单内的真实目录,用 NBSP 命名
+		const twinDirName = "a b"; // 普通空格版本——pi 归一化后实际会打开的名字
+		await mkdir(join(allowed, realDirName), { recursive: true });
+		await writeFile(join(allowed, realDirName, "ok.txt"), "ok");
+		await symlink(outside, join(allowed, twinDirName)); // 普通空格版本是指向白名单外的符号链接
+		await writeFile(join(outside, "ok.txt"), "PWNED-OUTSIDE");
+
+		const raw = join(allowed, realDirName, "ok.txt");
+		const realAllowed = realpathSync.native(allowed);
+
+		// "guard 自己看着没问题"的那一半:不加 NC-3 这道校验,guard 对原始字符串(含 NBSP)
+		// 算出的 realpath 确确实实落在白名单内——这不是假设,是直接调同一个 realpathSync.native
+		// 验证。
+		const naiveGuardRealpath = realpathSync.native(raw);
+		expect(naiveGuardRealpath === realAllowed || naiveGuardRealpath.startsWith(realAllowed + sep)).toBe(true);
+
+		// 端到端的另一半:pi 真实的 resolveReadPathAsync 对同一个原始字符串,解析到的是
+		// 白名单外的文件——这才是本条缺陷"实际会读到什么"的证据,不是猜测。
+		const { resolveReadPathAsync } = await loadPiReadPathResolver();
+		const piResolved = await resolveReadPathAsync(raw, root);
+		const piReal = realpathSync.native(piResolved);
+		expect(piReal === realAllowed || piReal.startsWith(realAllowed + sep)).toBe(false);
+
+		// guard 现在必须拦这个原始字符串,而不是像上面 naiveGuardRealpath 展示的那样放行。
+		const handler = instantiate([allowed]);
+		expect(await handler({ toolName: "read", input: { path: raw } })).toMatchObject({ block: true });
+	});
+
 	it("blocks a missing path instead of letting it through", async () => {
 		const handler = instantiate([allowed]);
 		expect(await handler({ toolName: "read", input: { path: join(allowed, "nope.txt") } })).toMatchObject({
@@ -150,6 +221,19 @@ describe("path-guard", () => {
 		// 结论,方向不可信,必须无条件拦。
 		const handler = instantiate([process.cwd()]);
 		expect(await handler({ toolName: "read", input: { path: "package.json" } })).toMatchObject({ block: true });
+	});
+
+	it("does not resolve a relative allowRoots entry against process.cwd(), even when it happens to match a real directory there", async () => {
+		// 顺带做的一条(复审 2026-07-31,与 I-2 对称):不用 process.chdir()——vitest 可能并发
+		// 跑多个测试文件,chdir 是进程级状态,会有跨测试污染风险。这里直接用测试实际运行时的
+		// process.cwd()(即 packages/task-runtime,本仓约定的 vitest 运行目录)构造反例:传一个
+		// 相对根 "src",它按 process.cwd() 解析确实是一个真实存在的目录,里面确实有
+		// src/runtime/assembler.ts——如果没有 isAbsolute(expandedRoot) 这道校验,这个相对根
+		// 会被当成合法根、放行这次读取;有了这道校验,相对根被跳过(不匹配任何已声明的根),
+		// 读取被拦。
+		const handler = instantiate(["src"]);
+		const target = join(process.cwd(), "src", "runtime", "assembler.ts");
+		expect(await handler({ toolName: "read", input: { path: target } })).toMatchObject({ block: true });
 	});
 
 	it("expands <runId> in allowRoots", async () => {

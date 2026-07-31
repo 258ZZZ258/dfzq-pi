@@ -1,0 +1,34 @@
+{
+	"id": "blackbox-eval",
+	"description": "blackbox-eval 合成审计域形式用例",
+
+	"model": { "role": "main" },
+
+	"toolset": "blackbox-eval",
+	"tools": [
+		"list_policy_docs",
+		"search_policy",
+		"get_policy_doc",
+		"get_policy_excerpt",
+		"list_expenses",
+		"get_expense_detail",
+		"find_invoice_usage",
+		"list_invoices",
+		"find_reused_invoices",
+		"summarize_expenses",
+		"summarize_department_budgets",
+		"list_records_by_reimburse_delay",
+		"list_records_missing_approval",
+		"list_employees",
+		"get_employee",
+		"get_department_budget",
+		"list_approvals"
+	],
+
+	"limits": { "maxTurns": 16, "runTimeoutMs": 900000 },
+
+	"mcpServers": [
+		{ "id": "policy_query",  "command": "python3", "args": ["fixtures/policy_query_mcp.py"],  "env": {} },
+		{ "id": "expense_query", "command": "python3", "args": ["fixtures/expense_query_mcp.py"], "env": {} }
+	]
+}

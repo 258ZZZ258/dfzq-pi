@@ -39,7 +39,25 @@ interface ContractShape {
 	exhausted_scope?: unknown;
 }
 
-/** §4.2 的条件约束 + 反幻觉。返回错误说明,通过时返回 undefined。 */
+/**
+ * §4.2 的条件约束 + 反幻觉。返回错误说明,通过时返回 undefined。
+ *
+ * **⚠ 反幻觉这一段的有效性寄生在 schema 上,这里不强制、也强制不了(2026-07-31 全分支
+ * 审查 C-3)**:下面只对"能从 basis 元素里读出字符串 `clause_id`"的项判臆造。**元素不带
+ * 这个键时 `invented` 为空,直接放行** —— 审查用一份不要求 basis 元素含 `clause_id` 的
+ * schema 实测:`basis` 非空 + `clauseIds` 全空,判官照样返回 `{"ok":true}`。
+ *
+ * ⇒ **C8 的输出契约 schema 必须把 `clause_id` 声明为每个 basis 元素的 `required` 字段。**
+ * 少写这一个 `required`,风险 10(pi 事件 schema 越界)的整个兜底就**静默消失** —— 而
+ * 风险 10 在设计文档 §9 里至今开着,它唯一的兜底就是这里。写 schema 的人和读这段代码的
+ * 人通常不是同一个,所以这条约束同时写在交接文档 §3.1 里。
+ *
+ * 这里不加"schema 未要求 clause_id 就报错"的校验:判官拿到的 schema 是任务级配置,在这一
+ * 层反过来校验配置的形状是越权(而且 draft-07 里 `required` 可以藏在 `$ref` / `allOf` /
+ * `oneOf` 后面,静态查全等于自己写半个 schema 解析器)。**这是刻意选择的"约束靠文档 +
+ * 验收兜底",不是遗漏** —— 规格 §8 的验收用例应当包含"basis 带未检索到的 clause_id ⇒ 判
+ * 失败"这一条,那才是这条约束的可执行凭证。
+ */
 function checkConditional(json: ContractShape, clauseIds: readonly string[]): string | undefined {
 	const basis = Array.isArray(json.basis) ? json.basis : [];
 	if (json.finish_reason === "stop" && basis.length === 0) {

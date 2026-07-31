@@ -3,7 +3,7 @@ import type { RuntimeLimits } from "../../spec/types.ts";
 import type { LimitKind, LimitState } from "../contract.ts";
 import type { PluginDescriptor } from "../plugin-registry.ts";
 
-export type { LimitState } from "../contract.ts";
+export type { LimitState };
 
 export interface LimitsHooks {
 	limits: RuntimeLimits;

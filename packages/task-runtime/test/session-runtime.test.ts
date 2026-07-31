@@ -2,7 +2,7 @@ import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
-import { PluginRegistry } from "../src/runtime/plugin-registry.ts";
+import { type PluginContext, PluginRegistry } from "../src/runtime/plugin-registry.ts";
 import { createSessionRuntime } from "../src/runtime/session-runtime.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
@@ -302,5 +302,112 @@ describe("SessionRuntime - abortFn rejection handling", () => {
 		expect(abortSpy).toHaveBeenCalledTimes(1);
 		expect(result.status).toBe("limit_exceeded");
 		expect(result.limit).toBe("maxTurns");
+	});
+});
+
+// Regression lock for review finding I-1 (Task 4): the two plugin-registry.test.ts cases added
+// alongside PluginContext only prove that instantiatePlugins()/resolveAll() forward a
+// *hand-rolled* ctx -- they never touch session-runtime.ts:36-42, the one place that actually
+// builds the production PluginContext. Nothing there would have caught `getRunId: () =>
+// runIdSnapshot` or `abort: abortFn` (silently freezing the :11 no-op forever) -- both compile,
+// both leave every other test green. These go through createSessionRuntime()'s real path: a
+// registry-registered plugin declared via spec.extraPlugins, exactly like a real deployment would.
+describe("SessionRuntime - PluginContext wiring (review I-1)", () => {
+	function specWithProbe(limits: RuntimeSpec["limits"]): RuntimeSpec {
+		return { ...spec(limits), extraPlugins: ["probe"] };
+	}
+
+	it("hands spec-declared plugins the real PluginContext: getRunId varies per run, getSession resolves to the live session", async () => {
+		let capturedCtx: PluginContext | undefined;
+		const registry = new PluginRegistry();
+		registry.register({
+			name: "probe",
+			hooks: [],
+			factory: (ctx) => {
+				// Only capture the handles here -- the factory runs inside assemble(), before
+				// createAgentSession() returns, i.e. before session-runtime.ts's `assembled` is
+				// assigned. Calling ctx.getSession() *now* would throw; that's the point of the
+				// lazy handle (mirrors plugin-registry.test.ts's "keeps getSession lazy" case, but
+				// for the ctx session-runtime.ts actually builds instead of a hand-rolled one).
+				capturedCtx = ctx;
+				return { name: "probe", factory: () => {} };
+			},
+		});
+
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		harness.faux.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		const runtime = await createSessionRuntime({
+			spec: specWithProbe({ maxTurns: 5 }),
+			profile,
+			registry,
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(runtime.dispose);
+
+		// getSession is lazy but must resolve to the *real, live* session once assemble() has
+		// actually returned -- proven by matching identity against runtime.sessionId, not just
+		// "didn't throw".
+		expect(capturedCtx?.getSession().sessionId).toBe(runtime.sessionId);
+
+		// getRunId's whole reason to exist (S3 pooling, Task 11's path-guard <runId> expansion) is
+		// that it varies across run() calls on the same runtime -- pin that now, 6 tasks before
+		// path-guard becomes the first real consumer.
+		const first = await runtime.run("hello", { runId: "run-a" });
+		expect(first.runId).toBe("run-a");
+		expect(capturedCtx?.getRunId()).toBe("run-a");
+
+		const second = await runtime.run("hello again", { runId: "run-b" });
+		expect(second.runId).toBe("run-b");
+		expect(capturedCtx?.getRunId()).toBe("run-b");
+		expect(capturedCtx?.getRunId()).not.toBe("run-a");
+	});
+
+	it("forwards ctx.abort() to the real session.abort(), not a snapshot of the initial no-op", async () => {
+		let capturedAbort: (() => void) | undefined;
+		const registry = new PluginRegistry();
+		registry.register({
+			name: "probe",
+			hooks: [],
+			factory: (ctx) => {
+				// Captured while `abortFn` (session-runtime.ts:11) is still the initial no-op --
+				// if ctx.abort were `abortFn` (a value snapshot) instead of `() => abortFn()` (a
+				// forwarding closure), calling this later would silently do nothing and the run
+				// below would complete instead of aborting.
+				capturedAbort = ctx.abort;
+				return { name: "probe", factory: () => {} };
+			},
+		});
+
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		harness.faux.setResponses([
+			() =>
+				new Promise((resolve) => {
+					setTimeout(() => resolve(fauxAssistantMessage("late")), 200);
+				}),
+		]);
+		const runtime = await createSessionRuntime({
+			spec: specWithProbe({ maxTurns: 5 }),
+			profile,
+			registry,
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(runtime.dispose);
+
+		const runPromise = runtime.run("hello");
+		await waitUntil(() => !runtime.isIdle);
+
+		capturedAbort?.();
+
+		const result = await runPromise;
+		expect(result.status).toBe("aborted");
+		expect(runtime.isIdle).toBe(true);
 	});
 });

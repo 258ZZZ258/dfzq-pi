@@ -88,18 +88,40 @@ describe("path-guard", () => {
 		});
 	});
 
-	it("blocks a `..` traversal through a symlinked directory (C-1: resolve() folds .. before realpath sees the symlink)", async () => {
-		// 判别性验证(复审 C-1,2026-07-31):linkdir 指向白名单外的 outside 目录。真正打开
-		// 这个原始字符串的系统调用会先跟随 linkdir 这个符号链接、再从它指向的地方往上退一级
-		// (落到 root,不是 allowed 的父目录)。若判定路径时先 `path.resolve()` 再 `realpath`,
-		// resolve() 会在触碰文件系统前就把 "linkdir/.." 当纯字符串折叠掉,得到
-		// ".../uploads/run-1/ok.txt"(白名单内、ALLOW)——但工具实际打开的原始字符串会解析
-		// 到 root/ok.txt(白名单外)。这里手工拼接 raw、不经过 `join()`(`join()` 内部会
-		// normalize 掉 ".."),才能复现"guard 看到的路径"和"工具实际打开的路径"不一致这个缺口。
+	it("blocks a `..` traversal through a symlinked directory pointing outside (C-1)", async () => {
+		// 判别性验证(复审 C-1,2026-07-31,措辞按复审 NC-1 附带意见收窄):linkdir 指向白名单
+		// 外的 outside 目录。若某个消费方直接把这个原始字符串交给 open(2)(比如一个直接
+		// `fs.readFile(input.path)` 的 MCP 工具,不做任何词法折叠),它会先跟随 linkdir 这个
+		// 符号链接、再从它指向的地方往上退一级(落到 root,不是 allowed 的父目录),读到
+		// root/ok.txt(白名单外)——这个说法**不对 pi 自己的 read 工具成立**:pi 会先对字符串
+		// 做词法折叠(path.resolve,不看 linkdir 是不是符号链接),折叠结果落回
+		// allowed/ok.txt(白名单**内**),读到的是合法的 ok.txt,不是外面那份。
+		// 现在的判定不再依赖"猜哪种消费方语义":本插件对任何含 ".." 段的路径一律拒绝
+		// (NC-1),这里手工拼接 raw、不经过 `join()`(`join()` 内部会 normalize 掉 ".."),
+		// 才能保留原始的 "linkdir/.." 片段来验证这条拒绝规则本身生效。
 		await symlink(outside, join(allowed, "linkdir"));
 		await writeFile(join(root, "ok.txt"), "PWNED-OUTSIDE"); // 与 allowed 同级,白名单外
 		const handler = instantiate([allowed]);
 		const raw = `${allowed}${sep}linkdir${sep}..${sep}ok.txt`;
+		expect(await handler({ toolName: "read", input: { path: raw } })).toMatchObject({ block: true });
+	});
+
+	it("blocks a `..` traversal through a symlink that points *inside* the allowed root (NC-1: mirror of C-1)", async () => {
+		// 判别性验证(复审 NC-1,2026-07-31):link 指向白名单**内部**深处(allowed/a/b),不是
+		// 外部。跟随符号链接、按展开后的实际目录处理 ".." 的解析(即 C-1 修复后 guard 用的
+		// realpathSync.native)会把这条 raw 判成"还在 allowed 内"(ALLOW)——但 pi 自己的
+		// read 工具先对字符串做纯词法折叠(path.resolve,不看 link 是不是符号链接)再 open:
+		// 折叠 "run-1/link/../../ok.txt" 时,"link" 和紧跟的第一个 ".." 相互抵消、"run-1" 和
+		// 第二个 ".." 相互抵消,落到 "uploads/ok.txt"——在 allowed 的父目录,白名单**外**。
+		// 同一个 raw 字符串,两种解析语义给出两个不同的目标文件:只做符号链接感知的
+		// realpath 比较(上一轮 C-1 的修法)会在这条向量上 ALLOW。必须靠"拒绝任何含 .. 的
+		// 路径"这条更前置的规则才能两头都不漏——这条测试就是在锁这条规则本身,而不是锁某一种
+		// realpath 实现。
+		await mkdir(join(allowed, "a", "b"), { recursive: true });
+		await symlink(join(allowed, "a", "b"), join(allowed, "link"));
+		await writeFile(join(root, "uploads", "ok.txt"), "PWNED-OUTSIDE"); // allowed 的父目录,白名单外
+		const handler = instantiate([allowed]);
+		const raw = `${allowed}${sep}link${sep}..${sep}..${sep}ok.txt`;
 		expect(await handler({ toolName: "read", input: { path: raw } })).toMatchObject({ block: true });
 	});
 

@@ -1,0 +1,181 @@
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { type ServerType, serve } from "@hono/node-server";
+import type { ProviderProfile } from "../env/provider-profile.ts";
+import { loadSpecRouter } from "../router/router.ts";
+import { PluginRegistry } from "../runtime/plugin-registry.ts";
+import { createSessionRuntime } from "../runtime/session-runtime.ts";
+import type { RuntimeSpec } from "../spec/types.ts";
+import { createSqliteRunStore } from "../store/sqlite.ts";
+import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
+import { ToolsetRegistry } from "../toolsets/registry.ts";
+import { createApp } from "./app.ts";
+import { Gate } from "./gate.ts";
+import type { RuntimeFactory } from "./run-manager.ts";
+import { RunManager } from "./run-manager.ts";
+
+export interface ServeOptions {
+	port: number;
+	dbPath: string;
+	specsDir: string;
+	internalToken: string | undefined;
+	// 必填注入点(不是可选):真实装配要么起 MCP 子进程要么要真实模型,两者都超出 S1a
+	// 判据。做成必填参数后 startServer 就是纯接线,可以用 stub 完整测试;真实工厂由
+	// 下面单独导出的 createDefaultRuntimeFactory 提供。
+	runtimeFactory: RuntimeFactory;
+	maxConcurrent?: number;
+	maxQueueDepth?: number;
+}
+
+export async function startServer(options: ServeOptions): Promise<{ port: number; close: () => Promise<void> }> {
+	const store = createSqliteRunStore(options.dbPath);
+	// 必须在开始接请求之前跑:否则 Java 会永远等一个不会完成的 run(设计文档 §5.7)。
+	const recovered = store.recoverStaleRuns(Date.now());
+	if (recovered > 0) {
+		console.error(`[task-runtime] startup recovery marked ${recovered} stale run(s) as error`);
+	}
+
+	const router = await loadSpecRouter(options.specsDir);
+	const gate = new Gate({ maxConcurrent: options.maxConcurrent, maxQueueDepth: options.maxQueueDepth });
+	const manager = new RunManager({ store, gate, runtimeFactory: options.runtimeFactory });
+
+	const app = createApp({ manager, router, store, internalToken: options.internalToken });
+	// `server.listen()`(hono 内部调用)是异步绑定的:serve() 同步返回时,底层 socket
+	// 大概率还没 bind 完成 —— 此刻 server.address() 恒为 null,若不等 "listening" 就
+	// 返回,close() 在真正开始监听前被调用会直接抛 ERR_SERVER_NOT_RUNNING(而不是把
+	// 监听端口干净地关掉),且 port:0 场景下调用方也拿不到真实分配到的端口。
+	// listeningListener 的第二个参数就是为此设计的回调,这里用它把 serve() 的"同步返回
+	// 但异步绑定"语义,转成本函数对外承诺的"resolve 时已确定监听"语义。
+	//
+	// "listening" 不是唯一可能触发的事件 —— 端口被占用(EADDRINUSE)等 bind 失败会触发
+	// "error" 而不是 "listening"。listeningListener 只挂在 "listening" 上,若不单独接管
+	// "error",bind 失败时这个 Promise 永远不 resolve 也不 reject:Node 对没有监听者的
+	// server "error" 事件的默认语义是直接扔出去炸进程(EventEmitter 的 unhandled 'error'
+	// 规则),就算调用方装了全局 uncaughtException 兜底吞掉了它,startServer() 也会
+	// 永久挂起 —— "服务启不来"却不给调用方任何可 catch 的信号,比崩溃更难查。
+	// 因此这里必须显式监听一次性的 "error" 并转成 reject;成功监听后要把它摘掉,否则
+	// 装配完成后的真实运行期错误(比如极端情况下的 EMFILE)会被这个已经 settle 过的
+	// listener 悄悄吃掉,而不是回退到 Node 默认的"响亮崩溃"行为。
+	let server: ServerType;
+	try {
+		server = await new Promise<ServerType>((resolve, reject) => {
+			let instance!: ServerType;
+			const onError = (error: unknown) => {
+				instance.off("listening", onListening);
+				reject(error);
+			};
+			const onListening = () => {
+				instance.off("error", onError);
+				resolve(instance);
+			};
+			instance = serve({ fetch: app.fetch, port: options.port, hostname: "127.0.0.1" }, onListening);
+			instance.once("error", onError);
+		});
+	} catch (error) {
+		// bind 失败(比如 EADDRINUSE):调用方拿到的是一个 reject 的 promise,不会拿到
+		// close() 去关掉上面已经打开的 store 句柄 —— 必须在这里自己关,不能悄悄泄漏
+		// (与 assembler.ts 装配失败时自己 dispose 已开 toolset 句柄同一条纪律)。
+		//
+		// 但 store.close() 自身也可能抛(仓库已三次立过「次生错误不得盖过原始错误」的规矩:
+		// sqlite.ts 吞 ROLLBACK 次生异常、run-manager.ts catch markError 失败、
+		// session-runtime.ts)。这里若不吞掉,会用一个面目全非的次生报错替换掉本该抛出的
+		// error(比如 EADDRINUSE),让「端口被占用」变成一个毫不相关的 store 关闭失败。
+		try {
+			store.close();
+		} catch (closeError) {
+			console.error("[task-runtime] failed to close the store after a bind failure", closeError);
+		}
+		throw error;
+	}
+	const address = server.address();
+	const port = typeof address === "object" && address ? address.port : options.port;
+
+	// close() 必须能安全重入,与 store.close()(见 store/sqlite.ts)同一条纪律 ——
+	// 调用方(以及测试的 afterEach)可能在已经 close 过一次之后再 close 一次;不设防的话
+	// 第二次调用会在 server 上撞 ERR_SERVER_NOT_RUNNING。
+	let closed = false;
+	return {
+		port,
+		close: async () => {
+			if (closed) return;
+			closed = true;
+			// 优雅下线(非重启)时仍有在途 run:没有排空协议(不在 S1a 判据内,见 brief),
+			// 这些 run 会随进程一起消失。默认行为是完全静默 —— 调用方看到的只是 close()
+			// resolve 了,run 的结果再也不会出现,直到下次启动 recoverStaleRuns() 才会把
+			// 它们标成 error。把这一步变响亮,好让运维在日志里能看到"为什么"。
+			if (manager.activeRuns > 0) {
+				console.error(
+					`[task-runtime] closing with ${manager.activeRuns} run(s) still in flight; their results will be ` +
+						"lost and the rows will be marked as error by recoverStaleRuns() on next startup",
+				);
+			}
+			await new Promise<void>((resolve, reject) => {
+				server.close((error) => (error ? reject(error) : resolve()));
+			});
+			store.close();
+		},
+	};
+}
+
+export interface DefaultFactoryOptions {
+	/** ProviderProfile 的 JSON 路径。 */
+	profilePath: string;
+	/** 每个 session 的工作目录根。 */
+	workRoot: string;
+	/**
+	 * spec 文件目录。这里**不收 SpecRouter** —— 它只持有 RuntimeSpec,而装配还需要
+	 * RuntimeSpec 之外的 mcpServers 字段,所以本工厂必须自己重读文件。收一个用不到的
+	 * router 只会是死参数。
+	 */
+	specsDir: string;
+}
+
+/** spec 文件在 RuntimeSpec 之外多带一个 mcpServers,与 cli/main.ts 的 SpecFile 同一形状。 */
+interface SpecFile extends RuntimeSpec {
+	mcpServers?: McpServerSpec[];
+}
+
+export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions): Promise<RuntimeFactory> {
+	const profile = JSON.parse(await readFile(options.profilePath, "utf8")) as ProviderProfile;
+	// spec 文件重读一次:SpecRouter 只持有 RuntimeSpec,mcpServers 不在该类型上。
+	const specFiles = new Map<string, SpecFile>();
+	for (const name of (await readdir(options.specsDir)).filter((n) => n.endsWith(".json"))) {
+		const parsed = JSON.parse(await readFile(join(options.specsDir, name), "utf8")) as SpecFile;
+		specFiles.set(parsed.id, parsed);
+	}
+
+	return async ({ specId, sessionId }) => {
+		const spec = specFiles.get(specId);
+		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
+
+		// ToolsetRegistry **必须**按 run 新建:下面 toolsets.register(spec.toolset, ...) 在
+		// 本闭包里每次 run 都会重新调用一次。若跨 run 复用同一个 ToolsetRegistry 实例,第二次
+		// run 再 register 同一个 spec.toolset id 会直接撞 `Toolset "X" is already registered`
+		// (见 toolsets/registry.ts 的类注释)。
+		//
+		// PluginRegistry 按 run 新建则是**当前无实际影响的保守做法**,不要和上面那条理由混为
+		// 一谈:limits 描述符是作为*实例*直接传给 assemble({ builtinPlugins }) 的(见
+		// session-runtime.ts),从不经过 registry.register() ——本工厂也从未往这个
+		// PluginRegistry 里 register 过任何东西,所以它在这条路径上永远是空表,复用与否对
+		// limits 毫无影响。
+		//
+		// TODO(继承自 cli/main.ts 的既有模式,非本任务引入):正因为这个 PluginRegistry 从不被
+		// 填充,任何声明了 contextStrategy / stopPolicy / resultPolicy / approvalPolicy /
+		// extraPlugins 的 spec,经这里装配时会在 assemble() 内部的 validateSpec 阶段报
+		// `plugin "..." is not registered`。当前 fixture 都没用到这些字段,这个缺口处于休眠
+		// 状态,但第一次真实使用命名插件时必现——需要在 createDefaultRuntimeFactory(或其
+		// DefaultFactoryOptions)里补一个"进程级插件描述符从哪来"的装配入口。
+		const toolsets = new ToolsetRegistry();
+		toolsets.register(spec.toolset, createMcpToolset(spec.mcpServers ?? []));
+
+		const workdir = join(options.workRoot, sessionId);
+		return createSessionRuntime({
+			spec,
+			profile,
+			registry: new PluginRegistry(),
+			toolsets,
+			cwd: join(workdir, "workspace"),
+			agentDir: join(workdir, "agent"),
+		});
+	};
+}

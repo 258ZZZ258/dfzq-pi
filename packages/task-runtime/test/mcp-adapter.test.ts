@@ -1,6 +1,8 @@
+// biome-ignore-all lint/suspicious/noTemplateCurlyInString: expandEnvRefs 的被测语法就是字面量
+// "${VAR}" —— 这条规则防的是「本想写模板字符串却漏了反引号」,在这里每一处命中都是误报。
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createMcpToolset } from "../src/toolsets/mcp/adapter.ts";
+import { createMcpToolset, expandEnvRefs } from "../src/toolsets/mcp/adapter.ts";
 import { McpClient } from "../src/toolsets/mcp/client.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
 
@@ -145,5 +147,43 @@ describe("createMcpToolset", () => {
 		} finally {
 			spawnSpy.mockRestore();
 		}
+	});
+});
+
+describe("expandEnvRefs", () => {
+	const base = { id: "policy-query", command: "x", args: ["-m", "query.mcp.server"], env: {} };
+
+	it("expands ${VAR} in command, cwd and env values", () => {
+		const out = expandEnvRefs(
+			{ ...base, command: "${PY}", cwd: "${ROOT}", env: { PGHOST: "${DBHOST}" } },
+			{ PY: "/venv/bin/python", ROOT: "/repo", DBHOST: "localhost" },
+		);
+		expect(out.command).toBe("/venv/bin/python");
+		expect(out.cwd).toBe("/repo");
+		expect(out.env).toEqual({ PGHOST: "localhost" });
+	});
+
+	it("leaves args untouched", () => {
+		// args 是模块路径与开关,不该依赖环境:放开会让「这个 server 到底跑的是什么」不可读。
+		const out = expandEnvRefs({ ...base, args: ["${PY}"] }, { PY: "/venv/bin/python" });
+		expect(out.args).toEqual(["${PY}"]);
+	});
+
+	it("throws on an undefined variable instead of expanding to empty", () => {
+		expect(() => expandEnvRefs({ ...base, command: "${MISSING}" }, {})).toThrow(/MISSING/);
+	});
+
+	it("throws on an empty-string variable", () => {
+		// 空串展开会让 command 变成 "",spawn 报一个与病因无关的 ENOENT。
+		expect(() => expandEnvRefs({ ...base, command: "${EMPTY}" }, { EMPTY: "" })).toThrow(/EMPTY/);
+	});
+
+	it("supports a literal path with no refs", () => {
+		const out = expandEnvRefs({ ...base, command: "/usr/bin/python3" }, {});
+		expect(out.command).toBe("/usr/bin/python3");
+	});
+
+	it("names the offending field so the error points at the spec, not at spawn", () => {
+		expect(() => expandEnvRefs({ ...base, cwd: "${NOPE}" }, {})).toThrow(/"policy-query"\.cwd/);
 	});
 });

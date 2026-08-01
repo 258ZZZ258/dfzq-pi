@@ -106,14 +106,6 @@ describe("result-budget", () => {
 		expect(out.content).toBe("纯文本结果");
 	});
 
-	// pi 真实的 tool_result 事件把 content 定成 (TextContent | ImageContent)[]——见
-	// result-budget.ts 里 extractText / rewrapContent 的注释:agent-session.js 的
-	// afterToolCall 钩子直接透传 AgentToolResult.content,而 task-runtime 自己的 MCP
-	// 适配层(toolsets/mcp/adapter.ts)产出的 AgentToolResult 固定是单元素
-	// `[{ type: "text", text }]`。上面几条用例喂的都是裸字符串,只覆盖了单测自己的输入
-	// 习惯;这一条专门盯住"喂真实形状的数组,预算逻辑照样生效,且原样按数组封回去"——
-	// 删掉 extractText/rewrapContent 的形状适配、退回 `event.content ?? ""` 会让这条
-	// 用例翻红(content.trim is not a function)。
 	// 护栏口径的边界凭证:实测值不截、阈值 +1 截。这是 result-budget 在
 	// 当前语料下唯一的「它真的会截」的证据 —— spec 的阈值本身永不触发。
 	// 7700 = get_clause_detail 真环境实测 5491 字符(8 个 clause_id 一次取全,见
@@ -135,6 +127,14 @@ describe("result-budget", () => {
 		expect(over.content).toContain("已截断,原长 7701 字符");
 	});
 
+	// pi 真实的 tool_result 事件把 content 定成 (TextContent | ImageContent)[]——见
+	// result-budget.ts 里 extractText / rewrapContent 的注释:agent-session.js 的
+	// afterToolCall 钩子直接透传 AgentToolResult.content,而 task-runtime 自己的 MCP
+	// 适配层(toolsets/mcp/adapter.ts)产出的 AgentToolResult 固定是单元素
+	// `[{ type: "text", text }]`。上面几条用例喂的都是裸字符串,只覆盖了单测自己的输入
+	// 习惯;这一条专门盯住"喂真实形状的数组,预算逻辑照样生效,且原样按数组封回去"——
+	// 删掉 extractText/rewrapContent 的形状适配、退回 `event.content ?? ""` 会让这条
+	// 用例翻红(content.trim is not a function)。
 	it("also budgets pi's real array-shaped content and mirrors the array shape back", async () => {
 		const handler = instantiate({ maxHits: { search_policy: 2 }, maxChars: { default: 10_000 } });
 		const payload = JSON.stringify({ total: 5, hits: [1, 2, 3, 4, 5] });

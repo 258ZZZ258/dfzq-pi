@@ -25,7 +25,31 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(systemMd).toContain("取证顺序"); // 其余内容还在,不是把文件删空了
 	});
 
-	it("keeps the seven legal basis keys and the no-text rule in the appended contract", () => {
+	/**
+	 * basis[] 的七个合法键 —— 契约正文(output-format.md)与出厂 schema
+	 * (output-contract.schema.json 的 basis.items.properties)必须逐字一致,这是下面用例
+	 * 断言 1 / 断言 2 共同的单一事实来源。
+	 *
+	 * 缘由(task-21 复审 必修1):此前用例名承诺"守七个 basis 键",循环里检查的却全是顶层键
+	 * (conclusion/basis/confidence/finish_reason),basis 内部七个键一个都没检 —— 终审变异
+	 * 实测:把 output-format.md 里的七键 JSON 示例整段换成 `{ }`、删掉"只能有上面列出的这
+	 * 七个键"那句,这条用例仍然全绿(彼时循环只剩正文散句里侥幸命中的 source_code)。
+	 * 真实后果不是风格问题:出厂 schema 只 `required` 了 clause_id,其余六个键(尤其
+	 * source_code —— 下游按它回查权威库装配条款正文)只在 output-format.md 里被要求。
+	 * source_code 一旦从契约正文掉了,模型不再输出它,schema 照样过、判官照样过,下游装配却
+	 * 会断,全链零信号。
+	 */
+	const BASIS_KEYS = [
+		"clause_id",
+		"doc_title",
+		"clause_path",
+		"status",
+		"source_code",
+		"source_doc_id",
+		"corpus_type",
+	] as const;
+
+	it("keeps the seven basis keys in lockstep between output-format.md's contract text and the schema's key set", () => {
 		const contract = readFileSync(`${specDir}policy-query/output-format.md`, "utf8");
 		for (const key of ["conclusion", "basis", "confidence", "finish_reason"]) {
 			expect(contract).toContain(key);
@@ -33,6 +57,19 @@ describe("出厂 spec: policy-query.json", () => {
 		// basis[] 不得含条款原文 —— 既是权限红线也防篡改(规格 §4.1)。
 		expect(contract).toContain("不要");
 		expect(contract).toContain("text");
+
+		// 断言 1:七个 basis 键必须逐个真的出现在契约正文里 —— 不是只在无关散句里侥幸命中。
+		for (const key of BASIS_KEYS) {
+			expect(contract).toContain(key);
+		}
+
+		// 断言 2:schema 的 basis.items.properties 键集必须恰好等于这七个键,多一个少一个都要
+		// 翻红。sort() 只是让比较不依赖 JSON 属性声明顺序,不是放宽成"包含即可"——两侧都
+		// sort 之后用 toEqual 做精确比较,不是 toContain/arrayContaining。
+		const schema = JSON.parse(readFileSync(`${specDir}policy-query/output-contract.schema.json`, "utf8")) as {
+			properties: { basis: { items: { properties: Record<string, unknown> } } };
+		};
+		expect(Object.keys(schema.properties.basis.items.properties).sort()).toEqual([...BASIS_KEYS].sort());
 	});
 
 	// output-contract.ts:42-59 那条寄生前提的静态半边:schema 少了这个 required,

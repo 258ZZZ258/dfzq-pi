@@ -377,6 +377,81 @@ describe("run manager", () => {
 
 			errorSpy.mockRestore();
 		});
+
+		// task-21 复审 必修2:上面那条用例走的是「排队中被取消」(admitAndDrive:268 的早退出
+		// 分支,cancelRequested 在装配开始前就已经是 true,那条分支外面根本没有 runtime/订阅
+		// 要收尾,自然也没有 try/finally)。这里补的是另一条完全不同的分支——「装配已经成功、
+		// runtime 已建好,但 run() 还没起步时才被 cancel」(admitAndDrive:313-326),真实场景
+		// 是 cancel() 恰好夹在「装配完成」和「markRunning 前」之间的 race。这条分支才有
+		// `try { return await this.finishAsAborted(...) } finally { unsubscribeEvents();
+		// await runtime.dispose()… }`,上一条用例的分支覆盖不到它。
+		//
+		// 终审变异实测:把这段 try/finally 退回修复前的三条顺序语句
+		// (`const result = await this.finishAsAborted(...); unsubscribeEvents(); await
+		// runtime.dispose()…; return result;`)——finishAsAborted() 一抛,后两条语句被跳过,
+		// 401 passed / 0 red,没有任何用例守到 dispose() 与 unsubscribe。dispose() 被跳过是真的
+		// 漏:MCP 子进程不会被回收。
+		it("finish() throwing while finishing an assembled-then-cancelled-before-run() run still disposes the runtime and unsubscribes events", async () => {
+			const gate = new Gate({ maxConcurrent: 1 });
+			const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+			let disposeCalls = 0;
+			const stub = createStubRuntime();
+			const trackedRuntime: Runtime = {
+				...stub,
+				dispose: async () => {
+					disposeCalls++;
+					await stub.dispose();
+				},
+			};
+			let appendEventsCalls = 0;
+			const brittleStore: RunStore = {
+				...store,
+				appendEvents: (runId, events) => {
+					appendEventsCalls++;
+					store.appendEvents(runId, events);
+				},
+				finish: () => {
+					throw new Error("SQLITE_FULL");
+				},
+			};
+			// rm 在自己的 runtimeFactory 闭包里被引用 —— 闭包只在 submit() 触发装配时才真正
+			// 执行,那时 rm 早已完成初始化(自引用闭包,不是 TDZ 访问)。这是复现"装配完成瞬间
+			// 调用 cancel()"这个 race 唯一的办法,cancelRequested 是私有字段,测试到不了。
+			const rm: RunManager = new RunManager({
+				store: brittleStore,
+				gate,
+				runtimeFactory: async ({ runId }) => {
+					// 模拟 run-manager.ts:307-312 描述的 race:装配已经成功但 run() 还没起步,此刻
+					// cancel() 恰好落进来。
+					await rm.cancel(runId);
+					return trackedRuntime;
+				},
+				now: () => 1000,
+				newRunId: () => "run-1",
+			});
+
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error("expected accepted");
+			// 异常仍须向上传播 —— finally 不吞异常。
+			await expect(outcome.completion).rejects.toThrow("SQLITE_FULL");
+
+			// runtime.dispose() 必须被调用过,否则 MCP 子进程不会被回收。
+			expect(disposeCalls).toBe(1);
+
+			// 事件订阅必须已解除:run 已经以异常终止之后再 emit 一条事件,不该有任何监听者接住。
+			stub.emit({
+				type: "tool_execution_end",
+				payload: {
+					type: "tool_execution_end",
+					toolCallId: "ghost",
+					toolName: "post_completion_ghost",
+					isError: false,
+				},
+			});
+			expect(appendEventsCalls).toBe(0);
+
+			errorSpy.mockRestore();
+		});
 	});
 
 	it("cancels a running run", async () => {

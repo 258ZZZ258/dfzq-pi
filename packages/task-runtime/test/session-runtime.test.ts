@@ -441,15 +441,12 @@ async function buildWithRegistry(
 }
 
 /** 登记一个判官的最小测试插件。`judge` 直接给,免得每条用例都抄一遍 register 样板。 */
-/**
- * 往默认表里再加一个登记判官的测试插件。
- *
- * ⚠ `name` 不能用默认表里已有的插件名(`limits` / `result-budget` / `path-guard` /
- * `sufficiency-gate`)—— 会撞 `already registered`。这条测试守的是**判官派发顺序**,
- * 与插件叫什么无关,所以用测试专用名。
- */
 function registryWithCustomJudge(name: string, judge: FinalJudge["judge"], overrides: Partial<FinalJudge> = {}) {
 	const registry = createDefaultPluginRegistry();
+	// 机器校验:撞上默认表里的四个插件时,register() 会抛一句
+	// "already registered",而错误里没有"这是测试自己起错名"这层信息。
+	// 先在这里响亮地说清楚,免得下一个人去查装配逻辑。
+	expect(registry.has(name), `测试插件名 "${name}" 与默认插件表撞名,换一个`).toBe(false);
 	registry.register({
 		name,
 		hooks: [],

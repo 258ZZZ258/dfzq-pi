@@ -170,10 +170,11 @@ export class RunManager {
 	 * 本身的终态行本来就可能因为同一次崩溃留在 running/queued(重启由 recoverStaleRuns 收尾)
 	 * ——那种情况下逐条写至少留得下"崩溃前已经发生过什么"这份对账线索,批量写则什么都留不下。
 	 *
-	 * 落库失败(store 已 close / 磁盘满等)只记日志、不重新抛出 —— 这段回调跑在 pi 的
-	 * `AgentSession._emit` 无 try/catch 的同步 fan-out 里(session-runtime.ts 对应位置的
-	 * 注释同一条纪律),抛出去会直接打穿 agent loop、杀掉正在跑的 run,一条事件落库失败不该有
-	 * 这么大的爆炸半径。
+	 * 落库失败(store 已 close / 磁盘满等)只记日志、不重新抛出 —— `Runtime.subscribe` 的
+	 * fan-out(session-runtime.ts 对应位置)本身已经给每个监听器包了 try/catch、抛了也会继续
+	 * 派发给其余监听器,所以这里不重新抛不是在补那一层的洞。这里的理由是本地的:不依赖上游
+	 * fan-out 的保护、就近处理并打一条带 runId 的日志 —— 一条事件落库失败不该有牵连同一个
+	 * run 上其余监听器、或者让调用方多一层要处理的异常这么大的影响面。
 	 */
 	private subscribeEvents(runId: string, runtime: Runtime): () => void {
 		return runtime.subscribe((event) => {
@@ -296,9 +297,11 @@ export class RunManager {
 			throw error;
 		}
 		entry.runtime = runtime;
-		// 接线点(task-18b):装配已成功、drive() 尚未开始 —— 从这里到 run() 真正跑起来之前
-		// 的所有退出路径都可能已经产生了事件(装配成功后 cancel 是唯一的例外,那条分支从不
-		// 调用 run(),不会有事件),所以订阅要在这三条退出路径之外的所有分支上都解得掉。
+		// 接线点(task-18b):装配已成功、drive() 尚未开始。从这里往下有三条退出路径
+		// (本分支的立即取消、下面 markRunning 失败、以及正常路径的 drive()),订阅建立之后
+		// 的每一条都必须解得掉 —— 三条都已核实覆盖(task-18b 复审 Important-1 修复前,这一条
+		// 分支里 finishAsAborted() 抛出时会跳过下面的 unsubscribeEvents()/dispose(),已用
+		// try/finally 补上,不再依赖"顺序执行到最后一行"这个脆弱前提)。
 		const unsubscribeEvents = this.subscribeEvents(runId, runtime);
 
 		// 装配成功但 run() 还没起步时已被 cancel:runtime 建好了,但对 stub 和真实的
@@ -309,10 +312,17 @@ export class RunManager {
 		// 和「markRunning 前」之间)。因此必须像排队分支一样,直接按已取消收尾、绝不调用 run()。
 		if (entry.cancelRequested) {
 			await runtime.abort().catch(() => {});
-			const result = await this.finishAsAborted(runId, req.specId, ticket);
-			unsubscribeEvents();
-			await runtime.dispose().catch(() => {});
-			return result;
+			// try/finally(task-18b 复审 Important-1):finishAsAborted() 在 store.finish()
+			// 落库失败时会重抛(见该函数内部注释),重抛此前这里是三条顺序语句,一抛就会跳过
+			// 下面的 unsubscribeEvents()/dispose() —— 悬空的订阅本身影响有限(run() 从未被
+			// 调用,不会再收到事件,live.delete 之后 runtime 也可被 GC),但 dispose() 被跳过
+			// 是真的漏:MCP 子进程不会被回收。finally 保证两者无条件执行。
+			try {
+				return await this.finishAsAborted(runId, req.specId, ticket);
+			} finally {
+				unsubscribeEvents();
+				await runtime.dispose().catch(() => {});
+			}
 		}
 
 		try {

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createOutputContractJudge, extractJsonBlock } from "../src/runtime/output-contract.ts";
 
@@ -219,5 +221,54 @@ describe("output contract judge", () => {
 			expect(verdict.detail).toContain("A-1");
 			expect(verdict.detail).toContain("本次检索结果为空");
 		}
+	});
+});
+
+const shippedSchema = JSON.parse(
+	readFileSync(fileURLToPath(new URL("../specs/policy-query/output-contract.schema.json", import.meta.url)), "utf8"),
+);
+const shippedJudge = createOutputContractJudge({ schema: shippedSchema, maxRepairAttempts: 2 });
+
+describe("A8 反幻觉兜底(出厂 schema)", () => {
+	// output-contract.ts:42-59 那条寄生前提唯一可执行的凭证 —— 代码层面强制不了
+	// (draft-07 的 required 可以藏在 $ref/allOf/oneOf 后面,静态查全等于自己写半个
+	// schema 解析器)。守它的是这条用例。
+	it("rejects a basis clause_id that was never retrieved in this run", async () => {
+		const answer = {
+			conclusion: "不允许",
+			basis: [{ clause_id: "FAKE-999" }],
+			confidence: "high",
+			finish_reason: "stop",
+		};
+		const verdict = await shippedJudge.judge({
+			lastAssistantText: JSON.stringify(answer),
+			clauseIds: ["REAL-1"],
+		});
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) expect(verdict.detail).toContain("FAKE-999");
+	});
+
+	// A8 变异检验实测偏离(task-18):上面那条用例的 payload(clause_id 键存在、值是
+	// 编造的 "FAKE-999")在 checkConditional 里走的是"这个 id 不在 retrieved 里"分支——
+	// 这条分支只看解析后的 JSON 值,根本不读 schema,所以对 basis.items.required 去掉
+	// clause_id 这个变异**不敏感**:实测过,删掉 required 后这条用例原样返回
+	// { ok:false, detail 含 "FAKE-999" },一字不差。schema 自己的 $comment 说得很清楚,
+	// 寄生前提真正兜的是"元素不带 clause_id 这个键时 invented 为空、直接放行"——
+	// 那必须是键缺失,不是键存在但值是假的。下面这条才是对 required 变异真正敏感的用例:
+	// 去掉 required 后 schema 校验不再拦"没有 clause_id 键"的元素,checkConditional 也
+	// 读不出字符串 id(invented 为空),两道防线一起失守,判官改口放行。
+	it("rejects a basis element that omits clause_id entirely (the mutation-sensitive case)", async () => {
+		const answer = {
+			conclusion: "不允许",
+			basis: [{}],
+			confidence: "high",
+			finish_reason: "stop",
+		};
+		const verdict = await shippedJudge.judge({
+			lastAssistantText: JSON.stringify(answer),
+			clauseIds: ["REAL-1"],
+		});
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) expect(verdict.detail).toContain("clause_id");
 	});
 });

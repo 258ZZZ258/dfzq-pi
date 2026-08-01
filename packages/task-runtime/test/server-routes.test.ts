@@ -511,4 +511,20 @@ describe("Java 应答适配:answer 字段(规格-Java应答适配 §2)", () => {
 		const body = await res.json();
 		expect(body).not.toHaveProperty("answer");
 	});
+
+	it("status 非 completed 时即便 output 含合法 JSON 块也缺省 answer(2026-07-31 复审 Important)", async () => {
+		// C6 的 onExhausted 是 "error"——输出不合契约(含反幻觉兜底判定 basis 引用了臆造
+		// clause_id)时 run 以 error 收尾,但 session-runtime 仍会把 getLastAssistantText()
+		// 原样写进 output。extractJsonBlock 只认花括号配不配对、JSON 解析过不过,不知道这份
+		// JSON 是否通过了 C6——「output 里能抠出合法 JSON」与「这份 JSON 通过了 C6」只有在
+		// status === "completed" 时才等价。这里构造一个 status: "error" 但 output 语法合法
+		// 的终态行,断言 answer 缺省而不是把这份被拒的应答原样透给 Java。
+		const { hono } = app({ result: { status: "error", output: STUB_OUTPUT } });
+		const res = await hono.request(post(submitBody({ waitMs: 5000 })));
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { status: string; output: string };
+		expect(body.status).toBe("error");
+		expect(body.output).toBe(STUB_OUTPUT);
+		expect(body).not.toHaveProperty("answer");
+	});
 });

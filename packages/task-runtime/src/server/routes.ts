@@ -44,8 +44,19 @@ export function isTerminal(status: RunRecord["status"]): boolean {
  * 而不是塞进 recordToRunResult,就是为了不再重演。
  *
  * 202 分支不经这里:它回的是 {runId, status},非终态、output 还不存在。
+ *
+ * **只在 `status === "completed"` 时才填 `answer`**(2026-07-31 复审 Important):C6
+ * 的 `onExhausted` 是 `"error"` —— 输出不合契约(含反幻觉兜底判定"basis 引用了臆造的
+ * clause_id")时,run 的终态是 `error`,但 `session-runtime.ts` 仍会把
+ * `getLastAssistantText()` 原样写进 `output`。`extractJsonBlock` 只认花括号配不配对、
+ * JSON 解析过不过——它不知道、也不该知道这份 JSON 是被 C6 判过还是判失败的那份。所以
+ * 「`output` 里能抠出合法 JSON」与「这份 JSON 通过了 C6」是两件事,只有 `status ===
+ * "completed"` 时两者才等价。非 completed 终态下 `output` 仍原样保留(诊断用),但不给
+ * 已解析的 `answer` —— 否则 Java 会消费一个已被判定为臆造引用的应答,正是反幻觉兜底要拦的
+ * 那一类。
  */
 export function toWireResult(result: RunResult): RunResult {
+	if (result.status !== "completed") return result;
 	if (result.output === undefined) return result;
 	const extracted = extractJsonBlock(result.output);
 	// 提取不到就原样返回 —— run 已经完成,拿不到 answer 是降级不是失败。

@@ -99,18 +99,21 @@ describe("POST /runs", () => {
 	});
 
 	it("returns 422 when filters is missing", async () => {
-		const { hono } = app();
+		const { hono, stub } = app();
 		const body = submitBody();
 		delete body.filters;
 		const res = await hono.request(post(body));
 		expect(res.status).toBe(422);
 		expect(await res.json()).toMatchObject({ error: { code: "missing_authorization_scope" } });
+		// A7:拒绝时不得起 run。只断言状态码不够 —— 422 也可能是 run 起了之后才回的。
+		expect(stub.runCalls).toBe(0);
 	});
 
 	it("returns 422 when corpusTypes is empty", async () => {
-		const { hono } = app();
+		const { hono, stub } = app();
 		const res = await hono.request(post(submitBody({ filters: { corpusTypes: [] } })));
 		expect(res.status).toBe(422);
+		expect(stub.runCalls).toBe(0);
 	});
 
 	it("returns 422 for an unknown taskKind", async () => {

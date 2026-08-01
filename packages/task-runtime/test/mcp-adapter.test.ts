@@ -268,6 +268,19 @@ describe("per-run scope 注入(C10 下半段)", () => {
 		);
 	});
 
+	// call 前复查必须覆盖**两种**缺失形态。既有那条只守 corpusTypes ——
+	// 只守一种,另一种被改空时就会静默放行,而 runId 被改空的后果更重:
+	// per-run 白名单退化成全局桶,池化(S3)后两个并发 run 能互取对方的条款详情。
+	it("re-checks an emptied runId before every call, not just corpusTypes", async () => {
+		const mutable = { ...SCOPE };
+		const tools = await resolve(registryWith(mutable), "mcp-demo");
+		mutable.runId = "";
+		const echo = tools.find((t) => t.name === "echo-args");
+		await expect(echo?.execute("c1", { text: "hi" } as never, undefined, undefined, {} as never)).rejects.toThrow(
+			/runId/i,
+		);
+	});
+
 	it("injects nothing when the scope is explicitly null", async () => {
 		// eval / CLI 路径不是权限场景。**必须显式写 null** —— 类型上不可省略,
 		// 于是生产路径漏传 scope 是编译错误,不会静默降级成「非权限场景」。

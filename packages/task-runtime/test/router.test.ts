@@ -90,6 +90,12 @@ describe("submit body validation", () => {
 		expect(out).toMatchObject({ ok: false, error: { code: "missing_authorization_scope" } });
 	});
 
+	it("rejects audit_project with unsupported_corpus_type, distinct from missing_authorization_scope", () => {
+		// 三档不得合并(规格 §2.5):audit_project 是合法枚举值、只是未接入,不是「未授权」。
+		const out = validateSubmitBody(body({ filters: { corpusTypes: ["internal", "audit_project"] } }));
+		expect(out).toMatchObject({ ok: false, error: { code: "unsupported_corpus_type" } });
+	});
+
 	it("rejects a corpusTypes with a non-string element as missing_authorization_scope, not invalid_body — a malformed element shape is disguised authorization probing", () => {
 		const out = validateSubmitBody(body({ filters: { corpusTypes: [123] } }));
 		expect(out).toMatchObject({ ok: false, error: { code: "missing_authorization_scope" } });

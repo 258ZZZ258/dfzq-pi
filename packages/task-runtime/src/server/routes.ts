@@ -7,7 +7,15 @@ export function recordToRunResult(row: RunRecord): RunResult {
 		? (JSON.parse(row.usageJson) as RunResult["usage"])
 		: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
 	return {
-		// 持久化层不存判官重判次数:它是本次进程内的验收观测,不是 run 的终态事实。
+		// judgeAttempts 只服务**进程内验收**,不落库(已决,规格-制度查询验收 §4.3)。
+		// 三件事连起来看才成立:
+		//   1. 持久化层不存这个字段,所以从 SQLite 读回时只能是 {};
+		//   2. 长 run 都走 202 + 轮询,**通过 HTTP 拿到的这个字段恒为空**,
+		//      只有 waitMs 内同步完成的响应才有真值(POST /runs 直接回 completion 的
+		//      RunResult,不经过这个函数 —— 见 server/app.ts 里 `c.json(raced as RunResult, 200)`
+		//      与本函数被调用的另外几处 GET/POST 分支的对照);
+		//   3. ⇒ A6 的工具调用对账**以 MCP 侧审计日志为准**,不用这个字段。
+		// 要改成可用得先在持久化层加列 —— 那是 S2 的事,不在本轮范围。
 		judgeAttempts: {},
 		runId: row.runId,
 		specId: row.specId,

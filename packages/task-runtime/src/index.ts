@@ -1,7 +1,7 @@
 export const PACKAGE_NAME = "@dfzq/task-runtime";
 
 export type { ProviderProfile, RoleBinding } from "./env/provider-profile.ts";
-export { reconcile } from "./observability/reconcile.ts";
+export { reconcile, reconcileRunEvents } from "./observability/reconcile.ts";
 export { attachTrajectory, readTrajectory } from "./observability/trajectory.ts";
 export { loadSpecRouter, SpecRouter } from "./router/router.ts";
 export { assemble } from "./runtime/assembler.ts";

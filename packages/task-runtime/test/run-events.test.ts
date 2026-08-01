@@ -10,6 +10,10 @@
  *
  * 复审 Important-2/Important-3 追加了两块:订阅确实解除(不是只在注释里声称)、
  * run_events 确实能当 reconcile() 的 pi 侧数据源用(不是只写不读)。
+ *
+ * re-review 追加:`stubWithToolEvents()` 从一次调用改成两次**不同工具名**的调用 ——
+ * 一次调用时 piCalls 是单元素数组,`listEvents()` 的 `ORDER BY seq` 无论对错都测不出来
+ * (re-review 变异 D:改成 `ORDER BY seq DESC` 全量照样 393 全绿)。
  */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -73,6 +77,12 @@ function readRunEvents(path: string, runId: string): RunEventRow[] {
 const SENTINEL_QUERY = "SENTINEL_QUERY_条款检索词_7f2c";
 const SENTINEL_CLAUSE_TEXT = "SENTINEL_CLAUSE_条款正文原文_9a3e";
 
+/**
+ * 两次**不同工具名**的调用(re-review 追加要求):此前只有一次调用,`piCalls` 是单元素
+ * 数组,顺序在构造上就不可能被测出来 —— `listEvents()` 的 `ORDER BY seq` 因此零覆盖
+ * (re-review 变异 D:改成 `ORDER BY seq DESC` 全量照样 393 全绿)。两次不同工具名的调用
+ * 才能让"顺序被保留"这件事有真正可失败的空间。
+ */
 function stubWithToolEvents() {
 	return createStubRuntime({
 		events: [
@@ -82,7 +92,7 @@ function stubWithToolEvents() {
 				payload: {
 					type: "tool_execution_start",
 					toolCallId: "call-1",
-					toolName: "search_clauses",
+					toolName: "search_policy",
 					args: { query: SENTINEL_QUERY },
 				},
 			},
@@ -92,8 +102,29 @@ function stubWithToolEvents() {
 				payload: {
 					type: "tool_execution_end",
 					toolCallId: "call-1",
-					toolName: "search_clauses",
+					toolName: "search_policy",
 					result: { content: [{ type: "text", text: SENTINEL_CLAUSE_TEXT }] },
+					isError: false,
+				},
+			},
+			{
+				seq: 2,
+				type: "tool_execution_start",
+				payload: {
+					type: "tool_execution_start",
+					toolCallId: "call-2",
+					toolName: "get_clause_detail",
+					args: { clauseId: "c-1" },
+				},
+			},
+			{
+				seq: 3,
+				type: "tool_execution_end",
+				payload: {
+					type: "tool_execution_end",
+					toolCallId: "call-2",
+					toolName: "get_clause_detail",
+					result: { content: [{ type: "text", text: "second call, non-sentinel body" }] },
 					isError: false,
 				},
 			},
@@ -124,7 +155,7 @@ describe("serve 侧事件落库(A6 pi 侧凭证)", () => {
 		expect(types).toContain("tool_execution_end");
 
 		// 判据 2:落库的 payload 里含工具名。
-		expect(rows.some((row) => row.payload.includes("search_clauses"))).toBe(true);
+		expect(rows.some((row) => row.payload.includes("search_policy"))).toBe(true);
 
 		// 判据 3(脱敏,不可省):落库的 payload 里不含工具返回体/参数里的正文。
 		const blob = rows.map((row) => row.payload).join("\n");
@@ -174,7 +205,11 @@ describe("serve 侧事件落库(A6 pi 侧凭证)", () => {
 	// (observability/reconcile.ts:47)读的是 trajectory JSONL 文件,不是 run_events ——
 	// serve 路径「写了但没人读」是同一个病换了个位置。这条用例证明 store.listEvents() 读回来
 	// 的行经 reconcileRunEvents() 能跑出一份非空、非 schemaMismatch 的报告。
-	it("run_events read back via store.listEvents() is a usable pi-side source for reconcile()", async () => {
+	//
+	// re-review 追加:fixture 换成两次**不同工具名**的调用,断言 piCalls 精确等于一个
+	// **有序**两元素数组 —— 只有这样,listEvents() 的 `ORDER BY seq` 才有真正的失败空间;
+	// 单元素数组时"顺序正确"是构造上的巧合,测不出 ORDER BY 被改坏。
+	it("run_events read back via store.listEvents() is a usable pi-side source for reconcile(), and preserves call order", async () => {
 		const stub = stubWithToolEvents();
 		const rm = new RunManager({
 			store,
@@ -192,12 +227,17 @@ describe("serve 侧事件落库(A6 pi 侧凭证)", () => {
 		expect(events.length).toBeGreaterThan(0);
 
 		const toolLogPath = join(root, "tool_calls.jsonl");
-		await writeFile(toolLogPath, `${JSON.stringify({ tool: "search_clauses" })}\n`);
+		await writeFile(
+			toolLogPath,
+			[{ tool: "search_policy" }, { tool: "get_clause_detail" }].map((entry) => JSON.stringify(entry)).join("\n"),
+		);
 
 		const report = await reconcileRunEvents(events, toolLogPath);
-		expect(report.piCalls).toEqual(["search_clauses"]);
+		// 核心判据:两元素有序数组,不是靠单元素巧合"顺序正确"。
+		expect(report.piCalls).toEqual(["search_policy", "get_clause_detail"]);
 		expect(report.schemaMismatch).toBe(false);
 		expect(report.vacuous).toBe(false);
+		expect(report.orderMismatch).toBe(false);
 		expect(report.ok).toBe(true);
 	});
 });

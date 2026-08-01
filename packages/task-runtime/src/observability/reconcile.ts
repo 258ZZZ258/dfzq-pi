@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import type { StoredEvent } from "../store/contract.ts";
 import { readTrajectory } from "./trajectory.ts";
 
 export interface ReconcileReport {
@@ -39,13 +40,18 @@ function stripServerPrefix(name: string, knownServerIds?: string[]): string {
 	return knownServerIds.includes(prefix) ? name.slice(index + 2) : name;
 }
 
-export async function reconcile(
-	trajectoryPath: string,
-	toolLogPath: string,
-	knownServerIds?: string[],
-): Promise<ReconcileReport> {
-	const events = await readTrajectory(trajectoryPath);
-	const piCalls = events
+/** pi 侧事件的最小形状 —— `RuntimeEvent`(trajectory 路径)与「JSON.parse 过的
+ *  `StoredEvent.payload`」(run_events 路径)都满足这个形状,`extractPiCalls` 不关心
+ *  事件是从文件读的还是从表里读的。 */
+interface PiSideEvent {
+	type: string;
+	payload: unknown;
+}
+
+/** 从 pi 侧事件里挑出 `tool_execution_end`,提工具名。两条数据源(trajectory JSONL /
+ *  run_events 表)共用这份提取逻辑,不各自维护一份,避免今后两边判据慢慢漂移。 */
+function extractPiCalls(events: PiSideEvent[], knownServerIds?: string[]): string[] {
+	return events
 		.filter((event) => event.type === "tool_execution_end")
 		.map((event) => {
 			const payload = event.payload;
@@ -53,13 +59,18 @@ export async function reconcile(
 			const toolName = String((payload as { toolName?: string }).toolName ?? "");
 			return stripServerPrefix(toolName, knownServerIds);
 		});
+}
 
+async function readMcpCalls(toolLogPath: string): Promise<string[]> {
 	const raw = await readFile(toolLogPath, "utf8");
-	const mcpCalls = raw
+	return raw
 		.split("\n")
 		.filter((line) => line.trim().length > 0)
 		.map((line) => String((JSON.parse(line) as { tool?: string }).tool ?? ""));
+}
 
+/** piCalls/mcpCalls 提出来之后,两条数据源共用同一份比对与报告组装逻辑。 */
+function buildReport(piCalls: string[], mcpCalls: string[]): ReconcileReport {
 	const missingInMcp = diffMultiset(piCalls, mcpCalls);
 	const missingInPi = diffMultiset(mcpCalls, piCalls);
 	const orderMismatch =
@@ -80,6 +91,43 @@ export async function reconcile(
 		schemaMismatch,
 		vacuous,
 	};
+}
+
+/** CLI/eval 路径:pi 侧数据源是 `attachTrajectory` 写的 trajectory JSONL 文件。 */
+export async function reconcile(
+	trajectoryPath: string,
+	toolLogPath: string,
+	knownServerIds?: string[],
+): Promise<ReconcileReport> {
+	const events = await readTrajectory(trajectoryPath);
+	const piCalls = extractPiCalls(events, knownServerIds);
+	const mcpCalls = await readMcpCalls(toolLogPath);
+	return buildReport(piCalls, mcpCalls);
+}
+
+/**
+ * serve 路径(task-18b 复审 Important-3):pi 侧数据源是 `RunStore.appendEvents` 落库的
+ * `run_events`,由调用方先 `store.listEvents(runId)` 读出再传进来 —— 本函数不持有
+ * `RunStore`,保持 observability 层不反向依赖 store 层的实现,只依赖 `StoredEvent` 这个
+ * 数据形状。
+ *
+ * `StoredEvent.payload` 是脱敏投影序列化后的 JSON 串(`server/run-manager.ts` 的
+ * `toStoredEvent`),这里只做 `JSON.parse` 把它变回对象,**不改投影**——脱敏后的
+ * `{type, seq, ts, toolName, isError}` 里的 `toolName` 字段名与 trajectory 路径读到的
+ * pi 原始事件一致,`extractPiCalls` 不需要为这条数据源另写一份字段映射。
+ */
+export async function reconcileRunEvents(
+	storedEvents: StoredEvent[],
+	toolLogPath: string,
+	knownServerIds?: string[],
+): Promise<ReconcileReport> {
+	const events: PiSideEvent[] = storedEvents.map((event) => ({
+		type: event.type,
+		payload: JSON.parse(event.payload) as unknown,
+	}));
+	const piCalls = extractPiCalls(events, knownServerIds);
+	const mcpCalls = await readMcpCalls(toolLogPath);
+	return buildReport(piCalls, mcpCalls);
 }
 
 /** a 里有、b 里不够的元素(按出现次数)。 */

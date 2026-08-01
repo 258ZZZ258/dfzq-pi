@@ -8,6 +8,28 @@ import * as sqliteModule from "../src/store/sqlite.ts";
 import { createSqliteRunStore } from "../src/store/sqlite.ts";
 import { createStubRuntime, type StubRuntime } from "./helpers/stub-runtime.ts";
 
+/** 构造期不会真的拨号验证 provider——这里只要是能被 JSON.parse 成 ProviderProfile 形状的
+ *  最小合法值,与本文件既有的 Minor-c 用例(:225-244)用的是同一份数据,抽成 helper 避免
+ *  在下面三条新用例里三次逐字重复。 */
+function minimalProfile(): unknown {
+	return {
+		id: "p",
+		baseUrl: "http://127.0.0.1:1",
+		apiKeyEnv: "X",
+		api: "openai-completions",
+		roles: {
+			main: {
+				provider: "p",
+				modelId: "m",
+				contextWindow: 1000,
+				maxTokens: 100,
+				reasoning: false,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			},
+		},
+	};
+}
+
 const CASE_TIMEOUT_MS = 30_000;
 
 let root: string;
@@ -248,6 +270,123 @@ describe("createDefaultRuntimeFactory - outputContract schema reading (Minor-c)"
 		await expect(
 			createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir }),
 		).rejects.toThrow(/ENOENT|no such file or directory/);
+	});
+});
+
+// Task 15d 复审 Critical-2 的回归锁:resolveSpecPromptPaths 的构造期调用点
+// (server/main.ts 的 createDefaultRuntimeFactory 里那个 for 循环、以及 cli/main.ts 里同样的
+// 调用)在这四条用例补上之前**零覆盖**——审查者的实测:把 server/main.ts 里的调用点整段删掉,
+// 或把 cli/main.ts 里对应那段整段删掉,`npm test --workspace=@dfzq/task-runtime` 都是
+// `382 passed | 4 skipped`,一条都不红。这里照 Minor-c(上面那个 describe)的既有范式
+// ——临时 specsDir + 坏值 + `await expect(createDefaultRuntimeFactory(...)).rejects...`——
+// 补上四条,不需要 MCP、不需要真实 python 解释器:createDefaultRuntimeFactory 本身在
+// "构造期"这个时点完全不 spawn MCP 子进程(那要等它返回的 RuntimeFactory 真的被调用)。
+//
+// 顺带覆盖了审查 Important-4(appendSystemPrompt 的"字面文本"这条路此前零覆盖)与
+// Important-5(appendSystemPrompt 形似路径但读不到时必须响亮失败,不能像旧判据那样静默
+// 退化成字面文本——见 resolve-prompt-paths.ts 的 looksLikePath 文档)。
+describe("createDefaultRuntimeFactory - systemPrompt / appendSystemPrompt resolution (Critical-2 / Important-4 / Important-5)", () => {
+	// ① 坏 systemPrompt ⇒ 抛,错误含字段名。
+	it("fails at construction time when systemPrompt cannot be read, not on the first run", async () => {
+		const specsDir = join(root, "specs");
+		await writeFile(
+			join(specsDir, "bad-system-prompt.json"),
+			JSON.stringify({
+				id: "bad-system-prompt",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				systemPrompt: "missing-system-prompt.md",
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		// 与 Minor-c 同一条纪律:必须是 createDefaultRuntimeFactory() 这次 await 本身
+		// reject——如果调用点被去掉(或调用点还在但函数体被削),这个断言会失败,因为
+		// 返回的 promise 根本不会 reject。错误信息必须点名 systemPrompt 这个字段,不能是
+		// 一个面目全非的 ENOENT(与 resolveSpecPromptPaths 里 catch 块重新抛出的约定一致)。
+		await expect(
+			createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir }),
+		).rejects.toThrow(/systemPrompt/);
+	});
+
+	// ② 坏 appendSystemPrompt 路径(形似路径、文件不存在)⇒ 抛,错误含字段名与坏值。
+	//
+	// 这条同时是审查 Important-5 的回归锁:一个长得像真实文件路径(带子目录、.md 后缀)但
+	// 因为拼错/文件不存在的 appendSystemPrompt 条目,以前会被 resolve(specsDir, item) 落空
+	// 后**静默**当字面文本使用——这正是本 task 要消灭的失效模式的一个变种,而出厂 spec 的
+	// 输出契约(policy-query.json 的 appendSystemPrompt: ["policy-query/output-format.md"])
+	// 恰好走这个字段,拼错路径会让契约悄悄从模型的 context 里消失、不报错。裁定改成:形似
+	// 路径但读不到就抛,不再静默退化成字面文本。
+	it("fails at construction time when an appendSystemPrompt entry looks like a path but does not exist", async () => {
+		const specsDir = join(root, "specs");
+		await writeFile(
+			join(specsDir, "broken-append-path.json"),
+			JSON.stringify({
+				id: "broken-append-path",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				appendSystemPrompt: ["policy-query/typo-does-not-exist.md"],
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		await expect(
+			createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir }),
+		).rejects.toThrow(/appendSystemPrompt.*policy-query\/typo-does-not-exist\.md/);
+	});
+
+	// ③ 字面文本 appendSystemPrompt ⇒ 不抛(brief 明确要求保住的那条路)。
+	// "SOME-LITERAL" 不含 "/",也不以 .md / .json 结尾——looksLikePath() 判它不形似路径,
+	// 构造期必须成功,不能因为"看起来不像一个合法路径"就报错。这条只钉"构造期不抛"这个
+	// wiring 层面的事实;"这段字面文本真的进了 assembled 之后的 systemPrompt 正文"这个更细
+	// 的内容层面断言在 test/policy-query-spec.test.ts 里(那边有 assemble() 的装配 harness,
+	// 这里没有,也不需要为了这一条额外引入)。
+	it("accepts a literal appendSystemPrompt entry that is not meant to be a file path", async () => {
+		const specsDir = join(root, "specs");
+		await writeFile(
+			join(specsDir, "literal-append.json"),
+			JSON.stringify({
+				id: "literal-append",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				appendSystemPrompt: ["SOME-LITERAL"],
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		const factory = await createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir });
+		expect(typeof factory).toBe("function");
+	});
+
+	// ④ 正常出厂 spec(systemPrompt 与 appendSystemPrompt 都指向真实存在的文件)⇒ 不抛。
+	// ①②③ 全是"某一种输入不该抛 / 该抛"的单点断言,这条是它们的对照组:两个字段都给
+	// 正常值时,整条路径端到端地成功,不是"因为两条分支都被小心避开了才侥幸不抛"。
+	it("succeeds at construction time for a normal spec whose systemPrompt and appendSystemPrompt both point at real files", async () => {
+		const specsDir = join(root, "specs");
+		await writeFile(join(specsDir, "system.md"), "系统提示正文\n");
+		await writeFile(join(specsDir, "contract.md"), "契约正文\n");
+		await writeFile(
+			join(specsDir, "normal.json"),
+			JSON.stringify({
+				id: "normal",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				systemPrompt: "system.md",
+				appendSystemPrompt: ["contract.md"],
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		const factory = await createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir });
+		expect(typeof factory).toBe("function");
 	});
 });
 

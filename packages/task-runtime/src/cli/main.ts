@@ -6,6 +6,7 @@ import type { ProviderProfile } from "../env/provider-profile.ts";
 import { attachTrajectory } from "../observability/trajectory.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
+import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
@@ -59,6 +60,20 @@ async function main(): Promise<void> {
 		spec.outputContract === undefined
 			? undefined
 			: JSON.parse(await readFile(resolve(dirname(values.spec as string), spec.outputContract.schema), "utf8"));
+
+	// Task 15d(根因修复)+ 审查 Important-3:systemPrompt / appendSystemPrompt 此前原样透传给
+	// pi —— pi 的 resolvePromptInput(resource-loader.ts:53-67)是
+	// `existsSync(input) ? read : input`,路径读不到就把路径字符串本身当 prompt 正文,不抛
+	// 也不告警。resolveSpecPromptPaths(../spec/resolve-prompt-paths.ts)构造期主动 readFile,
+	// 读不到就抛,与 server/main.ts 共用同一份实现——该模块只依赖 node:fs 系与
+	// ../spec/types.ts,不碰 @hono/node-server / node:sqlite,所以 import 它不违反上面
+	// "serve" 分支才动态 import "./serve.ts" 这条纪律(避免单跑 CLI 背上 server 的重依赖)。
+	// ⚠️ 与上面 outputContractSchema 那条警告同理:eval/main.ts 会把 spec 重新落盘成
+	// outDir 下的临时文件,届时 dirname(values.spec) 指向的是 outDir 而不是原始 specsDir——
+	// 如果未来某个经这条路径跑的 spec 声明了 systemPrompt / appendSystemPrompt,路径需要
+	// 提前解析好再写进临时 spec。目前 specs/blackbox-eval.json(唯一走 eval 路径的 spec)
+	// 没有声明这两个字段,这条留给引入它的人。
+	await resolveSpecPromptPaths(spec, dirname(values.spec as string));
 
 	const toolsets = new ToolsetRegistry();
 	toolsets.register(

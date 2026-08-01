@@ -1,9 +1,26 @@
 import { Value } from "typebox/value";
 import type { FinalJudge, JudgeContext, JudgeVerdict } from "./final-judge.ts";
 
+export type JsonBlockResult =
+	| { kind: "ok"; value: unknown }
+	| { kind: "unparsable"; error: string; snippet: string }
+	| { kind: "absent" };
+
+const SNIPPET_RADIUS = 80;
+
+/** 从 V8 的 "…at position 2532 (line 80 column 10)" 里取位置;取不到返回 0。 */
+function parseErrorPosition(message: string): number {
+	const m = /at position (\d+)/.exec(message);
+	return m ? Number(m[1]) : 0;
+}
+
 /**
  * 从助手文本里挖出 JSON。允许三种形态:裸对象、```json 围栏、无标签围栏。
- * 挖不到返回 undefined —— 调用方据此判"未找到 JSON",不要和"JSON 不合 schema"混为一谈。
+ *
+ * **三态而非二态**:`absent`(压根没有花括号,模型输出的是散文)与 `unparsable`
+ * (有花括号但 JSON 坏了)必须分开 —— 前者没有解析错误可报,后者有,而 C6 的 followUp
+ * 要靠后者告诉模型错在第几个字符。合并成一个 undefined 就是把这条信息扔掉,那正是
+ * 第 7 次真 run 只能拿到「未找到 JSON 块」的原因。
  *
  * candidates 的顺序是 `[围栏内容, 原文本]`——**实测过**这不是两次对称的尝试:
  * - 围栏内容本身不含花括号(比如模型贴的是一段非 JSON 的代码块)时,第一个候选在
@@ -14,29 +31,91 @@ import type { FinalJudge, JudgeContext, JudgeVerdict } from "./final-judge.ts";
  *   **包住**围栏里那段坏内容(原文本本来就包含整个围栏),回退候选截出来的还是同一段坏
  *   JSON。**实测这种情况下 `catch` 分支恢复不了**——保留第二个候选只是为了上面那种
  *   "围栏非 JSON + 裸 JSON 兜底" 的场景,不是为了"从损坏的围栏里抢救"。
+ *   ⇒ 因此 `unparsable` 报的是**最后一个候选**的错误。
  */
-export function extractJsonBlock(text: string): unknown {
+export function extractJsonBlock(text: string): JsonBlockResult {
 	const fenced = /```(?:json)?\s*\n([\s\S]*?)\n?```/i.exec(text);
 	const candidates = fenced?.[1] === undefined ? [text] : [fenced[1], text];
+	let lastFailure: { error: string; snippet: string } | undefined;
 	for (const candidate of candidates) {
 		const trimmed = candidate.trim();
 		const start = trimmed.indexOf("{");
 		const end = trimmed.lastIndexOf("}");
 		if (start < 0 || end <= start) continue;
+		const slice = trimmed.slice(start, end + 1);
 		try {
-			return JSON.parse(trimmed.slice(start, end + 1));
-		} catch {
-			// 只有"围栏内容含花括号但解析失败"这种输入会走到这里;实测这种情况下原文本
-			// 兜底同样会失败(见上面函数注释),这里只是诚实地"再试一次",不是号称能恢复。
+			return { kind: "ok", value: JSON.parse(slice) };
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const at = parseErrorPosition(message);
+			lastFailure = {
+				error: message,
+				snippet: slice.slice(Math.max(0, at - SNIPPET_RADIUS), at + SNIPPET_RADIUS),
+			};
 		}
 	}
-	return undefined;
+	return lastFailure ? { kind: "unparsable", ...lastFailure } : { kind: "absent" };
 }
 
 interface ContractShape {
 	finish_reason?: unknown;
 	basis?: unknown;
 	exhausted_scope?: unknown;
+}
+
+interface KeyDiff {
+	missing: string[];
+	extra: string[];
+}
+
+/**
+ * 沿 instancePath 同步走 schema 与 value,算该层对象的键差集。
+ *
+ * **这不是 schema 解析器,只认 `properties` 与 `items` 两种走法。** 遇到
+ * `$ref` / `allOf` / `oneOf` / `anyOf` 立刻放弃(返回 undefined),followUp 退回只带
+ * instancePath。宁可少给一份差集,也不给一份错的 —— 错的差集会让模型去改一个没错的字段。
+ *
+ * `extra` **只在 `additionalProperties === false` 时才报**:schema 允许额外属性时,
+ * 多出来的键根本不是错误,报出来是诬告。
+ */
+function keyDiffAt(schema: unknown, value: unknown, instancePath: string): KeyDiff | undefined {
+	const segments = instancePath.split("/").filter((s) => s.length > 0);
+	let node: Record<string, unknown> | undefined = isRecord(schema) ? schema : undefined;
+	let current: unknown = value;
+	for (const segment of segments) {
+		if (node === undefined) return undefined;
+		if (node.$ref !== undefined || node.allOf !== undefined || node.oneOf !== undefined || node.anyOf !== undefined) {
+			return undefined;
+		}
+		if (/^\d+$/.test(segment) && isRecord(node.items)) {
+			node = node.items;
+			current = Array.isArray(current) ? current[Number(segment)] : undefined;
+			continue;
+		}
+		const properties = isRecord(node.properties) ? node.properties : undefined;
+		const next = properties?.[segment];
+		if (!isRecord(next)) return undefined;
+		node = next;
+		current = isRecord(current) ? current[segment] : undefined;
+	}
+	if (node === undefined || !isRecord(current)) return undefined;
+	const properties = isRecord(node.properties) ? node.properties : undefined;
+	if (properties === undefined) return undefined;
+	const required = Array.isArray(node.required) ? node.required.filter((k): k is string => typeof k === "string") : [];
+	const missing = required.filter((key) => !(key in current));
+	const extra = node.additionalProperties === false ? Object.keys(current).filter((key) => !(key in properties)) : [];
+	return missing.length === 0 && extra.length === 0 ? undefined : { missing, extra };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function describeKeyDiff(diff: KeyDiff): string {
+	const parts: string[] = [];
+	if (diff.missing.length > 0) parts.push(`缺少 ${diff.missing.join("、")}`);
+	if (diff.extra.length > 0) parts.push(`多出 ${diff.extra.join("、")}`);
+	return parts.join(";");
 }
 
 /**
@@ -97,24 +176,43 @@ export function createOutputContractJudge(options: { schema: unknown; maxRepairA
 		// 输出不合契约是硬失败:Java 拿不到能解析的结果,不能假装成功。
 		onExhausted: "error",
 		judge: async (context: JudgeContext): Promise<JudgeVerdict> => {
-			const json = extractJsonBlock(context.lastAssistantText);
-			if (json === undefined) {
+			const extracted = extractJsonBlock(context.lastAssistantText);
+			if (extracted.kind === "absent") {
 				return {
 					ok: false,
 					detail: "未找到 JSON 块",
 					followUp: "输出不符合契约:未找到 JSON 块。请仅输出符合 schema 的 JSON,不要夹带其他文字。",
 				};
 			}
+			if (extracted.kind === "unparsable") {
+				const detail = `JSON 解析失败:${extracted.error}`;
+				return {
+					ok: false,
+					detail,
+					followUp:
+						`输出不符合契约:${detail}\n出错位置附近的原文:\n${extracted.snippet}\n` +
+						`请修正这处语法错误后重新输出完整 JSON。`,
+				};
+			}
+			const json = extracted.value;
 
 			// typebox 的 Value.Check 直接吃 draft-07 裸 schema(enum / additionalProperties /
 			// type:["string","null"] 均正确),不必再引第二个校验库。错误对象的路径字段是
 			// instancePath,不是 path。
 			if (!Value.Check(options.schema as never, json)) {
 				const first = [...Value.Errors(options.schema as never, json)][0];
-				const where =
-					first?.instancePath === "" || first?.instancePath === undefined ? "(root)" : first.instancePath;
+				const instancePath = first?.instancePath ?? "";
+				const where = instancePath === "" ? "(root)" : instancePath;
 				const detail = `${where} ${first?.message ?? "schema 校验失败"}`;
-				return { ok: false, detail, followUp: `输出不符合契约:${detail}。请仅输出符合 schema 的 JSON。` };
+				// 差集按**第一条错误所指的那一层**算,不是恒取顶层:第 5 次真 run 的错误在
+				// /basis/0,恒取顶层会给出一份与病因无关的差集,把模型引向没错的字段。
+				const diff = keyDiffAt(options.schema, json, instancePath);
+				const diffText = diff ? `。该层键差异:${describeKeyDiff(diff)}` : "";
+				return {
+					ok: false,
+					detail,
+					followUp: `输出不符合契约:${detail}${diffText}。请仅输出符合 schema 的 JSON。`,
+				};
 			}
 
 			const conditional = checkConditional(json as ContractShape, context.clauseIds);

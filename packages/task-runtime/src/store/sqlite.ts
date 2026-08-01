@@ -115,6 +115,7 @@ export function createSqliteRunStore(path: string): RunStore {
 		WHERE status IN ('queued', 'running')
 	`);
 	const insertEvent = db.prepare("INSERT INTO run_events (run_id, seq, ts, type, payload) VALUES (?, ?, ?, ?, ?)");
+	const selectEvents = db.prepare("SELECT seq, ts, type, payload FROM run_events WHERE run_id = ? ORDER BY seq");
 
 	function requireByRunId(runId: string): RunRecord {
 		const row = byRunId.get(runId) as RunRow | undefined;
@@ -204,6 +205,10 @@ export function createSqliteRunStore(path: string): RunStore {
 				}
 				throw err;
 			}
+		},
+		listEvents(runId: string) {
+			const rows = selectEvents.all(runId) as Array<{ seq: number; ts: number; type: string; payload: string }>;
+			return rows.map((row) => ({ seq: row.seq, ts: row.ts, type: row.type, payload: row.payload }));
 		},
 		close() {
 			if (closed) return;

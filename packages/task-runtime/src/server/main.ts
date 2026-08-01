@@ -5,6 +5,7 @@ import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
+import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
 import { createSqliteRunStore } from "../store/sqlite.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
@@ -151,6 +152,15 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 	const skillPaths = new Map<string, string[]>();
 	for (const name of (await readdir(options.specsDir)).filter((n) => n.endsWith(".json"))) {
 		const parsed = JSON.parse(await readFile(join(options.specsDir, name), "utf8")) as SpecFile;
+		// systemPrompt / appendSystemPrompt 与 skills / outputContract.schema 同一条纪律:
+		// 构造期把相对路径读成正文,读不到就响亮失败——见 resolveSpecPromptPaths(现在是
+		// ../spec/resolve-prompt-paths.ts 的独立模块)的注释。这行调用被去掉的话,
+		// test/server-startup.test.ts 里
+		// "createDefaultRuntimeFactory - systemPrompt / appendSystemPrompt resolution" 那个
+		// describe 的第一条("fails at construction time when systemPrompt cannot be read")
+		// 会翻红——已实测验证(见 task-15d-report.md 的 Critical-1 变异检验记录),不是没验过
+		// 的覆盖率承诺。
+		await resolveSpecPromptPaths(parsed, options.specsDir);
 		specFiles.set(parsed.id, parsed);
 		if (parsed.skills?.length) {
 			skillPaths.set(

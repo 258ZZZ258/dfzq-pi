@@ -15,6 +15,19 @@ import type { ToolsetRegistry } from "../toolsets/registry.ts";
 import { instantiatePlugins, type PluginContext, type PluginEntry, type PluginRegistry } from "./plugin-registry.ts";
 import { LIMITS_PLUGIN_NAME, type LimitsOptions } from "./plugins/limits.ts";
 
+/**
+ * Task 18c:`callTool`(下面 :163 起)打给一次插件驱动的工具调用发一次「开始」、一次
+ * 「结束」的合成事件,喂给 `AssembleOptions.emitPluginToolEvent`。形状照抄 pi 的
+ * `ToolExecutionStartEvent` / `ToolExecutionEndEvent`,但**只留 `toolName`(结束事件再加
+ * `isError`)**——不带 `args`/`result`。这与 18b 落库前脱敏投影的白名单
+ * (`server/run-manager.ts` 的 `toStoredEvent`:工具名 · isError · 事件类型 · seq · ts)
+ * 是同一条纪律:调用参数可能是检索词、返回体可能是制度条款正文,`_audit`「只记标识不记内容」
+ * 那条规矩对合成事件同样成立,不能指望下游落库时再帮它脱一次敏。
+ */
+export type PluginToolCallEvent =
+	| { type: "tool_execution_start"; toolName: string }
+	| { type: "tool_execution_end"; toolName: string; isError: boolean };
+
 export interface AssembleOptions {
 	spec: RuntimeSpec;
 	profile: ProviderProfile;
@@ -38,6 +51,24 @@ export interface AssembleOptions {
 		modelRuntime: ModelRuntime;
 		model: NonNullable<Parameters<typeof createAgentSession>[0]>["model"];
 	};
+	/**
+	 * Task 18c:插件经 `PluginContext.callTool` 发起的调用直接打 `tool.execute(...)`,
+	 * 绕过 pi 的 agent loop —— 不产生 `tool_execution_*` 事件,`run_events` 看不到,MCP 侧
+	 * 审计日志却记得到(C3 `sufficiency-gate` 判官的探针调用正是这样漏出 A6 对账缺口的)。
+	 *
+	 * 这个回调由 `session-runtime.ts` 提供(它握着 `Runtime.subscribe()` 的 `listeners`
+	 * 集合与那个单调 `seq` 计数器),`callTool` 在调用前后各发一次,由调用方补上 `RuntimeEvent`
+	 * 的信封(runId/specId/seq/ts)。
+	 *
+	 * 🔴 **硬性设计约束**:这条回调只能接到 `listeners`,绝不能接进 pi 的
+	 * `session.subscribe()` 那条通路 —— 那条是 C6 反幻觉校验 `collectClauseIds` 的数据源。
+	 * 若插件探针取回的内容也算进 `clauseIds`,等于扩大了模型可合法引用的 clause_id 集合、
+	 * 削弱反幻觉兜底;这条回调的职责仅仅是补观测,不改 C6 语义。约束是否守住由
+	 * `session-runtime.ts` 那侧的接线负责,这里只负责"调用前后各发一次、不多发字段"。
+	 *
+	 * 缺省时(比如测试直接调 `assemble()` 且不关心事件流)`callTool` 静默跳过发射。
+	 */
+	emitPluginToolEvent?: (event: PluginToolCallEvent) => void;
 }
 
 export interface Assembled {
@@ -164,12 +195,25 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 				const tool = byName.get(name);
 				if (!tool) {
 					// 装配错误要响要早:插件声明了依赖某工具,而 spec 的 toolset 没提供它。
+					// 工具从未被调用,不发合成事件 —— 没有发生过的执行没有事件可报。
 					throw new Error(
 						`Plugin requested tool "${name}", which this run's toolset does not provide ` +
 							`(available: ${formatNames([...byName.keys()])})`,
 					);
 				}
-				const result = await tool.execute("plugin", args as never, undefined, undefined, {} as never);
+				// Task 18c:这次调用打到真实 MCP server(审计日志记得到),但 tool.execute()
+				// 直接调、绕过 pi 的 agent loop,不会自己产生 tool_execution_* 事件 —— 这里手动
+				// 补一对,前后各发一次,失败路径(catch 分支)也要发,否则一次失败的探针会在
+				// pi 侧凭空消失、A6 又对不上。
+				options.emitPluginToolEvent?.({ type: "tool_execution_start", toolName: name });
+				let result: Awaited<ReturnType<typeof tool.execute>>;
+				try {
+					result = await tool.execute("plugin", args as never, undefined, undefined, {} as never);
+				} catch (error) {
+					options.emitPluginToolEvent?.({ type: "tool_execution_end", toolName: name, isError: true });
+					throw error;
+				}
+				options.emitPluginToolEvent?.({ type: "tool_execution_end", toolName: name, isError: false });
 				const text = extractText(result.content);
 				try {
 					return JSON.parse(text);

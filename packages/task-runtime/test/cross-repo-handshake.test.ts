@@ -10,26 +10,31 @@ import { McpClient } from "../src/toolsets/mcp/client.ts";
  * 今天握得上,但没有余量。SDK 下一个大版本若把它移出握手集合,启动即失败,而两侧各自的
  * 单元测试都不会红。
  *
- * 需要三个 env(缺任一即 skip):
+ * 需要四个 env(缺任一即 skip):
  *   DFZQ_AUDIT_AI_PYTHON   fork 的解释器
  *   DFZQ_AUDIT_AI_ROOT     fork 仓根
  *   PIPELINE_CONFIG_DIR    指向改过 model_name 的 config 副本(规格 §0.3)
+ *   POLICY_MCP_AUDIT_LOG   A6 对账落点;C1 未配置即 fail-closed 启动失败(server.py
+ *                          require_audit_log_path())——所以这里必须真带上,不能只是
+ *                          为了让本测试跑起来而放宽
  *
  * ⚠ **skip 不等于通过。** CI 上没有 dfzq-audit-ai 所以跳过,但本地必须真跑过 ——
  * 出口判据里单列了这一条。
  */
 const PY = process.env.DFZQ_AUDIT_AI_PYTHON;
 const ROOT = process.env.DFZQ_AUDIT_AI_ROOT;
-const available = Boolean(PY && ROOT && existsSync(PY) && existsSync(ROOT));
+const AUDIT = process.env.POLICY_MCP_AUDIT_LOG;
+const available = Boolean(PY && ROOT && AUDIT && existsSync(PY) && existsSync(ROOT));
 
 function spawnC1(): Promise<McpClient> {
 	return McpClient.spawn({
 		id: "policy-query",
 		command: PY as string,
 		args: ["-m", "query.mcp.server"],
-		// McpClient 不继承 process.env(白名单 env,见 client.ts),这三项要显式带上。
+		// McpClient 不继承 process.env(白名单 env,见 client.ts),这四项要显式带上。
 		env: {
 			PIPELINE_CONFIG_DIR: process.env.PIPELINE_CONFIG_DIR ?? "",
+			POLICY_MCP_AUDIT_LOG: process.env.POLICY_MCP_AUDIT_LOG ?? "",
 			HF_HUB_OFFLINE: "1",
 			PATH: process.env.PATH ?? "",
 		},

@@ -106,6 +106,27 @@ describe("result-budget", () => {
 		expect(out.content).toBe("纯文本结果");
 	});
 
+	// 护栏口径的边界凭证:实测值不截、阈值 +1 截。这是 result-budget 在
+	// 当前语料下唯一的「它真的会截」的证据 —— spec 的阈值本身永不触发。
+	// 7700 = get_clause_detail 真环境实测 5491 字符(8 个 clause_id 一次取全,见
+	// specs/policy-query.json 的 $comment)× 1.4 向上取整到百位。
+	it("leaves the measured payload untouched and truncates one char past the guardrail", async () => {
+		const handler = instantiate({ maxHits: {}, maxChars: { get_clause_detail: 7700 } });
+		const measured = (await handler({
+			toolName: "get_clause_detail",
+			content: "x".repeat(5491),
+			isError: false,
+		})) as { content: string };
+		expect(measured.content).not.toContain("已截断");
+
+		const over = (await handler({
+			toolName: "get_clause_detail",
+			content: "x".repeat(7701),
+			isError: false,
+		})) as { content: string };
+		expect(over.content).toContain("已截断,原长 7701 字符");
+	});
+
 	// pi 真实的 tool_result 事件把 content 定成 (TextContent | ImageContent)[]——见
 	// result-budget.ts 里 extractText / rewrapContent 的注释:agent-session.js 的
 	// afterToolCall 钩子直接透传 AgentToolResult.content,而 task-runtime 自己的 MCP

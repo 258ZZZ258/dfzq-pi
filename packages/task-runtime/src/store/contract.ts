@@ -68,5 +68,13 @@ export interface RunStore {
 	/** 启动时 status IN ('queued','running') → error,返回受影响行数。 */
 	recoverStaleRuns(now: number): number;
 	appendEvents(runId: string, events: StoredEvent[]): void;
+	/**
+	 * 按 seq 升序读回该 run 落库的事件(task-18b 复审 Important-3)。serve 路径下这是
+	 * `reconcile()` 的 pi 侧数据源 —— 与 CLI 路径下 `readTrajectory()` 读 trajectory
+	 * JSONL 文件是同一个角色,只是数据来源从文件换成了这张表(见
+	 * `observability/reconcile.ts` 的 `reconcileRunEvents`)。不存在的 runId 返回空数组,
+	 * 不抛 —— 与 `findByRunId` 的「查无则 undefined」同一条纪律,读路径不该因为查不到就报错。
+	 */
+	listEvents(runId: string): StoredEvent[];
 	close(): void;
 }

@@ -1,11 +1,44 @@
 import { randomUUID } from "node:crypto";
-import type { RunResult, Runtime } from "../runtime/contract.ts";
-import type { RunStore, StoredRunStatus } from "../store/contract.ts";
+// 复用 trajectory.ts 的落盘白名单(与其导出复用的注释同一处道理):两套白名单会漂移。
+import { shouldRecord } from "../observability/trajectory.ts";
+import type { RunResult, Runtime, RuntimeEvent } from "../runtime/contract.ts";
+import type { RunStore, StoredEvent, StoredRunStatus } from "../store/contract.ts";
 // 新 submit() 直接判 admission.kind 三支,不再需要 isRejection(留着会是未使用导入,biome 报错)
 import type { Gate, GateRejection, GateTicket } from "./gate.ts";
 // 终态判据只应有一份定义(见 routes.ts 的 isTerminal 注释);这里不再自己维护第二份
 // TERMINAL 白名单,避免两处未来各自漏改、方向还相反。
 import { isTerminal } from "./routes.ts";
+
+/**
+ * 落库前的脱敏投影(task-18b 硬性约束,见 brief「必须脱敏」一节)。
+ *
+ * `tool_execution_end` 的原始 payload 带工具返回体(制度条款正文),`tool_execution_start`
+ * 带调用参数(可能是检索词)—— 两者都不得落库。`StoredEvent.payload` 的契约注释明写「已
+ * 序列化、已脱敏」(store/contract.ts:42-43),A6 要对账的是**调用序列**,不是调用内容。
+ * 因此这里只从原始 payload 里摘 `toolName` / `isError` 两个字段(pi 的
+ * ToolExecutionStartEvent/ToolExecutionEndEvent 都带 `toolName`,后者另带 `isError`;
+ * `args`/`result` 一律不进投影),再拼上事件类型、seq、ts —— 与 brief 明列的白名单
+ * (工具名 · isError · 事件类型 · seq · ts)逐项对应。
+ */
+function toStoredEvent(event: RuntimeEvent): StoredEvent {
+	const raw = event.payload;
+	const toolName =
+		typeof raw === "object" && raw !== null && typeof (raw as { toolName?: unknown }).toolName === "string"
+			? (raw as { toolName: string }).toolName
+			: undefined;
+	const isError =
+		typeof raw === "object" && raw !== null && typeof (raw as { isError?: unknown }).isError === "boolean"
+			? (raw as { isError: boolean }).isError
+			: undefined;
+	const sanitized: { type: string; seq: number; ts: number; toolName?: string; isError?: boolean } = {
+		type: event.type,
+		seq: event.seq,
+		ts: event.ts,
+	};
+	if (toolName !== undefined) sanitized.toolName = toolName;
+	if (isError !== undefined) sanitized.isError = isError;
+	return { seq: event.seq, ts: event.ts, type: event.type, payload: JSON.stringify(sanitized) };
+}
 
 /**
  * Java jCasbin 预计算的授权位(设计文档 §6.4.1 的 `filters`)。**agent 不可见** ——
@@ -126,6 +159,34 @@ export class RunManager {
 		return this.gate.queueDepth;
 	}
 
+	/**
+	 * serve 侧事件落库(task-18b):A6 要求 pi 侧的工具调用事件流与 MCP 侧审计日志逐条
+	 * 对得上,而这条链路此前从未接线 —— `appendEvents` 声明了、实现了,零调用点。
+	 *
+	 * 逐条写(不缓冲到 finish 批量写):每条白名单事件到达就立即调一次
+	 * `store.appendEvents(runId, [...])`。取舍见任务报告,要点是——进程真崩溃(kill -9 /
+	 * OOM)时,这个选择丢的只是"崩溃那一刻正在处理、还没来得及跑进这个回调"的那一条事件之前
+	 * 的部分永远不丢;换成缓冲到 finish 才写,会让整个 run 的事件史随崩溃一次性清零,而 run
+	 * 本身的终态行本来就可能因为同一次崩溃留在 running/queued(重启由 recoverStaleRuns 收尾)
+	 * ——那种情况下逐条写至少留得下"崩溃前已经发生过什么"这份对账线索,批量写则什么都留不下。
+	 *
+	 * 落库失败(store 已 close / 磁盘满等)只记日志、不重新抛出 —— `Runtime.subscribe` 的
+	 * fan-out(session-runtime.ts 对应位置)本身已经给每个监听器包了 try/catch、抛了也会继续
+	 * 派发给其余监听器,所以这里不重新抛不是在补那一层的洞。这里的理由是本地的:不依赖上游
+	 * fan-out 的保护、就近处理并打一条带 runId 的日志 —— 一条事件落库失败不该有牵连同一个
+	 * run 上其余监听器、或者让调用方多一层要处理的异常这么大的影响面。
+	 */
+	private subscribeEvents(runId: string, runtime: Runtime): () => void {
+		return runtime.subscribe((event) => {
+			if (!shouldRecord(event.type)) return;
+			try {
+				this.store.appendEvents(runId, [toStoredEvent(event)]);
+			} catch (error) {
+				console.error(`[RunManager] failed to persist event for run "${runId}"; this event is dropped`, error);
+			}
+		});
+	}
+
 	async submit(req: SubmitRequest): Promise<SubmitOutcome> {
 		const runId = this.newRunId();
 		const created = this.store.insertQueued({
@@ -236,6 +297,12 @@ export class RunManager {
 			throw error;
 		}
 		entry.runtime = runtime;
+		// 接线点(task-18b):装配已成功、drive() 尚未开始。从这里往下有三条退出路径
+		// (本分支的立即取消、下面 markRunning 失败、以及正常路径的 drive()),订阅建立之后
+		// 的每一条都必须解得掉 —— 三条都已核实覆盖(task-18b 复审 Important-1 修复前,这一条
+		// 分支里 finishAsAborted() 抛出时会跳过下面的 unsubscribeEvents()/dispose(),已用
+		// try/finally 补上,不再依赖"顺序执行到最后一行"这个脆弱前提)。
+		const unsubscribeEvents = this.subscribeEvents(runId, runtime);
 
 		// 装配成功但 run() 还没起步时已被 cancel:runtime 建好了,但对 stub 和真实的
 		// SessionRuntime 而言,run() 开始前调用 abort() 都只是 no-op(没有正在跑的 prompt
@@ -245,9 +312,17 @@ export class RunManager {
 		// 和「markRunning 前」之间)。因此必须像排队分支一样,直接按已取消收尾、绝不调用 run()。
 		if (entry.cancelRequested) {
 			await runtime.abort().catch(() => {});
-			const result = await this.finishAsAborted(runId, req.specId, ticket);
-			await runtime.dispose().catch(() => {});
-			return result;
+			// try/finally(task-18b 复审 Important-1):finishAsAborted() 在 store.finish()
+			// 落库失败时会重抛(见该函数内部注释),重抛此前这里是三条顺序语句,一抛就会跳过
+			// 下面的 unsubscribeEvents()/dispose() —— 悬空的订阅本身影响有限(run() 从未被
+			// 调用,不会再收到事件,live.delete 之后 runtime 也可被 GC),但 dispose() 被跳过
+			// 是真的漏:MCP 子进程不会被回收。finally 保证两者无条件执行。
+			try {
+				return await this.finishAsAborted(runId, req.specId, ticket);
+			} finally {
+				unsubscribeEvents();
+				await runtime.dispose().catch(() => {});
+			}
 		}
 
 		try {
@@ -264,10 +339,11 @@ export class RunManager {
 			);
 			this.live.delete(runId);
 			ticket.release();
+			unsubscribeEvents();
 			await runtime.dispose().catch(() => {});
 			throw error;
 		}
-		return this.drive(runId, runtime, req.input, ticket);
+		return this.drive(runId, runtime, req.input, ticket, unsubscribeEvents);
 	}
 
 	/** 排队中 / 装配后 run() 尚未起步即被取消的共同收尾:直接落库为 aborted,不调用 run()。 */
@@ -299,7 +375,13 @@ export class RunManager {
 		return result;
 	}
 
-	private async drive(runId: string, runtime: Runtime, input: string, ticket: GateTicket): Promise<RunResult> {
+	private async drive(
+		runId: string,
+		runtime: Runtime,
+		input: string,
+		ticket: GateTicket,
+		unsubscribeEvents: () => void,
+	): Promise<RunResult> {
 		try {
 			const result = await runtime.run(input, { runId });
 			this.store.finish(runId, result, this.now());
@@ -320,9 +402,12 @@ export class RunManager {
 			}
 			throw error;
 		} finally {
-			// 结果已落盘 → 可立即驱逐 runtime(设计文档 §4.1)。
+			// 结果已落盘 → 可立即驱逐 runtime(设计文档 §4.1)。解订阅放在这里(task-18b):
+			// 与 live.delete / ticket.release 同一处收尾,run() 正常返回、抛错两条路径都
+			// 无条件走到这里,确保事件订阅不会在 runtime 被驱逐之后继续悬空。
 			this.live.delete(runId);
 			ticket.release();
+			unsubscribeEvents();
 			await runtime.dispose().catch(() => {});
 		}
 	}

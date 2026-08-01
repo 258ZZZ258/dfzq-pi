@@ -16,9 +16,10 @@ JSON。
 
 这不是保守起见的额外判断,而是一条真实踩过的坑:C6(输出契约判官,`onExhausted: "error"`)判定输出不合规时,
 run 的终态是 `"error"`,但产生这份输出的助手文本仍然会**原样**写进 `output`。早先的实现只看 `output` 里能不能
-抠出 JSON、不看 `status`,于是被 C6 拒掉的 JSON(实测样本 `basis[0].clause_id = "臆造-999"` —— 正是反幻觉
-兜底要拦的那一类)会原样进 `answer`。现在 `toWireResult`(`packages/task-runtime/src/server/routes.ts`)的第一行
-判断就是这道闸门:
+抠出 JSON、不看 `status`,于是被 C6 拒掉的 JSON —— 例如 `basis[]` 里引用了本次检索未命中过的 `clause_id`,
+正是反幻觉兜底(§2 的"反幻觉"一条)要拦截的那一类 —— 会原样进 `answer`。这条机制记录在
+`packages/task-runtime/src/runtime/contract.ts:51-57` 的复审注释里。现在 `toWireResult`
+(`packages/task-runtime/src/server/routes.ts`)的第一行判断就是这道闸门:
 
 ```ts
 export function toWireResult(result: RunResult): RunResult {
@@ -60,8 +61,8 @@ export function toWireResult(result: RunResult): RunResult {
 ## 2. `answer` 的形状(policy-query 的输出契约)
 
 `answer` 的值来自 `output` 的 JSON 块,且已经过 C6(输出契约判官)按
-`specs/policy-query/output-contract.schema.json` 校验通过(§3 说明"通过"具体保证了什么、没保证什么)。当前
-唯一接入 Java 的 taskKind 是 `policy-query`,其 `answer` 形状:
+`specs/policy-query/output-contract.schema.json` 校验通过(§3 说明"通过"具体保证了什么、没保证什么)。本文档
+描述的 `answer` 形状,是 `policy-query` 这一个 spec 的输出契约决定的:
 
 ```jsonc
 {
@@ -118,7 +119,7 @@ export function toWireResult(result: RunResult): RunResult {
 | 1 | **`status !== "completed"`** | `status` 是 `"aborted"` / `"limit_exceeded"` / `"error"`(含 C6 判定不合规、reprompt 次数耗尽那一类) | 会 —— 这是最外层闸门,见 §0 |
 | 2 | `output` 本身是 `undefined`,或 `output` 有内容但挖不出花括号包裹的候选(`extractJsonBlock` 返回 `absent`) | 助手最终没产出文本,或产出的是纯散文,没有 `{…}` | 理论上不会:见下方说明 |
 | 3 | 花括号配对但 `JSON.parse` 失败(`extractJsonBlock` 返回 `unparsable`) | 挖出的候选语法不合法 | 理论上不会:见下方说明 |
-| 4 | **spec 未声明 `outputContract`** | 该 taskKind 对应的 `RuntimeSpec` 没有 `outputContract` 字段,C6 根本不会挂载(`session-runtime.ts`),`status` 可以是 `"completed"` 而 `output` 从未经过任何 schema 校验,#2/#3 才会真的发生 | 不适用 —— `policy-query` 的 spec 文件(`specs/policy-query.json`)声明了 `outputContract`。仓库里目前只有 `blackbox-eval` 这个 taskKind 走这条路,且不对 Java 开放 |
+| 4 | **spec 未声明 `outputContract`** | 该 taskKind 对应的 `RuntimeSpec` 没有 `outputContract` 字段,C6 根本不会挂载(`session-runtime.ts`),`status` 可以是 `"completed"` 而 `output` 从未经过任何 schema 校验,#2/#3 才会真的发生 | 不适用于 `policy-query` —— 它的 spec 文件(`specs/policy-query.json`)声明了 `outputContract`。仓库里目前只有 `blackbox-eval` 这个 taskKind 没声明;`loadSpecRouter` 对 `specsDir` 下的 spec 一视同仁地加载,没有按 taskKind 的白名单/黑名单,`blackbox-eval` 是否会被路由完全取决于运维配置的 `specsDir` 包含哪些文件,这不是代码层面的强制隔离 |
 
 **#2/#3 对 `policy-query` 只是防御性表格项,不是已观察到的行为**:只要这个 taskKind 继续声明
 `outputContract`(现状如此),`status === "completed"` 就意味着 C6 已经用同一个提取函数(`extractJsonBlock`)

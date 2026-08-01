@@ -40,15 +40,17 @@
   },
   "resultPolicy": {
     "name": "result-budget",
+    "$comment": "护栏口径,当前语料下**不触发**。真环境实测(query=\"上市公司大股东通过集中竞价减持股份,需要提前多久预披露?\",corpus_types=[\"external\"],与 Task 15f 同一道已验证切题的问题):search_policy 8 条 / 2109 字符(qcfg.topk=8 封顶,agent 控制不了,只有把 topk 调到 >12 才会触发)· get_clause_detail(一次取全 8 个 clause_id)5491 字符 · enumerate_clauses 50 条 / 10638 字符(qcfg.enumerate_topk=50 封顶,同样是配置项而非语料量,只有调大该配置才会触发)· search_cases 无实测(cases 表 0 行,恒零命中,阈值随 search_policy 定)。阈值 = 实测 × 1.4,向上取整到百位,余量留给语料扩大与检索排序抖动。enumerate_clauses 单条返回的字符数(10638)远超 search_policy 的量级 —— 若挂在 maxChars.default(为 search_policy/search_cases 校准的 3000)下会导致 enumerate_clauses 的正常输出被截断,所以单独给它一个 maxChars.enumerate_clauses 键,不共用 default。截断能力的凭证在 test/result-budget.test.ts 的构造用例,不靠真语料触发 —— 压到真语料会截的值会截掉真依据,直接伤 §8.2 的答案质量。",
     "options": {
       "maxHits": {
-        "search_policy": 20,
-        "search_cases": 20,
-        "enumerate_clauses": 50
+        "search_policy": 12,
+        "search_cases": 12,
+        "enumerate_clauses": 70
       },
       "maxChars": {
-        "get_clause_detail": 8000,
-        "default": 4000
+        "get_clause_detail": 7700,
+        "enumerate_clauses": 14900,
+        "default": 3000
       }
     }
   },

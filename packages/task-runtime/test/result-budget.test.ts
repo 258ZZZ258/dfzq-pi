@@ -114,6 +114,27 @@ describe("result-budget", () => {
 	// 习惯;这一条专门盯住"喂真实形状的数组,预算逻辑照样生效,且原样按数组封回去"——
 	// 删掉 extractText/rewrapContent 的形状适配、退回 `event.content ?? ""` 会让这条
 	// 用例翻红(content.trim is not a function)。
+	// 护栏口径的边界凭证:实测值不截、阈值 +1 截。这是 result-budget 在
+	// 当前语料下唯一的「它真的会截」的证据 —— spec 的阈值本身永不触发。
+	// 7700 = get_clause_detail 真环境实测 5491 字符(8 个 clause_id 一次取全,见
+	// specs/policy-query.json 的 $comment)× 1.4 向上取整到百位。
+	it("leaves the measured payload untouched and truncates one char past the guardrail", async () => {
+		const handler = instantiate({ maxHits: {}, maxChars: { get_clause_detail: 7700 } });
+		const measured = (await handler({
+			toolName: "get_clause_detail",
+			content: "x".repeat(5491),
+			isError: false,
+		})) as { content: string };
+		expect(measured.content).not.toContain("已截断");
+
+		const over = (await handler({
+			toolName: "get_clause_detail",
+			content: "x".repeat(7701),
+			isError: false,
+		})) as { content: string };
+		expect(over.content).toContain("已截断,原长 7701 字符");
+	});
+
 	it("also budgets pi's real array-shaped content and mirrors the array shape back", async () => {
 		const handler = instantiate({ maxHits: { search_policy: 2 }, maxChars: { default: 10_000 } });
 		const payload = JSON.stringify({ total: 5, hits: [1, 2, 3, 4, 5] });

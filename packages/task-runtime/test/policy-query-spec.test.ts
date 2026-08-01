@@ -43,6 +43,32 @@ describe("出厂 spec: policy-query.json", () => {
 		};
 		expect(schema.properties.basis.items.required).toContain("clause_id");
 	});
+
+	// 护栏口径(规格 §4.1):阈值按 实测 × 1.4 定,正常不截、异常才截。
+	// 留一组永不触发又读起来像在生效的数字,比不装这个插件更隐蔽。
+	//
+	// 真环境实测(query="上市公司大股东通过集中竞价减持股份,需要提前多久预披露?",
+	// corpus_types=["external"],与 Task 15f 同一道已验证切题的问题):
+	//   search_policy      8 条 / 2109 字符(qcfg.topk=8 封顶,agent 控制不了)
+	//   get_clause_detail  8 个 id 一次取全 / 5491 字符
+	//   enumerate_clauses  50 条 / 10638 字符(qcfg.enumerate_topk=50 封顶,同样是配置项而非
+	//                       语料量;字符数远超 search_policy 量级 —— 若挂在 maxChars.default
+	//                       下会导致它的正常输出被截断,所以单独给一个 maxChars.enumerate_clauses)
+	//   search_cases       0 条(cases 表 0 行,恒零命中,无字符信号)
+	// 阈值 = 实测 × 1.4,向上取整到百位。
+	it("sets result-budget thresholds at the measured guardrail values", () => {
+		const options = (
+			spec.resultPolicy as {
+				options: { maxHits: Record<string, number>; maxChars: Record<string, number> };
+			}
+		).options;
+		expect(options.maxHits.search_policy).toBe(12);
+		expect(options.maxHits.search_cases).toBe(12);
+		expect(options.maxHits.enumerate_clauses).toBe(70);
+		expect(options.maxChars.get_clause_detail).toBe(7700);
+		expect(options.maxChars.enumerate_clauses).toBe(14900);
+		expect(options.maxChars.default).toBe(3000);
+	});
 });
 
 const fauxProfile: ProviderProfile = {

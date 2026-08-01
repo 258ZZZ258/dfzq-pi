@@ -63,8 +63,8 @@ export interface RunResult {
 	 * 类型是 `unknown` 而非具体形状:形状由**各 spec 自己的 outputContract schema** 决定,
 	 * task-runtime 这一层不该固化某一个 spec 的形状。
 	 *
-	 * **提取不到时缺省**(output 无 JSON 块 / spec 未声明 outputContract)。run 已经完成了,
-	 * 拿不到 answer 是降级不是失败 —— 这里绝不抛。
+	 * **提取不到时缺省**(output 没有花括号包裹的候选,或候选花括号配对但解析失败)。run 已经
+	 * 完成了,拿不到 answer 是降级不是失败 —— 这里绝不抛。
 	 *
 	 * **不在这一层重新校验 schema**:C6 是唯一真相源,再验一遍等于两处定义、必然漂移。
 	 */

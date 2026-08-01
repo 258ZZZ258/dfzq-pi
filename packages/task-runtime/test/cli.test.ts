@@ -84,6 +84,66 @@ describe("cli", () => {
 		).rejects.toMatchObject({ stderr: expect.stringContaining("DFZQ_ABSENT_KEY") });
 	});
 
+	// Task 15d 复审 Critical-2 的 CLI 半边回归锁:resolveSpecPromptPaths(现在是
+	// src/spec/resolve-prompt-paths.ts,cli/main.ts 与 server/main.ts 共用同一份实现)在
+	// cli/main.ts 里的调用点(main.ts 里紧跟在 outputContractSchema 之后那一行)此前**零覆盖**
+	// ——re-reviewer 的实测:把那一行换成注释,`npm test --workspace=@dfzq/task-runtime` 一条
+	// 不红,与上一轮审查抽模块前的数字一模一样。抽模块只降低了 server/cli 两份实现漂移的风险,
+	// 不等于把 CLI 这一半的调用点接住了——这条补的正是"调用点本身有没有被真的执行"这件事,
+	// 不是"函数体对不对"(函数体已经被 test/server-startup.test.ts 与
+	// test/policy-query-spec.test.ts 的用例覆盖)。
+	//
+	// resolveSpecPromptPaths 跑在 toolset 装配 / MCP 握手 / 模型解析之前(main.ts 里先读
+	// outputContractSchema,再解析 systemPrompt/appendSystemPrompt,toolsets 与
+	// createSessionRuntime 都在后面)——所以这条用例不需要真实 MCP server、不需要有效的 API
+	// key,systemPrompt 读不到应该在那之前就响亮失败、非零退出。
+	it(
+		"exits non-zero and names the field when spec.systemPrompt cannot be read",
+		{ timeout: CASE_TIMEOUT_MS },
+		async () => {
+			root = await mkdtemp(join(tmpdir(), "cli-bad-system-prompt-"));
+			const specPath = join(root, "spec.json");
+			const profilePath = join(root, "profile.json");
+			await writeFile(
+				specPath,
+				JSON.stringify({
+					id: "demo",
+					model: { role: "main" },
+					toolset: "mcp",
+					tools: ["echo"],
+					limits: { maxTurns: 3 },
+					systemPrompt: "missing-system-prompt.md",
+				}),
+			);
+			await writeFile(
+				profilePath,
+				JSON.stringify({
+					id: "test",
+					baseUrl: "http://localhost/v1",
+					apiKeyEnv: "DFZQ_ABSENT_KEY",
+					api: "openai-completions",
+					roles: {
+						main: {
+							provider: "p",
+							modelId: "m",
+							contextWindow: 8192,
+							maxTokens: 1024,
+							reasoning: false,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						},
+					},
+				}),
+			);
+			await expect(
+				run(
+					process.execPath,
+					[CLI, "run", "--spec", specPath, "--profile", profilePath, "--workdir", root, "--input", "hi"],
+					{ timeout: EXEC_TIMEOUT_MS },
+				),
+			).rejects.toMatchObject({ code: 1, stderr: expect.stringContaining("systemPrompt") });
+		},
+	);
+
 	// Task 15:补齐 CLI 的成功路径。CLI 是 execFile spawn 出的子进程,createFauxHarness()
 	// patch 的是父进程内的 pi-ai api-registry,子进程看不到 —— 所以这里用一个真实的本地 HTTP
 	// server(mock-openai-server.mjs)充当 profile.json 指向的 OpenAI 兼容端点,让子进程真的

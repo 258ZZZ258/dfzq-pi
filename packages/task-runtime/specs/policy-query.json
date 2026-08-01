@@ -13,7 +13,7 @@
     "get_clause_detail",
     "assess_sufficiency"
   ],
-  "systemPrompt": "@specs/policy-query/system.md",
+  "systemPrompt": "policy-query/system.md",
   "skills": [
     "policy-query/skills/citation-discipline.md",
     "policy-query/skills/scenario-to-rule.md",

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { type ServerType, serve } from "@hono/node-server";
@@ -135,6 +136,64 @@ interface SpecFile extends RuntimeSpec {
 	mcpServers?: McpServerSpec[];
 }
 
+/**
+ * `spec.systemPrompt` / `spec.appendSystemPrompt` 就地解析成实际正文——直接改写传入对象上的
+ * 这两个字段,不返回新对象。
+ *
+ * **导出是为了可测试性**:test/policy-query-spec.test.ts 的"出厂 spec 的 prompt 路径真的会被
+ * 解析"直接调用这个函数 + `assemble()` 组出一个真实 AgentSession 来断言
+ * `assembled.session.systemPrompt`。这条断言够不到 `createDefaultRuntimeFactory` 返回的
+ * `RuntimeFactory` ——那条路径经 `createSessionRuntime` 只交回 `contract.ts` 里的 `Runtime`,
+ * 不暴露 `assemble()` 产出的 `Assembled.session`;而 policy-query 出厂 spec 的 `mcpServers`
+ * 需要真实的 `${DFZQ_AUDIT_AI_PYTHON}` 解释器,也不该是这条单测的依赖。所以生产路径(下面
+ * `createDefaultRuntimeFactory` 的构造期 for 循环)与测试喂的是同一份解析代码,不是测试自己
+ * 另起一套影子实现——`resolveSpecPromptPaths` 的构造期 for 循环调用点被去掉的话,test 必须跟
+ * 着翻红(见 task-15d-report.md 的变异检验记录)。
+ *
+ * **为什么要在构造期把文件读出来,而不是把解析出的绝对路径原样交给 pi**:pi 的
+ * `resolvePromptInput`(packages/coding-agent/src/core/resource-loader.ts:53-67)是
+ * `existsSync(input) ? readFileSync(input) : input`——路径读不到就把路径字符串本身当 prompt
+ * 正文,不抛也不告警。task-runtime 如果只算出绝对路径丢给它,路径写错(比如曾经的
+ * `"@specs/policy-query/system.md"` 前缀)不会在装配阶段暴露,而是让模型静默收到一串文件路径
+ * 当系统提示——这正是 `spec.systemPrompt` 自 3dc0d28c 起从未生效过的根因
+ * (`.superpowers/sdd/实施计划-制度查询验收/task-15d-brief.md`)。
+ *
+ * - `systemPrompt`:出厂 spec 里就是路径(`specs/policy-query.json` 的
+ *   `"policy-query/system.md"`),没有任何字面文本用例依赖它——无条件当路径处理,读不到直接
+ *   抛,错误信息带 spec id 与字段名,方便定位是哪个 spec、哪个字段写错了路径。
+ * - `appendSystemPrompt`:既有语义是"每一项要么是字面文本、要么是文件路径"
+ *   (`runtime/assembler.ts` 里 `appendSystemPrompt` 选项那段注释),`test/assembler.test.ts`
+ *   有两条用例直接把字面文本(`"DFZQ-APPENDED-ONE"` 等)传给 `assemble()`——那两条用例直接
+ *   构造 `RuntimeSpec` 传给 `assemble()`,根本不经过 `createDefaultRuntimeFactory` / 这个
+ *   函数,不受影响;但这里如果对"`resolve(specsDir, item)` 不存在"的情况也抛错,会把 spec
+ *   作者写字面文本这种合法用法堵死。所以判据是 `resolve(specsDir, item)` 是否存在:存在就读
+ *   成正文,不存在就原样当字面文本继续传下去。
+ */
+export async function resolveSpecPromptPaths(spec: RuntimeSpec, specsDir: string): Promise<void> {
+	if (spec.systemPrompt !== undefined) {
+		const original = spec.systemPrompt;
+		const abs = resolve(specsDir, original);
+		try {
+			spec.systemPrompt = await readFile(abs, "utf8");
+		} catch (error) {
+			throw new Error(
+				`Spec "${spec.id}": systemPrompt "${original}" (resolved to "${abs}") could not be read — ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+	if (spec.appendSystemPrompt?.length) {
+		spec.appendSystemPrompt = await Promise.all(
+			spec.appendSystemPrompt.map(async (item) => {
+				const abs = resolve(specsDir, item);
+				if (!existsSync(abs)) return item; // resolve() 落空 = 字面文本,原样传下去
+				return await readFile(abs, "utf8");
+			}),
+		);
+	}
+}
+
 export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions): Promise<RuntimeFactory> {
 	const profile = JSON.parse(await readFile(options.profilePath, "utf8")) as ProviderProfile;
 	// spec 文件重读一次:SpecRouter 只持有 RuntimeSpec,mcpServers 不在该类型上。
@@ -151,6 +210,9 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 	const skillPaths = new Map<string, string[]>();
 	for (const name of (await readdir(options.specsDir)).filter((n) => n.endsWith(".json"))) {
 		const parsed = JSON.parse(await readFile(join(options.specsDir, name), "utf8")) as SpecFile;
+		// systemPrompt / appendSystemPrompt 与 skills / outputContract.schema 同一条纪律:
+		// 构造期把相对路径读成正文,读不到就响亮失败——见 resolveSpecPromptPaths 的注释。
+		await resolveSpecPromptPaths(parsed, options.specsDir);
 		specFiles.set(parsed.id, parsed);
 		if (parsed.skills?.length) {
 			skillPaths.set(

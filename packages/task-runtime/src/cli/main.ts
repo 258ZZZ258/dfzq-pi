@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
@@ -59,6 +60,41 @@ async function main(): Promise<void> {
 		spec.outputContract === undefined
 			? undefined
 			: JSON.parse(await readFile(resolve(dirname(values.spec as string), spec.outputContract.schema), "utf8"));
+
+	// Task 15d(根因修复):systemPrompt / appendSystemPrompt 此前原样透传给 pi —— pi 的
+	// resolvePromptInput(resource-loader.ts:53-67)是 `existsSync(input) ? read : input`,
+	// 路径读不到就把路径字符串本身当 prompt 正文,不抛也不告警。这里必须构造期主动
+	// readFile,不能只算绝对路径丢给它,否则路径写错(比如曾经的 "@specs/..." 前缀)会让
+	// 模型静默收到一串文件路径当系统提示。与 server/main.ts 的 resolveSpecPromptPaths 是
+	// 同一套逻辑,但这里不 import 它 —— main.ts 顶部已有先例(动态 import serve.ts)刻意
+	// 避免让单跑 CLI 背上 server/main.ts 的 hono/sqlite 依赖,两条入口各自独立实现。
+	// ⚠️ 与上面 outputContractSchema 那条警告同理:eval/main.ts 会把 spec 重新落盘成
+	// outDir 下的临时文件,届时 dirname(values.spec) 指向的是 outDir 而不是原始 specsDir——
+	// 如果未来某个经这条路径跑的 spec 声明了 systemPrompt / appendSystemPrompt,路径需要
+	// 提前解析好再写进临时 spec。目前 specs/blackbox-eval.json(唯一走 eval 路径的 spec)
+	// 没有声明这两个字段,这条留给引入它的人。
+	if (spec.systemPrompt !== undefined) {
+		const original = spec.systemPrompt;
+		const abs = resolve(dirname(values.spec as string), original);
+		try {
+			spec.systemPrompt = await readFile(abs, "utf8");
+		} catch (error) {
+			throw new Error(
+				`Spec "${spec.id}": systemPrompt "${original}" (resolved to "${abs}") could not be read — ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+	if (spec.appendSystemPrompt?.length) {
+		spec.appendSystemPrompt = await Promise.all(
+			spec.appendSystemPrompt.map(async (item) => {
+				const abs = resolve(dirname(values.spec as string), item);
+				if (!existsSync(abs)) return item; // resolve() 落空 = 字面文本,原样传下去
+				return await readFile(abs, "utf8");
+			}),
+		);
+	}
 
 	const toolsets = new ToolsetRegistry();
 	toolsets.register(

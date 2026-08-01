@@ -4,8 +4,13 @@ import { mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Runtime, RuntimeEvent } from "../runtime/contract.ts";
 
-/** 落盘白名单。token 级 delta 之类的高频噪声不记。 */
-const RECORDED_TYPES: ReadonlySet<string> = new Set([
+/**
+ * 落盘白名单。token 级 delta 之类的高频噪声不记。
+ *
+ * 导出复用:serve 侧的事件落库(`server/run-manager.ts`)判「这条事件要不要记」用的是同一份
+ * 白名单,不是另发明一套 —— 两套白名单会漂移(task-18b)。
+ */
+export const RECORDED_TYPES: ReadonlySet<string> = new Set([
 	"turn_start",
 	"turn_end",
 	"tool_execution_start",
@@ -16,7 +21,7 @@ const RECORDED_TYPES: ReadonlySet<string> = new Set([
 	"entry_appended",
 ]);
 
-function shouldRecord(type: string): boolean {
+export function shouldRecord(type: string): boolean {
 	return RECORDED_TYPES.has(type) || type.startsWith("auto_retry_");
 }
 

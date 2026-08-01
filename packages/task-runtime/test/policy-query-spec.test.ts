@@ -6,7 +6,7 @@ import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import { assemble } from "../src/runtime/assembler.ts";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
-import { resolveSpecPromptPaths } from "../src/server/main.ts";
+import { resolveSpecPromptPaths } from "../src/spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
 import { createFauxHarness } from "./helpers/faux.ts";
@@ -116,8 +116,9 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 	// 既有用例(test/assembler.test.ts)全部传字面文本("You are a test agent." 之类),
 	// 走的正是那条 fallthrough 分支 —— 实现对错都通过,零区分力。所以这里必须用**真实
 	// specs/policy-query.json 的真实路径值**,并且必须经过生产的解析代码
-	// (resolveSpecPromptPaths,由 createDefaultRuntimeFactory 在构造期调用)—— 不能在测试
-	// 里自己另起一套"看起来像"的解析逻辑,否则这条用例测的是测试自己的实现,不是生产代码。
+	// (resolveSpecPromptPaths,现在是 ../src/spec/resolve-prompt-paths.ts 的独立模块,
+	// server/main.ts 与 cli/main.ts 都从这里 import)—— 不能在测试里自己另起一套"看起来像"
+	// 的解析逻辑,否则这条用例测的是测试自己的实现,不是生产代码。
 	//
 	// 为什么不直接走 createDefaultRuntimeFactory 返回的 RuntimeFactory:那条路径经
 	// createSessionRuntime 只交回 contract.ts 的 Runtime,不暴露 assemble() 产出的
@@ -126,6 +127,14 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 	// 直接调用 resolveSpecPromptPaths(生产代码本体)+ assemble()(与 test/assembler.test.ts
 	// 的 fake-toolset / faux-model 装配套路同构),换掉的只是"怎么拿到 MCP 工具",不是
 	// "谁来解析 systemPrompt 的路径"。
+	//
+	// ⚠️ 这里直接调用 resolveSpecPromptPaths,**不经过** createDefaultRuntimeFactory 构造期
+	// for 循环里的调用点——那个调用点本身有没有真的接上,是审查 Critical-2 之后另一条独立的
+	// 覆盖面,见 test/server-startup.test.ts 的
+	// "createDefaultRuntimeFactory - systemPrompt / appendSystemPrompt resolution" 那个
+	// describe(用临时 specsDir + 坏路径,断言 createDefaultRuntimeFactory() 本身响亮失败)。
+	// 这条区分是 Task 15d 复审 Critical-1 的教训:早先这里的注释错误地声称"for 循环调用点被
+	// 去掉,这条用例会跟着翻红",但这条用例走的是函数直调,够不到那个调用点,那句断言是假的。
 	async function assembleRealSpec() {
 		const runtimeSpec = freshRuntimeSpec();
 		await resolveSpecPromptPaths(runtimeSpec, specDir);
@@ -168,6 +177,59 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 			expect(assembled.session.systemPrompt).not.toContain("policy-query/output-format.md");
 		} finally {
 			await cleanup();
+		}
+	});
+});
+
+function demoToolsets(): ToolsetRegistry {
+	const registry = new ToolsetRegistry();
+	registry.register("demo", async () => [
+		{
+			name: "echo",
+			label: "Echo",
+			description: "stub for the literal-appendSystemPrompt test — never actually called",
+			parameters: Type.Object({}),
+			execute: async () => ({ output: "", content: "" }),
+		} as never,
+	]);
+	return registry;
+}
+
+// 审查复审 Important-5 的正向对照:test/server-startup.test.ts 里 "accepts a literal
+// appendSystemPrompt entry..." 那条只证明了 createDefaultRuntimeFactory() 构造不抛(wiring
+// 层面);这里补上内容层面的证据——不形似路径的字面文本真的原样到达了 assemble() 产出的
+// AgentSession 的 systemPrompt 正文,不是被 looksLikePath() 的新判据顺手吞掉或改写。
+describe("appendSystemPrompt 的字面文本分支真的会到达 systemPrompt(Important-5 正向对照)", () => {
+	it("a literal (non-path-looking) appendSystemPrompt entry reaches the assembled system prompt verbatim", async () => {
+		const runtimeSpec: RuntimeSpec & { toolset: string; tools: string[] } = {
+			id: "literal-append-demo",
+			model: { role: "main" },
+			toolset: "demo",
+			tools: ["echo"],
+			limits: { maxTurns: 5 },
+			appendSystemPrompt: ["SOME-LITERAL-CONTRACT-TEXT"],
+		};
+		await resolveSpecPromptPaths(runtimeSpec, specDir);
+		// "SOME-LITERAL-CONTRACT-TEXT" 不含 "/",也不以 .md / .json 结尾 —— looksLikePath()
+		// 判它不形似路径,resolveSpecPromptPaths 必须原样放行,不碰文件系统、不抛、不改写。
+		expect(runtimeSpec.appendSystemPrompt).toEqual(["SOME-LITERAL-CONTRACT-TEXT"]);
+
+		const harness = await createFauxHarness();
+		const assembled = await assemble({
+			pluginContext: fauxPluginContext(),
+			spec: runtimeSpec,
+			profile: fauxProfile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: demoToolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		try {
+			expect(assembled.session.systemPrompt).toContain("SOME-LITERAL-CONTRACT-TEXT");
+		} finally {
+			await assembled.dispose();
+			await harness.cleanup();
 		}
 	});
 });

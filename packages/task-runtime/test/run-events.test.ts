@@ -23,6 +23,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import { reconcileRunEvents } from "../src/observability/reconcile.ts";
+import type { RuntimeEvent } from "../src/runtime/contract.ts";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import { createSessionRuntime } from "../src/runtime/session-runtime.ts";
 import { Gate } from "../src/server/gate.ts";
@@ -263,6 +264,18 @@ describe("serve 侧事件落库(A6 pi 侧凭证)", () => {
  * 装配管线)配一个真的登记了 `FinalJudge` 的插件,插件在判定时机经 `ctx.callTool()` 调一次
  * 工具,和 faux 模型驱动的两次真实工具调用交错在一次 run 里,包进真实 `RunManager`,断言
  * `run_events`(A6 的 pi 侧凭证)里能看到这次插件驱动的调用。
+ *
+ * 复审追加(Important-1/Important-2,详见 task-18c-report.md 对应小节):
+ *   - 失败路径此前零覆盖:`callTool` 的 catch 分支(`isError:true` 的合成事件 + 异常继续
+ *     向上传播)实现从一开始就是对的,但摘掉那一行发射调用点,全量照样绿。新增一条用例
+ *     专打这条路径。
+ *   - "哨兵不进 clauseIds" 那条用例此前的名字/注释声称自己在验"接线隔离",但两版变异
+ *     (含把 `session.subscribe()` 的真实回调原样搬进 `emitPluginToolEvent` 这种最字面的
+ *     接错线读法)都翻不了它 —— 根因是 `PluginToolCallEvent` 的 payload 压根不带
+ *     `result`,没有内容可漏,发给哪条通路结果都一样。这份区分力其实来自"payload 最小
+ *     化",不是"接线正确";名字与注释已改成如实描述,并新增一条真正验证 payload 最小化的
+ *     用例(必须读 `runtime.subscribe()` 的原始事件,不能读 `run_events` —— 后者会被落库
+ *     前的脱敏投影收窄成固定形状)。
  */
 describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判官探针)", () => {
 	const profile: ProviderProfile = {
@@ -286,18 +299,22 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 	// clauseIds 里(硬性设计约束的可执行凭证,brief Step 1 第 3 条)。
 	const PLUGIN_SENTINEL_CLAUSE_ID = "PLUGIN-SENTINEL-CLAUSE-9f3d";
 
-	function probeSpec(): RuntimeSpec {
+	/**
+	 * stopPolicy 可覆盖:成功场景用默认的 `probe-calltool-judge`,Important-1 的失败场景
+	 * 传 `probe-calltool-judge-failure` —— 两个判官除此之外共用同一个 spec 骨架。
+	 */
+	function probeSpec(stopPolicy = "probe-calltool-judge"): RuntimeSpec {
 		return {
 			id: "demo",
 			model: { role: "main" },
 			toolset: "probe-toolset",
-			// assess_sufficiency 刻意不在白名单里:它只应该被插件经 ctx.callTool() 调用,
-			// 模型够不着它 —— 这样断言里出现的 assess_sufficiency 调用一定是插件驱动的,
-			// 不可能是模型自己选中了它(faux 模型的应答序列也是手写脚本,和这条约束互相佐证)。
+			// assess_sufficiency* 刻意不在白名单里:只应该被插件经 ctx.callTool() 调用,
+			// 模型够不着它们 —— 这样断言里出现的调用一定是插件驱动的,不可能是模型自己选中
+			// (faux 模型的应答序列也是手写脚本,和这条约束互相佐证)。
 			tools: ["search_policy"],
 			limits: { maxTurns: 10 },
 			systemPrompt: "You are a test agent.",
-			stopPolicy: "probe-calltool-judge",
+			stopPolicy,
 		};
 	}
 
@@ -322,6 +339,17 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 				execute: async () => {
 					const payload = JSON.stringify({ clause_id: PLUGIN_SENTINEL_CLAUSE_ID });
 					return { output: payload, content: [{ type: "text", text: payload }], details: {} };
+				},
+			} as never,
+			{
+				// 复审 Important-1:失败路径此前零覆盖。这个工具恒抛,专打 assembler.ts
+				// callTool 的 catch 分支(isError:true 的合成事件 + 异常继续向上传播)。
+				name: "assess_sufficiency_flaky",
+				label: "Assess sufficiency (always fails)",
+				description: "C3 判官探针工具的失败版本,只用来测 isError:true 合成事件与异常传播。",
+				parameters: Type.Object({ hint: Type.String() }),
+				execute: async () => {
+					throw new Error("assess_sufficiency_flaky: upstream_failure");
 				},
 			} as never,
 		]);
@@ -361,9 +389,42 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 		return registry;
 	}
 
+	/**
+	 * 复审 Important-1:判官经 `ctx.callTool` 调一个恒抛的工具,**不 catch** 这次调用的
+	 * rejection —— 让它原样穿透 `judge()`。`runFinalJudges` 在 `judge()` 抛出时会把它转成
+	 * `errorMessage`(`final-judge.ts:68-77`),不会静默吞掉、也不会当成 `{ok:true}` 放过 ——
+	 * 这就是"异常仍会向上传播"的可观测形态。
+	 */
+	function probeCallToolFailureRegistry() {
+		const registry = createDefaultPluginRegistry();
+		registry.register({
+			name: "probe-calltool-judge-failure",
+			hooks: [],
+			factory: (ctx) => {
+				ctx.registerFinalJudge({
+					name: "probe-calltool-judge-failure",
+					maxAttempts: 3,
+					onExhausted: "pass",
+					judge: async () => {
+						await ctx.callTool("assess_sufficiency_flaky", { hint: "probe" });
+						return { ok: true };
+					},
+				});
+				return { name: "probe-calltool-judge-failure", factory: () => {} };
+			},
+		});
+		return registry;
+	}
+
 	interface ProbeScenario {
 		rows: RunEventRow[];
 		seenClauseIds: string[][];
+		/**
+		 * `runtime.subscribe()` 抓到的原始事件 —— **不经过** 18b 落库前的脱敏投影
+		 * (`server/run-manager.ts` 的 `toStoredEvent`)。有些断言必须读这份原始数据,
+		 * 见下面"合成事件本身是最小字段集合"用例的注释。
+		 */
+		rawEvents: RuntimeEvent[];
 	}
 
 	/**
@@ -387,11 +448,12 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 			]);
 
 			const seenClauseIds: string[][] = [];
+			const rawEvents: RuntimeEvent[] = [];
 			const rm = new RunManager({
 				store,
 				gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 2 }),
-				runtimeFactory: async () =>
-					createSessionRuntime({
+				runtimeFactory: async () => {
+					const runtime = await createSessionRuntime({
 						spec: probeSpec(),
 						profile,
 						registry: probeCallToolRegistry(seenClauseIds),
@@ -399,7 +461,13 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 						cwd: harness.cwd,
 						agentDir: harness.agentDir,
 						modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
-					}),
+					});
+					// 额外挂一路只读订阅,抓 emitPluginToolEvent 发出的**原始** RuntimeEvent ——
+					// 与 RunManager 自己那路(落库用,subscribeEvents)相互独立的两个订阅者,
+					// 谁先谁后不影响谁看到什么(listeners 是一个 Set,fan-out 时逐个通知)。
+					runtime.subscribe((event) => rawEvents.push(event));
+					return runtime;
+				},
 				now: () => 1000,
 				newRunId: () => "run-1",
 			});
@@ -411,7 +479,44 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 				throw new Error(`expected run to complete, got status "${result.status}": ${result.errorMessage}`);
 			}
 
-			return { rows: readRunEvents(dbPath, outcome.runId), seenClauseIds };
+			return { rows: readRunEvents(dbPath, outcome.runId), seenClauseIds, rawEvents };
+		} finally {
+			await harness.cleanup();
+		}
+	}
+
+	/**
+	 * 复审 Important-1 的失败场景:只需一个不带工具调用的模型回合(`session.prompt()` 立刻
+	 * 返回,判官紧接着触发),然后判官经 `ctx.callTool` 调 `assess_sufficiency_flaky` ——
+	 * 它恒抛。返回 `result` 而不只是 `rows`:要断言异常真的向上传播了,得看最终的 RunResult。
+	 */
+	async function runProbeFailureScenario() {
+		const harness = await createFauxHarness();
+		try {
+			harness.faux.setResponses([fauxAssistantMessage("draft answer")]);
+
+			const rm = new RunManager({
+				store,
+				gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 2 }),
+				runtimeFactory: async () =>
+					createSessionRuntime({
+						spec: probeSpec("probe-calltool-judge-failure"),
+						profile,
+						registry: probeCallToolFailureRegistry(),
+						toolsets: probeToolset(),
+						cwd: harness.cwd,
+						agentDir: harness.agentDir,
+						modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+					}),
+				now: () => 1000,
+				newRunId: () => "run-fail-1",
+			});
+
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			const result = await outcome.completion;
+
+			return { rows: readRunEvents(dbPath, outcome.runId), result };
 		} finally {
 			await harness.cleanup();
 		}
@@ -424,17 +529,51 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 			.map((row) => `${row.type}:${(JSON.parse(row.payload) as { toolName?: string }).toolName}`);
 	}
 
-	// brief Step 1 第 1 条:插件驱动的调用出现在 run_events 里,且 toolName 正确。
-	it("插件经 ctx.callTool 发起的调用出现在 run_events 里,toolName 正确", async () => {
-		const { rows } = await runProbeScenario();
-		const sequence = toolEventSequence(rows);
-		expect(sequence).toContain("tool_execution_start:assess_sufficiency");
-		expect(sequence).toContain("tool_execution_end:assess_sufficiency");
+	/**
+	 * 从原始 RuntimeEvent 流(`runProbeScenario()` 的 `rawEvents`,未经落库前的脱敏投影)
+	 * 里挑出某个工具名的 tool_execution_start / tool_execution_end 各一条。
+	 */
+	function rawToolEvents(rawEvents: RuntimeEvent[], toolName: string) {
+		const matches = rawEvents.filter(
+			(event) =>
+				(event.type === "tool_execution_start" || event.type === "tool_execution_end") &&
+				typeof event.payload === "object" &&
+				event.payload !== null &&
+				(event.payload as { toolName?: unknown }).toolName === toolName,
+		);
+		return {
+			start: matches.find((event) => event.type === "tool_execution_start"),
+			end: matches.find((event) => event.type === "tool_execution_end"),
+		};
+	}
+
+	// brief Step 1 第 1 条的补充:插件驱动的调用产生的合成事件本身
+	// (`emitPluginToolEvent` 发出的原始 RuntimeEvent)是最小字段集合 —— 不带 result/args。
+	//
+	// 复审 Important-2 + Minor-1:
+	//   - "run_events 里有 assess_sufficiency、toolName 正确"这件事已经被下面顺序用例的
+	//     `toEqual` 严格蕴含(有序数组精确匹配天然要求这两行存在且 toolName 正确)——
+	//     这里若再用 `toContain` 重复断言一次,是零独立区分力的重复劳动(Minor-1),已删除。
+	//   - 这里改测顺序用例根本碰不到的维度:合成事件的 payload 形状。这条断言**必须**读
+	//     `runtime.subscribe()` 抓到的原始事件,不能读 `run_events`:落库前的脱敏投影
+	//     (`server/run-manager.ts` 的 `toStoredEvent`)会把 payload 重新收窄成固定的
+	//     `{type,seq,ts,toolName?,isError?}`,不管原始 payload 里塞了什么 —— 从 run_events
+	//     读回来的行永远是这个形状,哪怕真往 `PluginToolCallEvent` 加了 `result`,这层落库
+	//     脱敏也会把它悄悄滤掉,测不出来。
+	it("插件经 ctx.callTool 发起的调用,合成事件本身是最小字段集合(不带 result/args)", async () => {
+		const { rawEvents } = await runProbeScenario();
+		const { start, end } = rawToolEvents(rawEvents, "assess_sufficiency");
+		expect(start).toBeDefined();
+		expect(end).toBeDefined();
+		expect(Object.keys(start?.payload as object).sort()).toEqual(["toolName", "type"]);
+		expect(Object.keys(end?.payload as object).sort()).toEqual(["isError", "toolName", "type"]);
+		expect((end?.payload as { isError?: boolean }).isError).toBe(false);
 	});
 
 	// brief Step 1 第 2 条:插件调用与模型驱动调用交错时,run_events 的 seq 顺序要与真实发生
 	// 顺序一致。⚠ 有序比较(toEqual),不用 toContain/arrayContaining —— 本轮已经在别的任务
-	// 栽过一次(fixture 只有一次调用,顺序在构造上就测不出来)。
+	// 栽过一次(fixture 只有一次调用,顺序在构造上就测不出来)。这条同时是 brief 第 1 条
+	// "存在性 + toolName 正确"的严格超集(有序数组精确匹配天然蕴含成员关系)。
 	it("插件调用与模型驱动调用交错时,run_events 的 seq 顺序与真实发生顺序一致", async () => {
 		const { rows } = await runProbeScenario();
 		const sequence = toolEventSequence(rows);
@@ -448,16 +587,58 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 		]);
 	});
 
-	// brief Step 1 第 3 条(硬性设计约束的可执行凭证,不可省):插件调用取回的 clause_id 哨兵
-	// 不得进入 C6 的 clauseIds —— 合成事件只发进 listeners,不发进 session.subscribe() 那条
-	// collectClauseIds 的数据源。回归锁:此刻(改动前)就应该 PASS,因为当前压根不进事件流,
-	// 更谈不上进 session 流;改动后必须继续 PASS。
-	it("插件调用取回的 clause_id 哨兵不会进入 C6 的 clauseIds(硬性设计约束)", async () => {
+	// brief Step 1 第 3 条 —— 复审 Important-2 改过名字与注释,如实描述这条测的是什么:
+	//
+	// 这条测的是"payload 最小化",不是"接线隔离"。原先的名字/注释声称它验证"合成事件只发进
+	// listeners、不发进 session.subscribe() 那条通路";但复审做了两版变异(含最字面的读法:
+	// 把 session.subscribe() 的真实回调原样抽成函数、在 emitPluginToolEvent 里照样调一遍),
+	// 哨兵断言两次都没翻红。根因是 `PluginToolCallEvent` 的类型只有 `{type,toolName}` /
+	// `{type,toolName,isError}`,压根不带 `result` —— 不管把合成事件发给哪条通路,
+	// `collectClauseIds(event.result, …)` 拿到的都是 `undefined`,没有内容可漏。这条用例的
+	// 区分力落在"payload 最小化"上,不在"接线正确"上;不去构造一个牵强的接线测试来伪造
+	// 区分力。
+	//
+	// 真正的防线有两层,都不是这条用例自己给的:
+	//   1. 类型层:`emitPluginToolEvent?.({...})` 的调用点是对象字面量,TS 的多余属性检查会
+	//      在编译期拒绝任何未声明字段。实测验证过(未提交,验证后已还原):往
+	//      assembler.ts:208 的调用点加一个 `args` 字段,`npx tsgo --noEmit` 报
+	//      `error TS2353: Object literal may only specify known properties, and 'args' does
+	//      not exist in type '{ type: "tool_execution_start"; toolName: string; }'.`
+	//      —— 而 `tsgo --noEmit` 就在门禁里。
+	//   2. 运行时层:上面"合成事件本身是最小字段集合"那条用例直接断言了原始 payload 的精确
+	//      字段集合 —— 这才是能在**运行时**捕捉"有人往 PluginToolCallEvent 加了 result"的
+	//      那条防线(它读的是 runtime.subscribe() 的原始事件,不是 run_events;后者会被
+	//      落库前的脱敏投影收窄成固定形状,测不出这个)。
+	//
+	// 这条用例继续保留,作为回归锁(哨兵串真的不会出现在 clauseIds 里),但不再声称自己在验
+	// "接线隔离"。
+	it("插件调用取回的 clause_id 哨兵不会进入 C6 的 clauseIds(回归锁 —— 真正防线见上方注释)", async () => {
 		const { seenClauseIds } = await runProbeScenario();
 		const allSeen = seenClauseIds.flat();
 		expect(allSeen).not.toContain(PLUGIN_SENTINEL_CLAUSE_ID);
 		// 模型驱动的检索仍然照常填充 clauseIds —— 证明这不是"clauseIds 整体没工作",
 		// 而是精确排除了插件驱动的那一次。
 		expect(seenClauseIds[0]).toEqual(["REAL-1"]);
+	});
+
+	// 复审 Important-1:失败路径(callTool 的 catch 分支)brief 明写要发
+	// tool_execution_end(isError:true)、且异常不能被吞掉 —— 实现从一开始就是对的
+	// (assembler.ts 的 catch 分支),但此前没有任何测试覆盖它:复审摘掉这一行发射调用点后
+	// 跑全量,398 全绿。这条路径不是假设场景 —— Task 19 的一次配置疏漏就制造过 10 次
+	// upstream_failure。
+	it("插件调用会抛异常的工具时,run_events 里的 tool_execution_end 带 isError:true,且异常仍会向上传播", async () => {
+		const { rows, result } = await runProbeFailureScenario();
+
+		const ends = rows
+			.filter((row) => row.type === "tool_execution_end")
+			.map((row) => JSON.parse(row.payload) as { toolName?: string; isError?: boolean });
+		const flaky = ends.find((event) => event.toolName === "assess_sufficiency_flaky");
+		expect(flaky).toBeDefined();
+		expect(flaky?.isError).toBe(true);
+
+		// 异常没有被 callTool 吞掉:runFinalJudges 在 judge() 抛出时把它转成 errorMessage
+		// (不是静默当成 {ok:true} 放过),最终 run 的状态与错误信息里带着这次失败的痕迹。
+		expect(result.status).toBe("error");
+		expect(result.errorMessage).toContain("upstream_failure");
 	});
 });

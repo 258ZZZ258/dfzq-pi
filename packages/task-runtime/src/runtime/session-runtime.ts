@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { type Assembled, type AssembleOptions, assemble } from "./assembler.ts";
+import { type Assembled, type AssembleOptions, assemble, type PluginToolCallEvent } from "./assembler.ts";
 import type { LimitKind, LimitState, RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
 import { collectClauseIds, type FinalJudge, runFinalJudges } from "./final-judge.ts";
 import { createOutputContractJudge } from "./output-contract.ts";
@@ -39,6 +39,56 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	const judges: FinalJudge[] = [];
 	const clauseIds = new Set<string>();
 
+	// seq/listeners 提到 assemble() 调用**之前**声明(比原先靠后的位置提早了):插件工厂在
+	// assemble() 内部同步执行(instantiatePlugins()),一个工厂完全可能同步发起
+	// `ctx.callTool(...)`(test/assembler.test.ts 的 "PluginContext.callTool(C3 接线)" 就是
+	// 这样写的),那时 assemble() 还没返回 —— 下面的 emitPluginToolEvent 闭包若引用尚未初始化
+	// 的 `let seq`/`const listeners` 会直接 TDZ 报错(ReferenceError)。提早声明让两者在
+	// assemble() 开始跑之前就已经可用。
+	let seq = 0;
+	const listeners = new Set<(event: RuntimeEvent) => void>();
+
+	/**
+	 * Task 18c:插件经 `PluginContext.callTool` 发起的调用绕过 pi 的 agent loop,不会触发
+	 * 下面的 `session.subscribe()` —— 这里补上合成事件,传给 `assemble()` 的
+	 * `AssembleOptions.emitPluginToolEvent`,由 `callTool` 在调用前后各调一次。
+	 *
+	 * 🔴 硬性设计约束:只发给 `listeners`(Runtime 订阅者:事件落库、`attachTrajectory`),
+	 * 绝不能发进下面 `session.subscribe()` 那条通路 —— 那条是 C6 反幻觉校验
+	 * `collectClauseIds` 的数据源。插件探针取回的内容一旦被算进 `clauseIds`,就等于扩大了
+	 * 模型可合法引用的 clause_id 集合、削弱反幻觉兜底;这个函数只补观测,不改 C6 语义。
+	 *
+	 * `seq` 走的是下面 `session.subscribe()` 回调里那个**同一个**单调计数器,不是另起一套 ——
+	 * 18b 落库的 `ORDER BY seq` 要靠这一条把插件事件排到真实发生的位置上。
+	 *
+	 * `specId` 这里用 `options.spec.id` 而不是下面的 `assembled.specId`:后者要等
+	 * `assemble()` 返回才存在,而这个函数在 `assemble()` 返回之前就可能被调用;两者取值
+	 * 恒等(assembler.ts 的 `Assembled.specId` 就是原样回填的 `spec.id`)。
+	 */
+	function emitPluginToolEvent(event: PluginToolCallEvent): void {
+		const enveloped: RuntimeEvent = {
+			runId: currentRunId,
+			specId: options.spec.id,
+			seq: seq++,
+			ts: Date.now(),
+			type: event.type,
+			payload: event,
+		};
+		// 与下面 session.subscribe() 回调里的 fan-out 同一条纪律:这段代码可能跑在插件工厂的
+		// 同步调用栈里,一个监听器抛出去不能把装配或整个 run 打死,记日志、继续派发给其余监听者。
+		for (const listener of listeners) {
+			try {
+				listener(enveloped);
+			} catch (error) {
+				console.error(
+					`[SessionRuntime] event subscriber threw for spec "${options.spec.id}" event "${enveloped.type}" ` +
+						"(plugin-driven tool call); continuing fan-out",
+					error,
+				);
+			}
+		}
+	}
+
 	// limits 不在这里构造描述符了:它是 createDefaultPluginRegistry() 里的进程级描述符,
 	// 由 assemble() 从 options.registry 无条件 lookup 出来。本次 run 的状态(LimitState、
 	// abort 句柄)全部经下面这个 PluginContext 注入 —— 所以一个 PluginRegistry 可以被
@@ -63,7 +113,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		getRunInput: () => currentRunInput,
 	};
 
-	assembled = await assemble({ ...options, pluginContext });
+	assembled = await assemble({ ...options, pluginContext, emitPluginToolEvent });
 	// **最后**追加 C6:判官按登记顺序跑,插件登记的(C3)排在前面 —— 证据不足时先补证据,
 	// 没必要先修 JSON 格式。C6 必须在插件登记完(assemble() 内部发生)之后才推进 judges,
 	// 所以放在这里而不是 pluginContext 声明的地方。
@@ -97,9 +147,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 
 	const id = randomUUID();
 	const specId = assembled.specId;
-	let seq = 0;
 	let lastActiveAt = Date.now();
-	const listeners = new Set<(event: RuntimeEvent) => void>();
 
 	const unsubscribeSession = session.subscribe((event) => {
 		lastActiveAt = Date.now();

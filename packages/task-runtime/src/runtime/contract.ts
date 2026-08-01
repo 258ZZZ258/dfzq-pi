@@ -48,6 +48,27 @@ export interface RunResult {
 	 * 此前 runFinalJudges 算了这个数但被 session-runtime 整个丢弃,只有单测能观测到。
 	 */
 	judgeAttempts: Record<string, number>;
+	/**
+	 * **只在 `status === "completed"` 时才有此字段**:从 `output` 的 JSON 块提取,且仅在
+	 * run 以 `completed` 收尾时提取——`status` 为 `error`(含 C6 输出契约判官
+	 * `onExhausted:"error"` 判定失败的那一类,例如 basis 引用了臆造的 clause_id)/
+	 * `limit_exceeded` / `aborted` 时,`output` 里即便能抠出语法合法的 JSON,也**不**填
+	 * 进 `answer`——那份 JSON 没有通过 C6,不能被当成"已校验的应答"交给 Java(2026-07-31
+	 * 复审 Important:早先这里写的是"C6 已校验的那个 JSON 对象",但代码从未检查 status,
+	 * 被 C6 拒掉的臆造应答会原样进 answer;已在 toWireResult 里补上 status 闸门)。
+	 *
+	 * **给 Java 侧用**:`output` 是原始助手文本、带 markdown 围栏,消费方不该自己抠。
+	 * 契约文档见 `packages/task-runtime/docs/java-answer-contract.md`。
+	 *
+	 * 类型是 `unknown` 而非具体形状:形状由**各 spec 自己的 outputContract schema** 决定,
+	 * task-runtime 这一层不该固化某一个 spec 的形状。
+	 *
+	 * **提取不到时缺省**(output 没有花括号包裹的候选,或候选花括号配对但解析失败)。run 已经
+	 * 完成了,拿不到 answer 是降级不是失败 —— 这里绝不抛。
+	 *
+	 * **不在这一层重新校验 schema**:C6 是唯一真相源,再验一遍等于两处定义、必然漂移。
+	 */
+	answer?: unknown;
 }
 
 export interface RuntimeSnapshot {

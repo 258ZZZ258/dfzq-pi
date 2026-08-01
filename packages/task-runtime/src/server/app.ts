@@ -5,7 +5,7 @@ import type { RunResult } from "../runtime/contract.ts";
 import type { RunStore } from "../store/contract.ts";
 import { checkInternalToken, INTERNAL_TOKEN_HEADER } from "./middleware/auth.ts";
 import { clampWaitMs, validateSubmitBody } from "./middleware/validate.ts";
-import { isTerminal, recordToRunResult } from "./routes.ts";
+import { isTerminal, recordToRunResult, toWireResult } from "./routes.ts";
 import type { RunManager, RunOptions } from "./run-manager.ts";
 
 export interface AppOptions {
@@ -109,7 +109,7 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 		}
 		if (outcome.kind === "idempotent") {
 			const row = store.findByRunId(outcome.runId);
-			if (row && isTerminal(row.status)) return c.json(recordToRunResult(row), 200);
+			if (row && isTerminal(row.status)) return c.json(toWireResult(recordToRunResult(row)), 200);
 			// row?.status 而不是 outcome.status(创建时的快照):markError/markRunning 等落库
 			// 写入若失败,drive() 的 finally 仍会无条件 live.delete,行却可能停在非终态 ——
 			// 「行非终态且不在 live」因此是可达的(finding #2 之后),不能再假设这里必是
@@ -137,17 +137,17 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			// 终态直接回 200 结果(含 error),非终态回 202 并如实报 queued/running
 			// (排队中的 run 不许谎称 running,RunManager 的 queued 语义就是为此服务的)。
 			const row = store.findByRunId(outcome.runId);
-			if (row && isTerminal(row.status)) return c.json(recordToRunResult(row), 200);
+			if (row && isTerminal(row.status)) return c.json(toWireResult(recordToRunResult(row)), 200);
 			return c.json({ runId: outcome.runId, status: row?.status ?? "running" }, 202);
 		}
-		return c.json(raced as RunResult, 200);
+		return c.json(toWireResult(raced as RunResult), 200);
 	});
 
 	app.get("/runs/:runId", (c) => {
 		const row = store.findByRunId(c.req.param("runId"));
 		if (!row) return c.json(errorBody("not_found", "run not found"), 404);
 		if (!isTerminal(row.status)) return c.json({ runId: row.runId, status: row.status }, 200);
-		return c.json(recordToRunResult(row), 200);
+		return c.json(toWireResult(recordToRunResult(row)), 200);
 	});
 
 	app.post("/runs/:runId/cancel", async (c) => {

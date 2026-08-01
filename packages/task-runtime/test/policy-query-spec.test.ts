@@ -26,7 +26,7 @@ describe("出厂 spec: policy-query.json", () => {
 	});
 
 	/**
-	 * basis[] 的七个合法键 —— 契约正文(output-format.md)与出厂 schema
+	 * basis[] 的八个合法键 —— 契约正文(output-format.md)与出厂 schema
 	 * (output-contract.schema.json 的 basis.items.properties)必须逐字一致,这是下面用例
 	 * 断言 1 / 断言 2 共同的单一事实来源。
 	 *
@@ -34,7 +34,7 @@ describe("出厂 spec: policy-query.json", () => {
 	 * (conclusion/basis/confidence/finish_reason),basis 内部七个键一个都没检 —— 终审变异
 	 * 实测:把 output-format.md 里的七键 JSON 示例整段换成 `{ }`、删掉"只能有上面列出的这
 	 * 七个键"那句,这条用例仍然全绿(彼时循环只剩正文散句里侥幸命中的 source_code)。
-	 * 真实后果不是风格问题:出厂 schema 只 `required` 了 clause_id,其余六个键(尤其
+	 * 真实后果不是风格问题:出厂 schema 只 `required` 了 clause_id,其余七个键(尤其
 	 * source_code —— 下游按它回查权威库装配条款正文)只在 output-format.md 里被要求。
 	 * source_code 一旦从契约正文掉了,模型不再输出它,schema 照样过、判官照样过,下游装配却
 	 * 会断,全链零信号。
@@ -47,9 +47,10 @@ describe("出厂 spec: policy-query.json", () => {
 		"source_code",
 		"source_doc_id",
 		"corpus_type",
+		"score",
 	] as const;
 
-	it("keeps the seven basis keys in lockstep between output-format.md's contract text and the schema's key set", () => {
+	it("keeps the eight basis keys in lockstep between output-format.md's contract text and the schema's key set", () => {
 		const contract = readFileSync(`${specDir}policy-query/output-format.md`, "utf8");
 		for (const key of ["conclusion", "basis", "confidence", "finish_reason"]) {
 			expect(contract).toContain(key);
@@ -58,12 +59,12 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(contract).toContain("不要");
 		expect(contract).toContain("text");
 
-		// 断言 1:七个 basis 键必须逐个真的出现在契约正文里 —— 不是只在无关散句里侥幸命中。
+		// 断言 1:八个 basis 键必须逐个真的出现在契约正文里 —— 不是只在无关散句里侥幸命中。
 		for (const key of BASIS_KEYS) {
 			expect(contract).toContain(key);
 		}
 
-		// 断言 2:schema 的 basis.items.properties 键集必须恰好等于这七个键,多一个少一个都要
+		// 断言 2:schema 的 basis.items.properties 键集必须恰好等于这八个键,多一个少一个都要
 		// 翻红。sort() 只是让比较不依赖 JSON 属性声明顺序,不是放宽成"包含即可"——两侧都
 		// sort 之后用 toEqual 做精确比较,不是 toContain/arrayContaining。
 		const schema = JSON.parse(readFileSync(`${specDir}policy-query/output-contract.schema.json`, "utf8")) as {
@@ -236,7 +237,7 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 		try {
 			// brief 建议的锚点 "basis[] 的元素只能有" 里那个 "]" 后面紧跟着 Markdown 的反引号
 			// (源文件是 "`basis[]` 的元素只能有"),不是连续子串 —— 换一句不含反引号断点的话。
-			expect(assembled.session.systemPrompt).toContain("的元素只能有上面列出的这七个键");
+			expect(assembled.session.systemPrompt).toContain("的元素只能有上面列出的这八个键");
 			expect(assembled.session.systemPrompt).not.toContain("policy-query/output-format.md");
 		} finally {
 			await cleanup();

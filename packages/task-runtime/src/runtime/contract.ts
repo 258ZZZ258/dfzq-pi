@@ -48,6 +48,21 @@ export interface RunResult {
 	 * 此前 runFinalJudges 算了这个数但被 session-runtime 整个丢弃,只有单测能观测到。
 	 */
 	judgeAttempts: Record<string, number>;
+	/**
+	 * C6(输出契约判官)已校验的那个 JSON 对象,从 `output` 的 JSON 块提取。
+	 *
+	 * **给 Java 侧用**:`output` 是原始助手文本、带 markdown 围栏,消费方不该自己抠。
+	 * 契约文档见 `packages/task-runtime/docs/java-answer-contract.md`。
+	 *
+	 * 类型是 `unknown` 而非具体形状:形状由**各 spec 自己的 outputContract schema** 决定,
+	 * task-runtime 这一层不该固化某一个 spec 的形状。
+	 *
+	 * **提取不到时缺省**(output 无 JSON 块 / spec 未声明 outputContract)。run 已经完成了,
+	 * 拿不到 answer 是降级不是失败 —— 这里绝不抛。
+	 *
+	 * **不在这一层重新校验 schema**:C6 是唯一真相源,再验一遍等于两处定义、必然漂移。
+	 */
+	answer?: unknown;
 }
 
 export interface RuntimeSnapshot {

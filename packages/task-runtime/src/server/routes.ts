@@ -1,4 +1,5 @@
 import type { RunResult } from "../runtime/contract.ts";
+import { extractJsonBlock } from "../runtime/output-contract.ts";
 import type { RunRecord } from "../store/contract.ts";
 
 /** 终态行 → RunResult 形状,给 GET /runs/{runId} 用。 */
@@ -32,4 +33,22 @@ export function recordToRunResult(row: RunRecord): RunResult {
 
 export function isTerminal(status: RunRecord["status"]): boolean {
 	return status !== "queued" && status !== "running";
+}
+
+/**
+ * 终态 RunResult → 上线形状。当前只做一件事:把 output 里的 JSON 块解析进 answer。
+ *
+ * ⚠ **终态结果有四个出口,必须全部经这里**(app.ts 的幂等分支 / 等待窗口超时但行已终态 /
+ * 同步完成 / GET /runs/:runId)。其中「同步完成」那条**不经 recordToRunResult** ——
+ * 正是这个不对称让 judgeAttempts 在三条路径上恒空、第四条却有真值。把适配放在这个单点上,
+ * 而不是塞进 recordToRunResult,就是为了不再重演。
+ *
+ * 202 分支不经这里:它回的是 {runId, status},非终态、output 还不存在。
+ */
+export function toWireResult(result: RunResult): RunResult {
+	if (result.output === undefined) return result;
+	const extracted = extractJsonBlock(result.output);
+	// 提取不到就原样返回 —— run 已经完成,拿不到 answer 是降级不是失败。
+	if (extracted.kind !== "ok") return result;
+	return { ...result, answer: extracted.value };
 }

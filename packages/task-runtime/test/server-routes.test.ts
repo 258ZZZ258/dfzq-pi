@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SpecRouter } from "../src/router/router.ts";
+import { extractJsonBlock } from "../src/runtime/output-contract.ts";
 import { createApp } from "../src/server/app.ts";
 import { Gate } from "../src/server/gate.ts";
 import { RunManager } from "../src/server/run-manager.ts";
@@ -396,5 +397,118 @@ describe("queue_full over HTTP", () => {
 		expect(retried.status).toBe(200);
 		expect(await retried.json()).toMatchObject({ status: "completed" });
 		expect(stubs).toHaveLength(2);
+	});
+});
+
+describe("Java 应答适配:answer 字段(规格-Java应答适配 §2)", () => {
+	// ⚠ 四条各钉一个出口。终态 RunResult 有四个出口,其中三个走 recordToRunResult、
+	// 第四个(同步完成)不走 —— 这个不对称正是 judgeAttempts 恒空那个 bug 的成因。
+	// 只测函数体不测调用点,摘掉任一出口都不会红(本项目已有四个任务栽在这上面)。
+
+	const ANSWER = {
+		conclusion: "允许",
+		basis: [{ clause_id: "A-1", score: 0.9 }],
+		confidence: "high",
+		finish_reason: "stop",
+	};
+	const STUB_OUTPUT = `前言\n\`\`\`json\n${JSON.stringify(ANSWER)}\n\`\`\`\n后记`;
+	const PROSE_OUTPUT = "这是一段纯散文,没有任何 JSON 块。";
+
+	it("出口 3(同步完成 200)带 answer", async () => {
+		// waitMs 内完成 ⇒ 走 app.ts 的 c.json(raced as RunResult, 200),不经 recordToRunResult。
+		const { hono } = app({ result: { output: STUB_OUTPUT } });
+		const res = await hono.request(post(submitBody({ waitMs: 5000 })));
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { status: string; answer?: unknown };
+		expect(body.status).toBe("completed");
+		expect(body.answer).toEqual(ANSWER);
+	});
+
+	it("出口 4(GET /runs/:runId)带 answer", async () => {
+		// 先 202 拿 runId,resolveNow 之后台落库,再 GET 拿终态。
+		const { hono, stub } = app({ hang: true, result: { output: STUB_OUTPUT } });
+		const { runId } = (await (await hono.request(post(submitBody({ waitMs: 0 })))).json()) as { runId: string };
+		stub.resolveNow();
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		const res = await hono.request(
+			new Request(`http://local/runs/${runId}`, { headers: { "x-internal-token": TOKEN } }),
+		);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { answer?: unknown };
+		expect(body.answer).toEqual(ANSWER);
+	});
+
+	it("出口 1(幂等重放)带 answer", async () => {
+		// 同一 clientRequestId 二次提交,第一次已把行落成终态 ⇒ 第二次走 idempotent 分支。
+		const { hono, stub } = app({ result: { output: STUB_OUTPUT } });
+		const body = submitBody({ waitMs: 5000 });
+		const first = await hono.request(post(body));
+		expect(first.status).toBe(200);
+		const second = await hono.request(post(body));
+		expect(second.status).toBe(200);
+		const json = (await second.json()) as { answer?: unknown };
+		expect(json.answer).toEqual(ANSWER);
+		expect(stub.runCalls).toBe(1);
+	});
+
+	it("出口 2(等待窗口超时但行已终态)带 answer", async () => {
+		// 这一支的"竞速输了"必须是真输,不能只是"跑得快":JS 的微任务恒先于宏任务清空,
+		// 一个不依赖真实定时器的完成路径(哪怕再快)也会先于 waitMs 的 setTimeout 落定,
+		// 结果会落进出口 3 而不是出口 2。要让 app.ts 的等待窗口 setTimeout 真正胜出,
+		// 完成路径必须是一个"真的挂起、不会自己结束"的 promise —— hang:true 的 runtime
+		// 正是这个角色:它保证 outcome.completion 在本用例生命周期内绝不通过正常路径
+		// 结算。行终态改由测试直接调用 store.finish() 造出(模拟"另有旁路已经把行写成
+		// 终态"这一刻),时间上早于等待窗口到期,从而复现 app.ts:140 那个分支。
+		const runtimeFactory = async ({ runId }: { runId: string }) => {
+			setTimeout(() => {
+				store.finish(
+					runId,
+					{
+						runId,
+						specId: SPEC.id,
+						status: "completed",
+						output: STUB_OUTPUT,
+						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+						turns: 1,
+						durationMs: 1,
+						judgeAttempts: {},
+					},
+					Date.now(),
+				);
+			}, 10);
+			return createStubRuntime({ hang: true });
+		};
+		const manager = new RunManager({
+			store,
+			gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 1, retryAfterSeconds: 3 }),
+			runtimeFactory,
+		});
+		const hono = createApp({ manager, router: new SpecRouter([SPEC]), store, internalToken: TOKEN });
+
+		const res = await hono.request(post(submitBody({ waitMs: 100 })));
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { status: string; answer?: unknown };
+		expect(body.status).toBe("completed");
+		expect(body.answer).toEqual(ANSWER);
+	});
+
+	it("answer 与 output 的 JSON 块深等", async () => {
+		// extractJsonBlock(output) 的 kind === "ok" 且 value toEqual answer
+		const { hono } = app({ result: { output: STUB_OUTPUT } });
+		const res = await hono.request(post(submitBody({ waitMs: 5000 })));
+		const body = (await res.json()) as { output: string; answer?: unknown };
+		const extracted = extractJsonBlock(body.output);
+		expect(extracted.kind).toBe("ok");
+		if (extracted.kind === "ok") expect(extracted.value).toEqual(body.answer);
+	});
+
+	it("output 不含 JSON 时缺省 answer 而不抛", async () => {
+		// stub 输出纯散文 ⇒ 200 且 "answer" 不出现在响应体里(不是 toBeUndefined,那个对
+		// "键存在但值为 undefined" 也会通过)。
+		const { hono } = app({ result: { output: PROSE_OUTPUT } });
+		const res = await hono.request(post(submitBody({ waitMs: 5000 })));
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body).not.toHaveProperty("answer");
 	});
 });

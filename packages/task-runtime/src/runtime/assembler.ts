@@ -81,6 +81,19 @@ export interface Assembled {
 	 */
 	resources: DefaultResourceLoader;
 	dispose: () => Promise<void>;
+	/**
+	 * 不经 agent loop 直接调本次装配的工具。与 `PluginContext.callTool` **是同一个函数**
+	 * (assemble() 内部只造一次),所以合成事件、未知工具名的响亮报错都一致。
+	 *
+	 * 暴露它是给 `fast-path-runtime.ts` 用的:快路径的模型看不到任何工具,检索由代码发起。
+	 *
+	 * 🔴 与 `assembler.ts` 里 `emitPluginToolEvent` 那条硬性约束的关系:那条说的是
+	 * 「callTool 的结果不得进 C6 的 clauseIds」,针对的是**插件探针**(探针取回的东西不是
+	 * 模型的证据)。快路径不同 —— 代码检索到并拼进模型② prompt 的**就是**模型的证据,
+	 * 所以 `fast-path-runtime.ts` 自己维护一份 clauseIds,**只收真正拼进 prompt 的那批**。
+	 * 那条约束本身不动。
+	 */
+	callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 }
 
 /**
@@ -271,6 +284,7 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 				session.dispose();
 				await disposeToolset();
 			},
+			callTool: pluginContext.callTool,
 		};
 	} catch (error) {
 		// createAgentSession (or anything above it in this block) threw before the caller

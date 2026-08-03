@@ -713,6 +713,23 @@ describe("PluginContext.callTool(C3 接线)", () => {
 		expect(thrown?.message).toMatch(/no-such-tool/);
 		expect(thrown?.message).toMatch(/does not provide/);
 	});
+
+	it("exposes callTool on the assembled result", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			spec: spec(),
+			profile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			pluginContext: pluginContext(),
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+		await expect(assembled.callTool("echo", { text: "hi" })).resolves.toBeDefined();
+	});
 });
 
 describe("C7:spec 声明的 skill 注入", () => {

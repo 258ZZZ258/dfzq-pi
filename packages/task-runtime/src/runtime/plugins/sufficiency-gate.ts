@@ -37,7 +37,9 @@ export function extractMatters(input: string): string[] {
  *
  * ⚠ 字段名跟着 C1 走:那边刻意叫 `hit_count_sufficient` 而不是 `sufficient` ——
  * 底层 `assess()` 只做 `len(candidates) >= min_hits` 的计数,**不做语义判定**。
- * 真正有判定力的是 `unfetched`:检索到了却没取正文就下结论,是这个判官要拦的事。
+ * `unfetched` 的语义没变(检索到了却没取正文的那些);但有判定力的只是它与
+ * `basis` 引用的交集 ——「被引用了、却没取过正文就下结论」才是这个判官要拦的事,
+ * 检索到了却没打算引用的,不算。
  */
 interface AssessToolResult {
 	hit_count_sufficient?: boolean;
@@ -51,13 +53,14 @@ interface AssessToolResult {
  *
  * C3 判据收窄靠它:旧判据是 `unfetched.length === 0`,要求把**检索到过的每一条**都取完正文
  * —— `search_policy` 每次回 8 条、`enumerate_clauses` 回最多 50 条,实测不可满足
- * (规格 §1.5:真 run `5a29d7bf` 连判两次不通过,最后靠 onExhausted:"pass" 放行,白花 42.3s)。
+ * (规格 §1.4:真 run `5a29d7bf` 连判两次不通过,最后靠 onExhausted:"pass" 放行,白花 42.3s)。
  *
  * 收窄后判的是「**被引用了、却没取过正文**」—— 那才是 system.md:12 那条纪律要拦的事
  * (凭条款标题猜内容)。
  *
  * 解析不出 JSON / 没有 basis ⇒ 回 `[]` ⇒ 交集必空 ⇒ C3 放行。**这是有意的**:
- * 那种输出的病是「不合契约」,归 C6 判,不该由 C3 用一个语义不对的理由拦下来。
+ * 那种输出的病是「不合契约」,在 C6 挂载时(spec 声明了 `outputContract`)归它判,
+ * 不该由 C3 用一个语义不对的理由拦下来。
  */
 export function extractBasisClauseIds(assistantText: string): string[] {
 	const extracted = extractJsonBlock(assistantText);

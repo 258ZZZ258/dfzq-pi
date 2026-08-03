@@ -79,13 +79,17 @@ describe("sufficiency-gate", () => {
 
 	// C3 判据收窄后,第一个参数不再是 context.clauseIds,而是 basis[] 引用的 clause_id
 	// (见 extractBasisClauseIds)—— 这条钉住调用点确实换了参数来源,不是还在传 clauseIds。
+	// clauseIds 必须是 basis 引用集合的**真超集**(多一个 "A-3"):若调用点退回
+	// context.clauseIds,assess 会收到三个 id,与下面断言的两个不等 ⇒ 翻红。
+	// 用真超集是关键 —— 此前 clauseIds 与 basis 引用的 id 完全相同,两种参数来源产出的
+	// 断言都成立,变异回 context.clauseIds 这条测试照样绿,钉不住调用点。
 	it("passes the basis-cited clause ids and the resolved matters to assess", async () => {
 		const judges: FinalJudge[] = [];
 		const assess = vi.fn(async () => ({ sufficient: true, covered: [], missing: [] }));
 		createSufficiencyGateDescriptor(assess).factory(makeContext(judges), { matters: ["合规性"] });
 		await judges[0]!.judge({
 			lastAssistantText: '```json\n{"basis":[{"clause_id":"A-1"},{"clause_id":"A-2"}]}\n```',
-			clauseIds: ["A-1", "A-2"],
+			clauseIds: ["A-1", "A-2", "A-3"],
 		});
 		expect(assess).toHaveBeenCalledWith(["A-1", "A-2"], ["合规性"]);
 	});
@@ -164,10 +168,10 @@ describe("assessViaTool 的判定依据(C3 改语义后的核心)", () => {
 		lastAssistantText: '```json\n{"basis":[{"clause_id":"a"},{"clause_id":"b"}]}\n```',
 	} as never;
 
-	it("rejects when some retrieved clauses were never fetched, even if the count says sufficient", async () => {
+	it("rejects when a cited clause was retrieved but never fetched, even if the count says sufficient", async () => {
 		// **这条是改语义的全部意义**:C1 的 hit_count_sufficient 只是 len(candidates)>=min_hits
-		// 的计数,底层 assess() 不做任何语义判定。真正有判定力的是 unfetched ——
-		// 「检索到了却没取正文就下结论」。拿计数当判据 = 这个判官形同虚设。
+		// 的计数,底层 assess() 不做任何语义判定。真正有判定力的是 unfetched 与 basis 引用的
+		// 交集 ——「被引用了、却没取过正文就下结论」。拿计数当判据 = 这个判官形同虚设。
 		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2 });
 		const verdict = await judge.judge(context);
 		expect(verdict.ok).toBe(false);

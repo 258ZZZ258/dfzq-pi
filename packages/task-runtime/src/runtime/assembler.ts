@@ -85,13 +85,14 @@ export interface Assembled {
 	 * 不经 agent loop 直接调本次装配的工具。与 `PluginContext.callTool` **是同一个函数**
 	 * (assemble() 内部只造一次),所以合成事件、未知工具名的响亮报错都一致。
 	 *
-	 * 暴露它是给 `fast-path-runtime.ts` 用的:快路径的模型看不到任何工具,检索由代码发起。
+	 * 暴露它是**为后续的快路径准备的**:那条路径上模型看不到任何工具,检索由代码发起。
+	 * ⚠ 本任务只做暴露,不实现快路径。
 	 *
 	 * 🔴 与 `assembler.ts` 里 `emitPluginToolEvent` 那条硬性约束的关系:那条说的是
 	 * 「callTool 的结果不得进 C6 的 clauseIds」,针对的是**插件探针**(探针取回的东西不是
 	 * 模型的证据)。快路径不同 —— 代码检索到并拼进模型② prompt 的**就是**模型的证据,
-	 * 所以 `fast-path-runtime.ts` 自己维护一份 clauseIds,**只收真正拼进 prompt 的那批**。
-	 * 那条约束本身不动。
+	 * 所以快路径**若要用它,就得自己维护一份 clauseIds**,只收真正拼进 prompt 的那批 ——
+	 * 那是留给后续任务的责任,本任务未实现。那条约束本身不动。
 	 */
 	callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 }

@@ -61,4 +61,22 @@ export function validateSpec(spec: RuntimeSpec, ctx: ValidateContext): void {
 			throw new Error(`RuntimeSpec "${spec.id}": outputContract.maxRepairAttempts must be a non-negative integer`);
 		}
 	}
+
+	if (spec.fastPath !== undefined) {
+		const fp = spec.fastPath;
+		if (typeof fp.enabled !== "boolean") {
+			throw new Error(`RuntimeSpec "${spec.id}": fastPath.enabled must be a boolean`);
+		}
+		for (const key of ["systemPrompt", "rewritePrompt", "answerPrompt"] as const) {
+			if (typeof fp[key] !== "string" || fp[key].length === 0) {
+				throw new Error(`RuntimeSpec "${spec.id}": fastPath.${key} must be a non-empty file path`);
+			}
+		}
+		if (!Number.isInteger(fp.maxClauses) || fp.maxClauses < 1) {
+			throw new Error(`RuntimeSpec "${spec.id}": fastPath.maxClauses must be an integer >= 1`);
+		}
+		if (typeof fp.limits !== "object" || fp.limits === null) {
+			throw new Error(`RuntimeSpec "${spec.id}": fastPath.limits must be an object`);
+		}
+	}
 }

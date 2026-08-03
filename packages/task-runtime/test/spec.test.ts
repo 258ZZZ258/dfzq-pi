@@ -61,3 +61,65 @@ describe("validateSpec", () => {
 		expect(() => validateSpec(spec, ctx)).toThrow(/outputContract\.maxRepairAttempts.*non-negative integer/);
 	});
 });
+
+// 注意:limits 给 { maxTurns: 5 }(非空),不是 brief 草稿里的 {} —— validateSpec 既有的
+// 顶层 "limits must set at least one limit" 校验会在到达 fastPath 校验之前先抛,{} 会让下面
+// 四条用例全部因为这条无关的顶层校验失败,fastPath 校验分支根本测不到。
+const BASE = {
+	id: "s",
+	model: { role: "main" },
+	toolset: "t",
+	tools: ["x"],
+	limits: { maxTurns: 5 },
+};
+const CTX = { knownToolsets: new Set(["t"]), knownPlugins: new Set<string>(), knownRoles: new Set(["main"]) };
+
+describe("fastPath 校验", () => {
+	it("accepts a spec without fastPath", () => {
+		expect(() => validateSpec(BASE as never, CTX)).not.toThrow();
+	});
+
+	it("accepts a well-formed fastPath", () => {
+		const spec = {
+			...BASE,
+			fastPath: {
+				enabled: true,
+				systemPrompt: "a.md",
+				rewritePrompt: "b.md",
+				answerPrompt: "c.md",
+				maxClauses: 12,
+				limits: { maxCostUsd: 0.1 },
+			},
+		};
+		expect(() => validateSpec(spec as never, CTX)).not.toThrow();
+	});
+
+	it("rejects fastPath.maxClauses below 1", () => {
+		const spec = {
+			...BASE,
+			fastPath: {
+				enabled: true,
+				systemPrompt: "a.md",
+				rewritePrompt: "b.md",
+				answerPrompt: "c.md",
+				maxClauses: 0,
+				limits: {},
+			},
+		};
+		expect(() => validateSpec(spec as never, CTX)).toThrow(/maxClauses/);
+	});
+
+	it("rejects fastPath missing a prompt path", () => {
+		const spec = {
+			...BASE,
+			fastPath: {
+				enabled: true,
+				systemPrompt: "a.md",
+				rewritePrompt: "b.md",
+				maxClauses: 12,
+				limits: {},
+			},
+		};
+		expect(() => validateSpec(spec as never, CTX)).toThrow(/answerPrompt/);
+	});
+});

@@ -118,6 +118,42 @@ export interface RuntimeSpec {
 
 	/** 缺省即不挂 C6(输出契约判官)—— 既有 spec 的行为不变。 */
 	outputContract?: OutputContractSpec;
+
+	/** 缺省不填 = 不启用,既有 spec 行为不变。 */
+	fastPath?: FastPathSpec;
+}
+
+/**
+ * 快路径:模型调用次数固定为 2 次(先改写检索词,再对代码检索好的正文一次作答)。
+ * 缺省不填 = 不启用,既有 spec 行为不变。产出不达标时升级回既有的 agent 自主编排路径 ——
+ * 升级判定与两次模型调用的编排由后续任务实现,本接口这里只声明配置,不做调度。
+ *
+ * **不另起 spec 文件**:SpecRouter 是 taskKind → spec 1:1、每个 .json 一个 taskKind
+ * (router.ts:21),另起文件会凭空多出一个 Java 不会调的 taskKind。
+ */
+export interface FastPathSpec {
+	enabled: boolean;
+	/**
+	 * 快路径的 system prompt,**文件路径**(与 `RuntimeSpec.systemPrompt` 同一套语义:
+	 * 无条件当路径处理,构造期读成正文,读不到直接抛)。
+	 *
+	 * ⚠ 必须**中性**:两次模型调用共用同一个 AgentSession ⇒ 共用同一份 system prompt。
+	 * 把输出契约写进这里,模型①(改写检索词那次)会直接吐 JSON 而不是改写词。
+	 * 输出契约放 `answerPrompt`。
+	 */
+	systemPrompt: string;
+	/** 模型① 的 user 消息模板,文件路径,同 `systemPrompt` 的路径语义。 */
+	rewritePrompt: string;
+	/** 模型② 的 user 消息模板(含输出契约正文),文件路径,同 `systemPrompt` 的路径语义。 */
+	answerPrompt: string;
+	/** 取正文的 clause_id 条数上限。 */
+	maxClauses: number;
+	/** 快路径自己的限额。`maxTurns` 不适用(结构固定 2 次模型调用)。 */
+	limits: RuntimeLimits;
+	/** 缺省沿用 `RuntimeSpec.thinkingLevel`。 */
+	thinkingLevel?: ThinkingLevel;
+	/** 覆盖 C4 result-budget 的 `maxChars`。 */
+	maxChars?: Record<string, number>;
 }
 
 export function pluginName(ref: PluginRef): string {

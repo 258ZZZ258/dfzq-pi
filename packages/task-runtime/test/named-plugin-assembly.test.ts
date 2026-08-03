@@ -166,7 +166,13 @@ describe("named plugin assembly (风险 12)", () => {
 		// 下面调用 judge() 并断言 assess 真的被我们传入的函数处理,才是不可伪造的那部分。
 		expect(gate.maxAttempts).toBe(2);
 		expect(gate.onExhausted).toBe("pass");
-		const verdict = await gate.judge({ lastAssistantText: "", clauseIds: ["A-1"] });
+		// C3 判据收窄后,judge() 的第一个参数不再是 context.clauseIds,而是从
+		// lastAssistantText 的 basis[] 里抽出来的 clause_id(extractBasisClauseIds)——
+		// 这里的 lastAssistantText 因此要真的引用 "A-1",不能再是空串。
+		const verdict = await gate.judge({
+			lastAssistantText: '```json\n{"basis":[{"clause_id":"A-1"}]}\n```',
+			clauseIds: ["A-1"],
+		});
 		expect(verdict).toEqual({ ok: true });
 		// 装配时传入的 assess 函数被真实调用,且 matters:"auto" 真的从我们的 ctx.getRunInput()
 		// 抽取(而不是某个别的默认输入)——这证明 assemble() 把 fixture 的 options 与我们的

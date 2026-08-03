@@ -61,6 +61,9 @@ interface AssessToolResult {
  * 解析不出 JSON / 没有 basis ⇒ 回 `[]` ⇒ 交集必空 ⇒ C3 放行。**这是有意的**:
  * 那种输出的病是「不合契约」,在 C6 挂载时(spec 声明了 `outputContract`)归它判,
  * 不该由 C3 用一个语义不对的理由拦下来。
+ *
+ * ⚠ 上面这段"跳过不合法元素"的抽取本身,与 `output-contract.ts` 的 `checkConditional`
+ * 共用同一份 `extractClauseIds` 实现:改 `extractClauseIds` 会同时影响 C6 与本判官。
  */
 export function extractBasisClauseIds(assistantText: string): string[] {
 	const extracted = extractJsonBlock(assistantText);

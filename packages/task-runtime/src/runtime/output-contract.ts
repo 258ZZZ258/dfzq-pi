@@ -119,6 +119,23 @@ function describeKeyDiff(diff: KeyDiff): string {
 }
 
 /**
+ * 从 basis[] 数组的元素里取字符串 clause_id;元素不是对象、没有这个键、或值不是字符串,
+ * 都直接跳过(不计入返回值,也不报错)。
+ *
+ * `checkConditional` 的反幻觉判据与 `sufficiency-gate.ts` 的 `extractBasisClauseIds`
+ * 共用这一份 —— Task 2 引入 `extractBasisClauseIds` 时与此处逐字重复,本任务合并。
+ * basis 是否为空、整段 JSON 能否解析,分别由各自调用方在调用前后处理,这个函数只认
+ * "给定一个数组,从里面挑得出字符串 clause_id 的元素"。
+ */
+export function extractClauseIds(basis: readonly unknown[]): string[] {
+	return basis
+		.map((item) =>
+			typeof item === "object" && item !== null ? (item as { clause_id?: unknown }).clause_id : undefined,
+		)
+		.filter((id): id is string => typeof id === "string");
+}
+
+/**
  * §4.2 的条件约束 + 反幻觉。返回错误说明,通过时返回 undefined。
  *
  * **⚠ 反幻觉这一段的有效性寄生在 schema 上,这里不强制、也强制不了(2026-07-31 全分支
@@ -137,24 +154,6 @@ function describeKeyDiff(diff: KeyDiff): string {
  * 验收兜底",不是遗漏** —— 规格 §8 的验收用例应当包含"basis 带未检索到的 clause_id ⇒ 判
  * 失败"这一条,那才是这条约束的可执行凭证。
  */
-
-/**
- * 从 basis[] 数组的元素里取字符串 clause_id;元素不是对象、没有这个键、或值不是字符串,
- * 都直接跳过(不计入返回值,也不报错)。
- *
- * `checkConditional` 的反幻觉判据与 `sufficiency-gate.ts` 的 `extractBasisClauseIds`
- * 共用这一份 —— 两处这条 `.map`/`.filter` 链此前逐字重复(2026-07-31 全分支审查
- * Minor,见 task-3 交接)。basis 是否为空、整段 JSON 能否解析,分别由各自调用方在
- * 调用前后处理,这个函数只认"给定一个数组,从里面挑得出字符串 clause_id 的元素"。
- */
-export function extractClauseIds(basis: readonly unknown[]): string[] {
-	return basis
-		.map((item) =>
-			typeof item === "object" && item !== null ? (item as { clause_id?: unknown }).clause_id : undefined,
-		)
-		.filter((id): id is string => typeof id === "string");
-}
-
 function checkConditional(json: ContractShape, clauseIds: readonly string[]): string | undefined {
 	const basis = Array.isArray(json.basis) ? json.basis : [];
 	if (json.finish_reason === "stop" && basis.length === 0) {
@@ -185,9 +184,9 @@ function checkConditional(json: ContractShape, clauseIds: readonly string[]): st
 export type ContractCheck = { ok: true; value: unknown } | { ok: false; detail: string; followUp: string };
 
 /**
- * 输出契约校验的**唯一实现**。C6 判官(`createOutputContractJudge`)与快路径
- * (`fast-path-runtime.ts` 的升级判据)都调它 —— 两处各写一套必然漂移,而这一份正是
- * 反幻觉兜底(风险 10)的唯一落点。
+ * 输出契约校验的**唯一实现**。C6 判官(`createOutputContractJudge`)调它;快路径
+ * (后续任务)将调它 —— 两处各写一套必然漂移,而这一份正是反幻觉兜底(风险 10)的
+ * 唯一落点。
  */
 export function validateOutputContract(text: string, schema: unknown, clauseIds: readonly string[]): ContractCheck {
 	const extracted = extractJsonBlock(text);

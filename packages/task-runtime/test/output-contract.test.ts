@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { createOutputContractJudge, extractJsonBlock } from "../src/runtime/output-contract.ts";
+import { createOutputContractJudge, extractJsonBlock, validateOutputContract } from "../src/runtime/output-contract.ts";
 
 const SCHEMA = {
 	type: "object",
@@ -270,5 +270,46 @@ describe("A8 反幻觉兜底(出厂 schema)", () => {
 		});
 		expect(verdict.ok).toBe(false);
 		if (!verdict.ok) expect(verdict.detail).toContain("clause_id");
+	});
+});
+
+const VALIDATE_SCHEMA = {
+	type: "object",
+	required: ["conclusion", "basis", "finish_reason"],
+	properties: {
+		conclusion: { type: "string" },
+		finish_reason: { enum: ["stop", "refused"] },
+		basis: {
+			type: "array",
+			items: { type: "object", required: ["clause_id"], properties: { clause_id: { type: "string" } } },
+		},
+	},
+} as const;
+
+describe("validateOutputContract", () => {
+	it("returns the parsed value when everything checks out", () => {
+		const text = '```json\n{"conclusion":"c","finish_reason":"stop","basis":[{"clause_id":"A-1"}]}\n```';
+		const got = validateOutputContract(text, VALIDATE_SCHEMA, ["A-1"]);
+		expect(got.ok).toBe(true);
+		if (got.ok) expect((got.value as { conclusion: string }).conclusion).toBe("c");
+	});
+
+	it("rejects a basis clause_id that was never retrieved", () => {
+		const text = '```json\n{"conclusion":"c","finish_reason":"stop","basis":[{"clause_id":"臆造-1"}]}\n```';
+		const got = validateOutputContract(text, VALIDATE_SCHEMA, ["A-1"]);
+		expect(got.ok).toBe(false);
+		if (!got.ok) expect(got.detail).toContain("臆造-1");
+	});
+
+	it("rejects text with no JSON block", () => {
+		const got = validateOutputContract("没有 JSON", VALIDATE_SCHEMA, []);
+		expect(got.ok).toBe(false);
+		if (!got.ok) expect(got.detail).toBe("未找到 JSON 块");
+	});
+
+	it("rejects a schema violation", () => {
+		const text = '```json\n{"conclusion":"c","finish_reason":"nope","basis":[]}\n```';
+		const got = validateOutputContract(text, VALIDATE_SCHEMA, []);
+		expect(got.ok).toBe(false);
 	});
 });

@@ -1,5 +1,5 @@
 import type { FinalJudge, JudgeContext, JudgeVerdict } from "../final-judge.ts";
-import { extractJsonBlock } from "../output-contract.ts";
+import { extractClauseIds, extractJsonBlock } from "../output-contract.ts";
 import type { PluginContext, PluginDescriptor } from "../plugin-registry.ts";
 
 export const SUFFICIENCY_GATE_PLUGIN_NAME = "sufficiency-gate";
@@ -67,11 +67,7 @@ export function extractBasisClauseIds(assistantText: string): string[] {
 	if (extracted.kind !== "ok") return [];
 	const basis = (extracted.value as { basis?: unknown }).basis;
 	if (!Array.isArray(basis)) return [];
-	return basis
-		.map((item) =>
-			typeof item === "object" && item !== null ? (item as { clause_id?: unknown }).clause_id : undefined,
-		)
-		.filter((id): id is string => typeof id === "string");
+	return extractClauseIds(basis);
 }
 
 /** 缺省实现:走 per-run 的 MCP 会话调 C1。注入版保留作测试缝。 */

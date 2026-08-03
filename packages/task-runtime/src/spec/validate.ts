@@ -78,5 +78,23 @@ export function validateSpec(spec: RuntimeSpec, ctx: ValidateContext): void {
 		if (typeof fp.limits !== "object" || fp.limits === null) {
 			throw new Error(`RuntimeSpec "${spec.id}": fastPath.limits must be an object`);
 		}
+		// maxTurns 对快路径不适用(结构固定 2 次模型调用,FastPathSpec.limits 的文档已注明)——
+		// 严格度对齐顶层 spec.limits 的既有判据(30-38 行):runTimeoutMs / maxCostUsd /
+		// maxTotalTokens 至少命中一条,命中的每一项都必须是正数。挂钟硬顶(runTimeoutMs)缺失时
+		// 快路径没有超时兜底,一次挂死会把两条路径的耗时相加。
+		const fastPathLimitKeys = ["runTimeoutMs", "maxCostUsd", "maxTotalTokens"] as const;
+		const fastPathLimitEntries = fastPathLimitKeys
+			.map((key) => [key, fp.limits[key]] as const)
+			.filter(([, value]) => value !== undefined);
+		if (fastPathLimitEntries.length === 0) {
+			throw new Error(
+				`RuntimeSpec "${spec.id}": fastPath.limits must set at least one of runTimeoutMs, maxCostUsd, maxTotalTokens`,
+			);
+		}
+		for (const [key, value] of fastPathLimitEntries) {
+			if (typeof value !== "number" || value <= 0) {
+				throw new Error(`RuntimeSpec "${spec.id}": fastPath.limits.${key} must be a positive number`);
+			}
+		}
 	}
 }

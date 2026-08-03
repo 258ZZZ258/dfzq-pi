@@ -390,6 +390,46 @@ describe("createDefaultRuntimeFactory - systemPrompt / appendSystemPrompt resolu
 	});
 });
 
+// Task 4 复审 I-1 的回归锁:resolve-prompt-paths.ts 里 fastPath 三个 prompt 字段的解析分支,
+// 在这条用例补上之前**零覆盖**——test/spec.test.ts 的 fastPath 用例全部直接调 validateSpec,
+// 不经过 resolveSpecPromptPaths;把 resolve-prompt-paths.ts 里 fastPath 那段解析代码整段删掉,
+// npm test --workspace=@dfzq/task-runtime 一条都不会红(与上面 Critical-2 那条回归锁守的是同一
+// 类型的坑,只是换了 spec.systemPrompt / spec.fastPath 两个不同字段)。这里照上面
+// "①坏 systemPrompt" 那条用例的同一范式补上,断在生产调用点(server/main.ts:163 的
+// resolveSpecPromptPaths),不是直接调 resolveSpecPromptPaths 函数本身。
+describe("createDefaultRuntimeFactory - fastPath prompt resolution (Task 4 复审 I-1)", () => {
+	it("fails at construction time when fastPath.answerPrompt cannot be read, not on the first run", async () => {
+		const specsDir = join(root, "specs");
+		// systemPrompt / rewritePrompt 都指向真实存在的文件——只让 answerPrompt 触发失败,
+		// 这样断言的 /fastPath\.answerPrompt/ 才是精确定位到那一个字段,不是三选一撞上的。
+		await writeFile(join(specsDir, "fp-system.md"), "快路径 system prompt 正文\n");
+		await writeFile(join(specsDir, "fp-rewrite.md"), "快路径改写 prompt 正文\n");
+		await writeFile(
+			join(specsDir, "bad-fastpath-answer-prompt.json"),
+			JSON.stringify({
+				id: "bad-fastpath-answer-prompt",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				fastPath: {
+					enabled: true,
+					systemPrompt: "fp-system.md",
+					rewritePrompt: "fp-rewrite.md",
+					answerPrompt: "missing-fp-answer.md",
+					maxClauses: 12,
+					limits: { runTimeoutMs: 5000 },
+				},
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		await expect(
+			createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir }),
+		).rejects.toThrow(/fastPath\.answerPrompt/);
+	});
+});
+
 // 以下用例来自评审对 main.ts 的复审(Critical + Important),补在 brief 逐字采用的
 // describe("server startup", ...) 之外,不动上面那段。
 describe("server shutdown safety", () => {

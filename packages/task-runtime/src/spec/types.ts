@@ -128,8 +128,10 @@ export interface RuntimeSpec {
  * 缺省不填 = 不启用,既有 spec 行为不变。产出不达标时升级回既有的 agent 自主编排路径 ——
  * 升级判定与两次模型调用的编排由后续任务实现,本接口这里只声明配置,不做调度。
  *
- * **不另起 spec 文件**:SpecRouter 是 taskKind → spec 1:1、每个 .json 一个 taskKind
- * (router.ts:21),另起文件会凭空多出一个 Java 不会调的 taskKind。
+ * **不另起 spec 文件**:`src/router/router.ts` 的 `SpecRouter` 构造函数(12-19 行)保证
+ * taskKind → spec 1:1(重复 id 装配期抛);`loadSpecRouter`(40-52 行)按目录下每个 `.json`
+ * 文件各自 parse 出一个 spec,一个文件对应一个 taskKind。另起文件会凭空多出一个 Java 不会调的
+ * taskKind。
  */
 export interface FastPathSpec {
 	enabled: boolean;

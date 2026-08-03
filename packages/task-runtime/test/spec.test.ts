@@ -122,4 +122,53 @@ describe("fastPath 校验", () => {
 		};
 		expect(() => validateSpec(spec as never, CTX)).toThrow(/answerPrompt/);
 	});
+
+	// 复审 I-2:fastPath.limits 是必填字段(注释写着「快路径自己的限额」,不像 thinkingLevel /
+	// maxChars 那样声明「缺省继承」),{} 只能读作「一条限额都没设」,必须按顶层 spec.limits
+	// 同一严格度拒绝——否则 runTimeoutMs 缺失时快路径没有挂钟硬顶,一次挂死会把两条路径的
+	// 耗时相加。
+	it("rejects fastPath.limits with none of runTimeoutMs/maxCostUsd/maxTotalTokens set", () => {
+		const spec = {
+			...BASE,
+			fastPath: {
+				enabled: true,
+				systemPrompt: "a.md",
+				rewritePrompt: "b.md",
+				answerPrompt: "c.md",
+				maxClauses: 12,
+				limits: {},
+			},
+		};
+		expect(() => validateSpec(spec as never, CTX)).toThrow(/fastPath\.limits/);
+	});
+
+	it("rejects fastPath.limits with a negative value", () => {
+		const spec = {
+			...BASE,
+			fastPath: {
+				enabled: true,
+				systemPrompt: "a.md",
+				rewritePrompt: "b.md",
+				answerPrompt: "c.md",
+				maxClauses: 12,
+				limits: { runTimeoutMs: -1 },
+			},
+		};
+		expect(() => validateSpec(spec as never, CTX)).toThrow(/fastPath\.limits\.runTimeoutMs.*positive/);
+	});
+
+	it("rejects fastPath.limits with a non-number value", () => {
+		const spec = {
+			...BASE,
+			fastPath: {
+				enabled: true,
+				systemPrompt: "a.md",
+				rewritePrompt: "b.md",
+				answerPrompt: "c.md",
+				maxClauses: 12,
+				limits: { maxCostUsd: "5" },
+			},
+		};
+		expect(() => validateSpec(spec as never, CTX)).toThrow(/fastPath\.limits\.maxCostUsd.*positive/);
+	});
 });

@@ -26,6 +26,13 @@ function looksLikePath(item: string): boolean {
  *
  * 错误信息带 spec id、字段名(含 `fastPath.` 前缀区分是哪个字段)、原始值、解析后的绝对路径,
  * 与既有的 `systemPrompt` / `appendSystemPrompt` 报错同构。
+ *
+ * ⚠ `original` 形参标了 `string`,但生产序上 `resolveSpecPromptPaths` 跑在 `validateSpec` 之前
+ * (`server/main.ts` 先解析 prompt 路径,`assemble()` 内部才校验 spec 形状)——一个畸形 spec
+ * (比如 `fastPath` 缺了某个 prompt 字段)在校验层拦下之前会先走到这里,此时 `original` 在运行期
+ * 可能是 `undefined`。`resolve(specsDir, undefined)` 会抛一个不带 spec id / 字段名的
+ * `ERR_INVALID_ARG_TYPE`,与 `readFile` 失败时的报错形状不同构,排障时看不出是哪个 spec、哪个
+ * 字段——下面这行前置校验把它拦成与 `readFile` 失败同构的报错。
  */
 async function readPromptPathField(
 	specId: string,
@@ -33,6 +40,9 @@ async function readPromptPathField(
 	original: string,
 	specsDir: string,
 ): Promise<string> {
+	if (typeof original !== "string") {
+		throw new Error(`Spec "${specId}": ${fieldLabel} must be a non-empty file path, got ${JSON.stringify(original)}`);
+	}
 	const abs = resolve(specsDir, original);
 	try {
 		return await readFile(abs, "utf8");

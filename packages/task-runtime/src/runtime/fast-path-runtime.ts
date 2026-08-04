@@ -167,7 +167,8 @@ function toHits(raw: unknown): RetrievalHit[] {
  * (那个数组只装 anchor 压根查不到的 id,:105-111)。这种行只有标题元数据,模型看不到正文却
  * 能引用它;若 `clauseIds` 沿用"这一行在 `items` 里出现过"当判据,C6 的反幻觉校验会认可这条
  * 引用——规格 §2.3 的"阶段 1 里模型看得见的条款都有正文"这条语义保证就不成立了,而那正是
- * §4.2 摘掉 C3(sufficiency-gate)的**唯一理由**(见 `deriveFastSpec` 上方注释)。
+ * §4.2 摘掉 C3(sufficiency-gate)**两条理由之一**(另一条独立成立:C3 的动作是 reprompt,
+ * 破坏「模型调用固定 2 次」,不依赖 §2.3 这条语义保证。两条理由见 `deriveFastSpec` 上方注释)。
  */
 function hasFetchedText(item: unknown): item is DetailItem {
 	if (typeof item !== "object" || item === null) return false;
@@ -403,8 +404,16 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		emit("fast_path_escalated", { reason });
 		return {
 			verdict: { accept: false, reason },
+			// status 一律 "limit_exceeded",runTimeout 不例外 —— 与 session-runtime.ts 的
+			// classify() 同口径(tripped 就是 "limit_exceeded",不看 tripped 的具体取值),
+			// 也是 docs/java-answer-contract.md:82 写死的形态("limit 仅 status ===
+			// "limit_exceeded" 时有意义")。"aborted" 在 run-manager.ts 里专指用户主动取消
+			// (finishAsAborted),把挂钟超时也映射成 "aborted" 会让 Java 侧以为是用户撤销了
+			// 请求,排障方向被带偏;而 `limit` 字段一旦被 status !== "limit_exceeded" 的结果
+			// 带出去,正是 session-runtime.ts 那段注释点名过的"下游按 status==='limit_exceeded'
+			// 记预算超支会直接漏记"那种自相矛盾组合。
 			result: normalize(runId, startedAt, output, {
-				status: tripped === "runTimeout" ? "aborted" : "limit_exceeded",
+				status: "limit_exceeded",
 				errorMessage: reason,
 				limit: tripped,
 			}),
@@ -448,8 +457,10 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 			emit("fast_path_escalated", { reason });
 			return {
 				verdict: { accept: false, reason },
+				// status 同 checkPreempted() 的口径:tripped 一律 "limit_exceeded"(含
+				// runTimeout),不映射成 "aborted" —— 见 checkPreempted 上方的注释。
 				result: normalize(runId, startedAt, session.getLastAssistantText() ?? "", {
-					status: tripped === "runTimeout" ? "aborted" : tripped ? "limit_exceeded" : "error",
+					status: tripped ? "limit_exceeded" : "error",
 					errorMessage: reason,
 					limit: tripped,
 				}),

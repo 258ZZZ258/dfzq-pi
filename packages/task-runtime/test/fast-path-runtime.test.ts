@@ -199,6 +199,9 @@ interface FastOpts {
 	hangRewriteMs?: number;
 	/** 让 get_clause_detail 的 execute 延迟这么多 ms 才返回,模拟"检索阶段挂住"。 */
 	hangDetailMs?: number;
+	/** 让 modelReplies[1](模型②作答那次回复)延迟这么多 ms 才 resolve,模拟"模型②挂住"——
+	 *  测检查点 3(promptOnce(answer) 之后、judgeFastPathOutput 之前那道复查)。 */
+	hangAnswerMs?: number;
 	/** 让 get_clause_detail 把这些 clause_id 判成"查不到详情"——进 not_found,不进 items。 */
 	detailNotFound?: string[];
 	/** 让 get_clause_detail 对这些 clause_id 返回"详情行存在但正文缺失"(C-1:text 是 null,
@@ -211,9 +214,13 @@ function rewriteReply(terms: string[]): string {
 	return body({ queries: terms });
 }
 
-/** 模型②的作答回复。默认引用 "C-1" —— fastOptions() 的 get_clause_detail 对任何请求到的
- *  clause_id 都会原样回正文,所以 "C-1" 在除"检索无命中"/"阶段 1 抛错"外的每个用例里都真实
- *  存在于 clauseIds 里。 */
+/** 模型②的作答回复。默认引用 "C-1" —— fastOptions() 的 get_clause_detail **缺省**对任何请求到
+ *  的 clause_id 都原样回正文,所以不传 `detailNotFound` / `detailNullText` 的用例里,"C-1" 都
+ *  真实存在于 clauseIds 里。**例外**:①"检索无命中"/"阶段 1 抛错"两条早退路径压根到不了
+ *  promptOnce(answer),这个字符串本身用不用都无所谓;②用例若显式传了覆盖到 "C-1" 的
+ *  `detailNotFound` / `detailNullText`(比如 "emits fast_path_escalated…" 那条用
+ *  `detailNullText:["C-1","C-2","C-3"]`),"C-1" 就不再真实存在于 clauseIds 里——那类用例要么
+ *  不调 `answerReply()`,要么(如上例)在到达 promptOnce(answer) 之前就已经早退,同样不受影响。 */
 function answerReply(clauseId = "C-1"): string {
 	return body({ ...GOOD, basis: [{ clause_id: clauseId }] });
 }
@@ -223,14 +230,16 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 	cleanups.push(harness.cleanup);
 	// faux 按顺序吐:第一次 prompt 拿 modelReplies[0](改写词),第二次拿 [1](作答 JSON)。
 	// `responses` 用 `unknown[]`(与 test/session-runtime.test.ts 的 `build()` helper 同一处理)
-	// 而不是精确的 FauxResponseStep[]——`hangRewriteMs` 那个分支要塞一个零参工厂函数,零参数
-	// 结构上兼容 FauxResponseFactory 的 4 参签名(TS 允许提供更少的形参),但精确标出这个
-	// 联合类型没有必要,交给 setResponses 调用处的 `as never` 统一处理。
-	const responses: unknown[] = o.modelReplies.map((reply, index) =>
-		index === 0 && o.hangRewriteMs !== undefined
-			? () => new Promise((resolve) => setTimeout(() => resolve(fauxAssistantMessage(reply)), o.hangRewriteMs))
-			: fauxAssistantMessage(reply),
-	);
+	// 而不是精确的 FauxResponseStep[]——`hangRewriteMs`/`hangAnswerMs` 那两个分支要塞一个零参
+	// 工厂函数,零参数结构上兼容 FauxResponseFactory 的 4 参签名(TS 允许提供更少的形参),但
+	// 精确标出这个联合类型没有必要,交给 setResponses 调用处的 `as never` 统一处理。
+	const hangMsByIndex = [o.hangRewriteMs, o.hangAnswerMs];
+	const responses: unknown[] = o.modelReplies.map((reply, index) => {
+		const hangMs = hangMsByIndex[index];
+		return hangMs === undefined
+			? fauxAssistantMessage(reply)
+			: () => new Promise((resolve) => setTimeout(() => resolve(fauxAssistantMessage(reply)), hangMs));
+	});
 	harness.faux.setResponses(responses as never);
 
 	const hitCount = o.hitCount ?? 3;
@@ -473,7 +482,12 @@ describe("createFastPathRuntime", () => {
 		const got = await rt.runFast("原始问题");
 		expect(got.verdict.accept).toBe(false);
 		if (!got.verdict.accept) expect(got.verdict.reason).toContain("超时");
-		expect(got.result.status).toBe("aborted");
+		// status 与 session-runtime.ts 的 classify() 同口径:tripped(含 runTimeout)一律
+		// "limit_exceeded",不是 "aborted"——"aborted" 在 run-manager.ts 里专指用户主动取消,
+		// docs/java-answer-contract.md:82 也把 `limit` 字段的语义钉死在
+		// `status === "limit_exceeded"` 上。
+		expect(got.result.status).toBe("limit_exceeded");
+		expect(got.result.limit).toBe("runTimeout");
 		// 只发了模型①这一次 —— checkPreempted() 在 promptOnce(rewrite) 之后立刻早退,
 		// 连 get_clause_detail 都不该被调用(headStart 那次 search_policy 抢跑独立触发,
 		// 不受这条早退影响,所以不断言它不出现)。
@@ -493,9 +507,36 @@ describe("createFastPathRuntime", () => {
 		const got = await rt.runFast("原始问题");
 		expect(got.verdict.accept).toBe(false);
 		if (!got.verdict.accept) expect(got.verdict.reason).toContain("超时");
-		expect(got.result.status).toBe("aborted");
+		expect(got.result.status).toBe("limit_exceeded");
+		expect(got.result.limit).toBe("runTimeout");
 		// 只发了模型①这一次 —— 若 promptOnce(answer) 之前那道早退被删掉,这里会变成 2。
 		expect(got.result.turns).toBe(1);
+	});
+
+	it("escalates when the wall clock trips during stage 2 itself (checkpoint after promptOnce(answer))", async () => {
+		// runTimeoutMs 与 hangAnswerMs 之间留足余量(30ms vs 150ms):模型①与三次检索(无人为
+		// 延迟)必须在 30ms 内跑完,不能让计时器提前在检查点 1/2 触发——那样这条用例就退化成
+		// 重复测检查点 1/2,而不是它本该测的检查点 3。上面两条 hangRewriteMs/hangDetailMs 用例
+		// 用 runTimeoutMs:5 是刻意贴着"快腿"的真实延迟走(复审已用满载 CPU 验过 3 次不翻车),
+		// 这条反过来要给"快腿"(模型①+检索)留出比它宽裕得多的余量,两种取舍互不通用。
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				runTimeoutMs: 30,
+				hangAnswerMs: 150,
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict.accept).toBe(false);
+		if (!got.verdict.accept) expect(got.verdict.reason).toContain("超时");
+		expect(got.result.status).toBe("limit_exceeded");
+		expect(got.result.limit).toBe("runTimeout");
+		// 两次模型调用都真的发生了(与前两条超时用例不同,那两条在 promptOnce(answer) 之前就
+		// 早退,turns 停在 1)——这条的挂钟专门卡在模型②这一轮,必须走到 turns===2 才可能被
+		// 检查点 3 拦下;若检查点 3 被删掉,这里会变成 2 但 verdict.accept 变成 true(半截/完整
+		// 的 answer 文本会被正常送去 judgeFastPathOutput 判)。
+		expect(got.result.turns).toBe(2);
 	});
 
 	// 规格 §7:阶段 1 撞 limits 插件维护的阈值(不止挂钟超时)也要升级。测试用的 profile 计费

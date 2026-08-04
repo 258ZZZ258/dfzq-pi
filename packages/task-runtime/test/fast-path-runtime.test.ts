@@ -189,6 +189,21 @@ interface FastOpts {
 	onToolCall?: (name: string, args: Record<string, unknown>) => void;
 	/** 让指定工具抛错,验规格 §7 的「阶段 1 抛错 ⇒ 升级」。 */
 	toolThrows?: "search_policy" | "get_clause_detail";
+	/** fastPath.limits.runTimeoutMs 覆盖值,缺省不设(与其余用例一致,不测超时时不需要它)。 */
+	runTimeoutMs?: number;
+	/** fastPath.limits.maxTotalTokens 覆盖值,用来验规格 §7「阶段 1 撞 limits 插件的阈值 ⇒
+	 *  升级」——测试用的 profile 计费全 0,maxCostUsd 永远撞不上,只有 token 计数能触发。 */
+	maxTotalTokens?: number;
+	/** 让 modelReplies[0](模型①改写词那次回复)延迟这么多 ms 才 resolve,模拟"模型①挂住"。
+	 *  必须配合 runTimeoutMs 使用。 */
+	hangRewriteMs?: number;
+	/** 让 get_clause_detail 的 execute 延迟这么多 ms 才返回,模拟"检索阶段挂住"。 */
+	hangDetailMs?: number;
+	/** 让 get_clause_detail 把这些 clause_id 判成"查不到详情"——进 not_found,不进 items。 */
+	detailNotFound?: string[];
+	/** 让 get_clause_detail 对这些 clause_id 返回"详情行存在但正文缺失"(C-1:text 是 null,
+	 *  audit-ai 的 get_clause_detail.py:100-101"正文缺失是 null,不是错误")。 */
+	detailNullText?: string[];
 }
 
 /** 模型①的改写词回复:约定形状是 `{"queries": [...]}`(与 parseRewriteTerms 的文档同一份约定)。 */
@@ -207,7 +222,16 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 	const harness = await createFauxHarness();
 	cleanups.push(harness.cleanup);
 	// faux 按顺序吐:第一次 prompt 拿 modelReplies[0](改写词),第二次拿 [1](作答 JSON)。
-	harness.faux.setResponses(o.modelReplies.map((reply) => fauxAssistantMessage(reply)));
+	// `responses` 用 `unknown[]`(与 test/session-runtime.test.ts 的 `build()` helper 同一处理)
+	// 而不是精确的 FauxResponseStep[]——`hangRewriteMs` 那个分支要塞一个零参工厂函数,零参数
+	// 结构上兼容 FauxResponseFactory 的 4 参签名(TS 允许提供更少的形参),但精确标出这个
+	// 联合类型没有必要,交给 setResponses 调用处的 `as never` 统一处理。
+	const responses: unknown[] = o.modelReplies.map((reply, index) =>
+		index === 0 && o.hangRewriteMs !== undefined
+			? () => new Promise((resolve) => setTimeout(() => resolve(fauxAssistantMessage(reply)), o.hangRewriteMs))
+			: fauxAssistantMessage(reply),
+	);
+	harness.faux.setResponses(responses as never);
 
 	const hitCount = o.hitCount ?? 3;
 	const registry = new ToolsetRegistry();
@@ -240,20 +264,31 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 			execute: async (_id: string, params: Record<string, unknown>) => {
 				o.onToolCall?.("get_clause_detail", params);
 				if (o.toolThrows === "get_clause_detail") throw new Error("faux get_clause_detail 炸了");
+				if (o.hangDetailMs !== undefined) await new Promise((resolve) => setTimeout(resolve, o.hangDetailMs));
 				const ids = params.clause_ids as string[];
-				const items = ids.map((clause_id) => ({
-					clause_id,
-					doc_title: "某规则",
-					clause_path: clause_id,
-					status: "effective",
-					source_code: "S",
-					source_doc_id: "D",
-					version: null,
-					page_start: null,
-					page_end: null,
-					text: `${clause_id} 的正文`,
-				}));
-				const payload = JSON.stringify({ items, rejected: [], not_found: [] });
+				const notFound = new Set(o.detailNotFound ?? []);
+				const nullText = new Set(o.detailNullText ?? []);
+				const items = ids
+					.filter((clause_id) => !notFound.has(clause_id))
+					.map((clause_id) => ({
+						clause_id,
+						doc_title: "某规则",
+						clause_path: clause_id,
+						status: "effective",
+						source_code: "S",
+						source_doc_id: "D",
+						version: null,
+						page_start: null,
+						page_end: null,
+						// C-1 fixture:audit-ai 对"anchor 存在但正文缺失"的条款回 text: null,
+						// 不落 not_found(get_clause_detail.py:100-101)。
+						text: nullText.has(clause_id) ? null : `${clause_id} 的正文`,
+					}));
+				const payload = JSON.stringify({
+					items,
+					rejected: [],
+					not_found: ids.filter((clause_id) => notFound.has(clause_id)),
+				});
 				return { output: payload, content: payload };
 			},
 		} as never,
@@ -274,7 +309,11 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 				rewritePrompt: '把问题改写成检索词,只输出 JSON 对象 {"queries": [...]}。',
 				answerPrompt: "依据下面的条款作答,输出契约 JSON。",
 				maxClauses: o.maxClauses ?? 12,
-				limits: { maxCostUsd: 1 },
+				limits: {
+					maxCostUsd: 1,
+					...(o.runTimeoutMs !== undefined ? { runTimeoutMs: o.runTimeoutMs } : {}),
+					...(o.maxTotalTokens !== undefined ? { maxTotalTokens: o.maxTotalTokens } : {}),
+				},
 			},
 		},
 		profile,
@@ -307,6 +346,9 @@ describe("createFastPathRuntime", () => {
 		expect(calls.map((c) => c.name)).toEqual(["search_policy", "search_policy", "get_clause_detail"]);
 		// 批量:一次调用带上全部 clause_id,不是一条一次
 		expect((calls[2]!.args.clause_ids as string[]).length).toBeGreaterThan(1);
+		// M-4:用例名说"exactly two model calls",此前没有断言真的验过——turns 就是
+		// promptOnce() 的调用次数(fast-path-runtime.ts 的 modelCalls)。
+		expect(got.result.turns).toBe(2);
 	});
 
 	it("caps the fetched clause_ids at fastPath.maxClauses", async () => {
@@ -371,19 +413,36 @@ describe("createFastPathRuntime", () => {
 		if (!got.verdict.accept) expect(got.verdict.reason).toContain("抛错");
 	});
 
-	it("counts ONLY the clause_ids whose text was fetched as retrieved (anti-hallucination source)", async () => {
-		// 命中 30 条、只取 12 条正文 ⇒ 引用第 20 条必须被判臆造
+	it("counts ONLY clause_ids with real fetched text — excludes rows dropped by maxClauses, not_found, and text:null (anti-hallucination source; C-1/I-2)", async () => {
+		// 命中 30 条、maxClauses 只留 12 条预算,再让 get_clause_detail 对其中两条回"未真正取到
+		// 正文"的两种真实形态:
+		//   - C-1 进 not_found(PG 查不到详情);
+		//   - C-2 详情行回来了但 text 是 null(get_clause_detail.py:100-101,
+		//     "正文缺失是 null,不是错误"——这类条款只有标题元数据,C-1 修复要拦的正是这个);
+		//   - C-30 命中 30 条但 maxClauses 只留 12 条预算,压根没被送去 get_clause_detail。
+		// 三种"未真正取到正文"的形态都必须被 clauseIds 排除,判官必须把三者都判臆造。
+		// 用 C-1/C-2/C-30 而不是 C-1/C-2/C-20:C-2 是 C-20 的前缀,`toContain("C-2")` 在
+		// reason 里同时出现 "C-2" 与 "C-20" 时会误判——C-30 与 C-1/C-2 互不为前缀,断言干净。
 		const rt = await createFastPathRuntime(
 			await fastOptions({
 				hitCount: 30,
 				maxClauses: 12,
-				modelReplies: [rewriteReply(["改写词一"]), answerReply("C-20")],
+				detailNotFound: ["C-1"],
+				detailNullText: ["C-2"],
+				modelReplies: [
+					rewriteReply(["改写词一"]),
+					body({ ...GOOD, basis: [{ clause_id: "C-1" }, { clause_id: "C-2" }, { clause_id: "C-30" }] }),
+				],
 			}),
 		);
 		cleanups.push(rt.dispose);
 		const got = await rt.runFast("原始问题");
 		expect(got.verdict.accept).toBe(false);
-		if (!got.verdict.accept) expect(got.verdict.reason).toContain("C-20");
+		if (!got.verdict.accept) {
+			expect(got.verdict.reason).toContain("C-1");
+			expect(got.verdict.reason).toContain("C-2");
+			expect(got.verdict.reason).toContain("C-30");
+		}
 	});
 
 	it("deactivates every tool before the first prompt", async () => {
@@ -392,5 +451,129 @@ describe("createFastPathRuntime", () => {
 		// 测试缝:锁住 setActiveToolsByName([]) 那一行 —— faux 模型本来就不调工具,
 		// 删掉那行不会有任何别的用例翻红,必须有这一条直接断言。
 		expect(rt.activeToolNamesForTest()).toEqual([]);
+	});
+
+	// C-2 / I-1:挂钟硬顶必须在两次模型调用**之间**也生效,不能只在模型②返回之后查一次 ——
+	// 否则超时期间代码会继续走完检索、发出一次完全没有上限的模型②调用,快路径存在的意义
+	// (落进 Java 的 30s 窗口)反而被自己吃掉。
+
+	it("escalates when stage 1 (the rewrite prompt) hangs past runTimeoutMs, and never fetches clause detail or dispatches stage 2", async () => {
+		const calls: string[] = [];
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				runTimeoutMs: 5,
+				hangRewriteMs: 60,
+				onToolCall: (name) => {
+					calls.push(name);
+				},
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict.accept).toBe(false);
+		if (!got.verdict.accept) expect(got.verdict.reason).toContain("超时");
+		expect(got.result.status).toBe("aborted");
+		// 只发了模型①这一次 —— checkPreempted() 在 promptOnce(rewrite) 之后立刻早退,
+		// 连 get_clause_detail 都不该被调用(headStart 那次 search_policy 抢跑独立触发,
+		// 不受这条早退影响,所以不断言它不出现)。
+		expect(got.result.turns).toBe(1);
+		expect(calls).not.toContain("get_clause_detail");
+	});
+
+	it("escalates when the wall clock trips during retrieval (between the two prompts), and still never dispatches stage 2", async () => {
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				runTimeoutMs: 5,
+				hangDetailMs: 60,
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict.accept).toBe(false);
+		if (!got.verdict.accept) expect(got.verdict.reason).toContain("超时");
+		expect(got.result.status).toBe("aborted");
+		// 只发了模型①这一次 —— 若 promptOnce(answer) 之前那道早退被删掉,这里会变成 2。
+		expect(got.result.turns).toBe(1);
+	});
+
+	// 规格 §7:阶段 1 撞 limits 插件维护的阈值(不止挂钟超时)也要升级。测试用的 profile 计费
+	// 全 0,maxCostUsd 永远撞不上,用 maxTotalTokens 触发同一条 limitState.tripped 通路。
+	it("escalates when a limits-plugin threshold trips between the two prompts (regspec §7, not just wall-clock timeout)", async () => {
+		const calls: string[] = [];
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				maxTotalTokens: 1,
+				onToolCall: (name) => {
+					calls.push(name);
+				},
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict.accept).toBe(false);
+		if (!got.verdict.accept) expect(got.verdict.reason).toContain("token 上限");
+		expect(got.result.status).toBe("limit_exceeded");
+		expect(got.result.limit).toBe("maxTotalTokens");
+		expect(got.result.turns).toBe(1);
+		// limits 插件的 turn_end 钩子在 promptOnce(rewrite) 返回后立刻触发,checkPreempted()
+		// 的检查点 1 应该在那一刻就早退——不该再走到 get_clause_detail。
+		expect(calls).not.toContain("get_clause_detail");
+	});
+
+	// I-3:抛错 / 超时 / 判负的分支,RunResult.status 都不能是 "completed" —— 否则
+	// server/routes.ts 的 toWireResult 会在 run() 被接线之后把一份未过契约的 JSON 当成
+	// 已校验的 answer 交给 Java。
+	it('never reports status:"completed" when verdict.accept is false', async () => {
+		const noHit = await createFastPathRuntime(
+			await fastOptions({ hitCount: 0, modelReplies: [rewriteReply(["x"]), answerReply()] }),
+		);
+		cleanups.push(noHit.dispose);
+		const noHitResult = await noHit.runFast("原始问题");
+		expect(noHitResult.result.status).not.toBe("completed");
+
+		const thrown = await createFastPathRuntime(
+			await fastOptions({ toolThrows: "get_clause_detail", modelReplies: [rewriteReply(["x"]), answerReply()] }),
+		);
+		cleanups.push(thrown.dispose);
+		const thrownResult = await thrown.runFast("原始问题");
+		expect(thrownResult.result.status).not.toBe("completed");
+
+		const rejected = await createFastPathRuntime(
+			await fastOptions({ modelReplies: [rewriteReply(["x"]), body({ ...GOOD, confidence: "low" })] }),
+		);
+		cleanups.push(rejected.dispose);
+		const rejectedResult = await rejected.runFast("原始问题");
+		expect(rejectedResult.verdict.accept).toBe(false);
+		expect(rejectedResult.result.status).not.toBe("completed");
+	});
+
+	// I-4:merged.length===0(检索无命中)与 items.length===0(命中但一条正文都取不到)这两条
+	// 提前返回此前不 emit fast_path_escalated——规格 §8.1 判据 2"升级率如实记录"在这两条路径
+	// 上没有任何可查询的凭证。
+	it("emits fast_path_escalated for the two early-return paths (no hits / no fetched text)", async () => {
+		const events: string[] = [];
+
+		const noHit = await createFastPathRuntime(
+			await fastOptions({ hitCount: 0, modelReplies: [rewriteReply(["x"]), answerReply()] }),
+		);
+		cleanups.push(noHit.dispose);
+		noHit.subscribe((e) => events.push(e.type));
+		await noHit.runFast("原始问题");
+		expect(events).toContain("fast_path_escalated");
+
+		events.length = 0;
+		const noText = await createFastPathRuntime(
+			await fastOptions({
+				detailNullText: ["C-1", "C-2", "C-3"],
+				modelReplies: [rewriteReply(["x"]), answerReply()],
+			}),
+		);
+		cleanups.push(noText.dispose);
+		noText.subscribe((e) => events.push(e.type));
+		await noText.runFast("原始问题");
+		expect(events).toContain("fast_path_escalated");
 	});
 });

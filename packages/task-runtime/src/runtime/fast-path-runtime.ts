@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderProfile } from "../env/provider-profile.ts";
-import { type FastPathSpec, pluginName, pluginOptions, type RuntimeSpec } from "../spec/types.ts";
+import { type FastPathSpec, pluginName, pluginOptions, type RuntimeLimits, type RuntimeSpec } from "../spec/types.ts";
 import type { ToolsetRegistry } from "../toolsets/registry.ts";
 import { type Assembled, type AssembleOptions, assemble, type PluginToolCallEvent } from "./assembler.ts";
-import type { RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
+import type { LimitKind, LimitState, RunOptions, RunResult, RunStatus, Runtime, RuntimeEvent } from "./contract.ts";
 import { mergeHitsRoundRobin, type RetrievalHit } from "./merge-hits.ts";
 import { extractJsonBlock, validateOutputContract } from "./output-contract.ts";
 import type { PluginContext, PluginRegistry } from "./plugin-registry.ts";
@@ -86,6 +86,14 @@ export function parseRewriteTerms(text: string): string[] {
 export function deriveFastSpec(spec: RuntimeSpec): RuntimeSpec {
 	const fp = spec.fastPath;
 	if (!fp) throw new Error(`RuntimeSpec "${spec.id}": deriveFastSpec called on a spec without fastPath`);
+	// ⚠ `fp.maxChars` 传下去之后其实**不生效**:`result-budget` 插件挂在 pi 的 `tool_result`
+	// hook 上做截断,而阶段 1 的检索全部经 `Assembled.callTool` 直打 `tool.execute()`,绕过
+	// pi 的 agent loop、不触发任何 hook(assembler.ts 里 `callTool` 那段实现与文档字符串)。
+	// 证据块大小眼下只由 `fastPath.maxClauses` 间接兜住,`maxChars` 这份配置整条链路都是空转。
+	// 不是本任务改的范围(改配置留给规格与计划那边同步),这里只如实记录,别让人以为它有效。
+	//
+	// 主 spec 没配 `resultPolicy` 时,下面的三元表达式会连同 `fp.maxChars` 一起静默丢弃 ——
+	// 既然 `maxChars` 本来就不生效,这不构成额外的实害,不用为它单独分支。
 	const resultPolicy =
 		fp.maxChars === undefined || spec.resultPolicy === undefined
 			? spec.resultPolicy
@@ -150,6 +158,34 @@ function toHits(raw: unknown): RetrievalHit[] {
 	);
 }
 
+/**
+ * `get_clause_detail` 的 `items` 里,"确实取到了正文"这件事只能靠 `text` 字段自己判断,不能
+ * 只看这一行是否存在。
+ *
+ * audit-ai 的 `get_clause_detail.py`(:100-101,"正文缺失是 null,不是错误")对"anchor 存在但
+ * 正文缺失"的条款照样把它塞进 `items`,只是 `text` 是 `null`——这类条款**不落 `not_found`**
+ * (那个数组只装 anchor 压根查不到的 id,:105-111)。这种行只有标题元数据,模型看不到正文却
+ * 能引用它;若 `clauseIds` 沿用"这一行在 `items` 里出现过"当判据,C6 的反幻觉校验会认可这条
+ * 引用——规格 §2.3 的"阶段 1 里模型看得见的条款都有正文"这条语义保证就不成立了,而那正是
+ * §4.2 摘掉 C3(sufficiency-gate)的**唯一理由**(见 `deriveFastSpec` 上方注释)。
+ */
+function hasFetchedText(item: unknown): item is DetailItem {
+	if (typeof item !== "object" || item === null) return false;
+	if (typeof (item as { clause_id?: unknown }).clause_id !== "string") return false;
+	const text = (item as { text?: unknown }).text;
+	return typeof text === "string" && text.trim().length > 0;
+}
+
+/** `limitState.tripped` 的人可读描述。快路径结构上不用 `maxTurns`(固定 2 次模型调用,
+ *  `FastPathSpec.limits` 的文档已注明),这里仍覆盖它只是为了穷尽 `LimitKind` 的类型,
+ *  不代表期望它触发。 */
+function describeTripped(kind: LimitKind, limits: RuntimeLimits): string {
+	if (kind === "runTimeout") return `阶段 1 超时(${limits.runTimeoutMs}ms)`;
+	if (kind === "maxCostUsd") return `阶段 1 撞到费用上限(maxCostUsd=${limits.maxCostUsd})`;
+	if (kind === "maxTotalTokens") return `阶段 1 撞到 token 上限(maxTotalTokens=${limits.maxTotalTokens})`;
+	return `阶段 1 撞到限额:${kind}`;
+}
+
 /** 把取到正文的条款渲染成给模型②看的正文块。**只渲染 items** —— 见下面 clauseIds 的注释。 */
 function renderEvidence(items: readonly DetailItem[], byId: ReadonlyMap<string, RetrievalHit>): string {
 	return items
@@ -180,6 +216,19 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	// `FastPathSpec | undefined`。给 `fp` 一个自己的、非 optional 的声明类型,嵌套函数里
 	// 引用到的就是这个类型本身,不需要再缩窄。
 	const fp: FastPathSpec = maybeFp;
+	// 装配期失败要早要响(全仓一贯纪律,`createSessionRuntime` 对 outputContract/schema 的
+	// 缺失校验是同一类护栏)。`outputContractSchema` 字段类型是 `unknown`,TS 拦不住调用方漏传
+	// `undefined`——而阶段 2 每一次作答都要靠它判定 accept/escalate,不是可选项。漏传时的
+	// 实际后果已经跑过:`judgeFastPathOutput` 在 `validateOutputContract` 内部对 `undefined`
+	// 的 schema 做 `Value.Check` 会抛 `Cannot use 'in' operator to search for 'type' in
+	// undefined`,这个 TypeError 会被 `runFast()` 的 catch 吞成一句看不出病因的"阶段 1 抛错",
+	// 快路径因此对每一次调用都静默升级。装配期直接响亮拒绝,不留这个坑给运行期猜。
+	if (options.outputContractSchema === undefined) {
+		throw new Error(
+			`RuntimeSpec "${options.spec.id}": createFastPathRuntime requires outputContractSchema ` +
+				`(it is used to judge every stage-2 answer; omitting it turns every run into a silent escalation)`,
+		);
+	}
 	const fastSpec = deriveFastSpec(options.spec);
 
 	let currentRunId = "";
@@ -206,19 +255,46 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		}
 	}
 
-	// `assembled` 要等 assemble() 返回才有值,但下面 pluginContext 的几个闭包
-	// (getSession/abort)要在**构造 pluginContext 字面量时**就引用它——用 `let ...!:` 声明
-	// (与 session-runtime.ts 的 `assembled` 同一处理)而不是 `const assembled = await
-	// assemble(...)` 之后再原地内联 pluginContext:后者会在同一函数作用域内让这些闭包引用一个
-	// 文本顺序上还没声明的 `const`,触发 TS2448。这些闭包只在 assemble() 已经 resolve 之后
-	// (某个 hook / 判官回调里)才会被真正调用,所以运行时时序没问题,问题只在编译期的声明顺序。
+	// limits 插件(由 assemble() 从 fastSpec.limits 无条件挂载)与我们自己的 runTimeoutMs
+	// 定时器共写这一个 LimitState.tripped——同一份单一事实来源,`checkPreempted()` 只需要
+	// 查这一处。命名为独立的 const(而不是内联在 pluginContext 字面量里)是因为 runFast()
+	// 也要读它。
+	const limitState: LimitState = { turns: 0 };
+
+	// `assembled` 要等 assemble() 返回才有值。下面 pluginContext 的 getSession 闭包要在
+	// **构造 pluginContext 字面量时**就引用它——用 `let ...!:` 声明(与 session-runtime.ts
+	// 的 `assembled` 同一处理)而不是 `const assembled = await assemble(...)` 之后再原地内联
+	// pluginContext:后者会在同一函数作用域内让闭包引用一个文本顺序上还没声明的 `const`,
+	// 触发 TS2448。
+	//
+	// ⚠ 这个闭包在 fastSpec 眼下挂载的两个插件(limits、result-budget)身上确实只在 hook
+	// 回调里才被调用,但那是这两个插件恰好这么写,不是 PluginContext 的契约保证:
+	// `assemble()` 对插件工厂的调用是**同步**的、发生在 assemble() 返回之前
+	// (`instantiatePlugins()`——`test/assembler.test.ts` 的 "PluginContext.callTool(C3 接线)"
+	// 那组用例就是在工厂体内**同步**调 `ctx.callTool` 的),同一个 PluginContext 上的
+	// `getSession` 原则上可以被将来某个装了 extraPlugins 的插件同样同步调用。裸读
+	// `assembled.session` 在那种情况下只会抛一句不指向病因的
+	// "Cannot read properties of undefined",所以下面的 `getSession` 自带一道描述性护栏
+	// (与 session-runtime.ts 的 `getSession` 同款),不指望这条注释兜底。
 	let assembled!: Assembled;
+	// `abort` 不需要同一道护栏:装配期(assembled 还没有值)调用它没有任何东西可 abort,
+	// 让它是个安全的空操作即可——这里照抄 session-runtime.ts 的 `abortFn` 模式,先给一个
+	// 空操作默认值,assemble() 返回之后再指向真正会话。
+	let abortFn: () => void = () => {};
 
 	const pluginContext: Omit<PluginContext, "callTool"> = {
 		getRunId: () => currentRunId,
-		getSession: () => assembled.session,
-		abort: () => void assembled.session.abort().catch(() => {}),
-		limitState: { turns: 0 },
+		getSession: () => {
+			if (!assembled) {
+				throw new Error(
+					`FastPathRuntime "${options.spec.id}": PluginContext.getSession() was called during assembly, ` +
+						"before the AgentSession exists; plugin factories must defer session access to hook callbacks",
+				);
+			}
+			return assembled.session;
+		},
+		abort: () => abortFn(),
+		limitState,
 		// 阶段 1 不注册任何判官(deriveFastSpec 已摘掉 stopPolicy / outputContract),
 		// 但接口要求这个字段存在。若将来有插件想在这里登记判官,是设计错误 ——
 		// 快路径的确定性建立在「模型调用固定 2 次」上,判官会 reprompt。
@@ -243,6 +319,20 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		emitPluginToolEvent: (event: PluginToolCallEvent) => emit(event.type, event),
 	});
 
+	// session-runtime.ts 的 abortFn 同一条纪律:这条回调从同步的 hook(limits 插件的
+	// turn_end)或下面 runFast() 里的 setTimeout 触发,两者都无法 await 它——session.abort()
+	// 是异步的、可能 reject,不接住会变成未处理的 promise rejection(现代 Node 视为致命)。
+	// 这是尽力而为的清理路径,不是公开的 Runtime.abort() 契约(下面 return 里那个),所以
+	// 失败在这里打日志后吞掉,而不是往上传播。
+	abortFn = () => {
+		void assembled.session.abort().catch((error: unknown) => {
+			console.error(
+				`[FastPathRuntime] abort() triggered by a limit/timeout failed for spec "${options.spec.id}"`,
+				error,
+			);
+		});
+	};
+
 	// 🔴 模型在阶段 1 **看不到任何工具**。检索全由下面的代码经 assembled.callTool 发起。
 	// 不能靠 spec 里写 `tools: []` —— validate.ts 明确拒绝空白名单
 	// ("tools must be a non-empty whitelist"),`spec.tools` 与那条校验都不动。
@@ -260,14 +350,29 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		return session.getLastAssistantText() ?? "";
 	}
 
-	function normalize(runId: string, startedAt: number, output: string, errorMessage?: string): RunResult {
+	/** 升级(verdict.accept===false)与真正的运行期失败共用的落地信息。缺省即 status:"completed"。 */
+	interface EscalationOutcome {
+		status: Exclude<RunStatus, "completed">;
+		errorMessage: string;
+		limit?: LimitKind;
+	}
+
+	// I-3:`errorMessage` 此前**没有任何调用点传值**——阶段 1 抛错 / 超时 / 判负的分支全部
+	// 落地成 `{status:"completed", output:<改写词或未过契约的那段文本>}`。这不只是措辞不准:
+	// `server/routes.ts` 的 `toWireResult` 只看 `status !== "completed"` 就放行填 `answer`
+	// (2026-07-31 复审 Important 记录的同一类闸门),一旦 `run()`(见下面 return 里的警告)
+	// 被接线,Java 会原样收到一份从未通过 `judgeFastPathOutput` 的 JSON。`verdict.accept` 与
+	// `result.status` 因此必须同步:任何 `{accept:false}` 都要有一个非 "completed" 的
+	// status,这里以 `EscalationOutcome` 参数统一收口,不再让某个分支漏传。
+	function normalize(runId: string, startedAt: number, output: string, outcome?: EscalationOutcome): RunResult {
 		const stats = session.getSessionStats();
 		return {
 			runId,
 			specId: options.spec.id,
-			status: errorMessage === undefined ? "completed" : "error",
+			status: outcome?.status ?? "completed",
 			output: output.length > 0 ? output : undefined,
-			errorMessage,
+			errorMessage: outcome?.errorMessage,
+			limit: outcome?.limit,
 			usage: {
 				input: stats.tokens.input,
 				output: stats.tokens.output,
@@ -282,48 +387,79 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		};
 	}
 
+	/**
+	 * 挂钟超时与限额插件(maxCostUsd/maxTotalTokens,由 assemble() 从 fastSpec.limits 无条件
+	 * 挂载的 limits 插件负责计数)必须在两次模型调用之间也查一次,不能只在模型②返回之后查:
+	 * runTimeoutMs 的 timer 一次性、limits 插件的 turn_end 钩子命中后 `if (state.tripped)
+	 * return` 永久停手(final-judge.ts 的 runFinalJudges 注释详述过这个组合),而 abort 本身
+	 * 在 pi 里不是粘滞状态 —— 三条叠起来:若只在最后查一次,超时/撞限额一旦发生在模型①期间
+	 * 或两次检索期间,代码会带着"没有任何上限"的状态走完剩下的流程,发出第二次**完全无上限**
+	 * 的模型调用,快路径存在的意义(落进 Java 的 30s 窗口)反而被它自己吃掉。
+	 */
+	function checkPreempted(runId: string, startedAt: number, output: string): FastPathRun | undefined {
+		const tripped = limitState.tripped;
+		if (!tripped) return undefined;
+		const reason = describeTripped(tripped, fp.limits);
+		emit("fast_path_escalated", { reason });
+		return {
+			verdict: { accept: false, reason },
+			result: normalize(runId, startedAt, output, {
+				status: tripped === "runTimeout" ? "aborted" : "limit_exceeded",
+				errorMessage: reason,
+				limit: tripped,
+			}),
+		};
+	}
+
 	async function runFast(input: string, opts?: RunOptions): Promise<FastPathRun> {
 		const runId = opts?.runId ?? randomUUID();
 		currentRunId = runId;
 		currentInput = input;
 		modelCalls = 0;
+		// 每次 run() 开头重置:不重置的话,同一个 runtime 上的第二次 run() 会继承上一次已经
+		// tripped 的 limitState,一进来就被 checkPreempted() 判掉(与 session-runtime.ts 的
+		// run() 开头重置 state.turns/state.tripped 同一条纪律)。
+		limitState.turns = 0;
+		limitState.tripped = undefined;
 		const startedAt = Date.now();
 
 		// 挂钟硬顶。**必须有** —— 快路径的全部意义是落进 Java 的 30s 窗口,一次挂住的
 		// 模型调用会把两条路径的时间**相加**,比不做快路径还慢。
 		// 与 SessionRuntime 一样,timer 住在这里而不是 limits 插件里:插件只看 turn_end,
-		// 看不见轮内挂住。超时 ⇒ abort ⇒ 下面的 try/catch 转成升级,不是把 run 判成 error。
-		let timedOut = false;
+		// 看不见轮内挂住。命中时写同一个 limitState.tripped(固定值 "runTimeout"),与
+		// limits 插件共享同一份事实来源,checkPreempted() 只需要查一处。
 		let timer: NodeJS.Timeout | undefined;
 		if (fp.limits.runTimeoutMs !== undefined) {
 			timer = setTimeout(() => {
-				timedOut = true;
-				void session.abort().catch(() => {});
+				if (limitState.tripped) return; // limits 插件已经先一步 trip,不重复覆盖
+				limitState.tripped = "runTimeout";
+				abortFn();
 			}, fp.limits.runTimeoutMs);
 		}
 		try {
-			return await runFastInner(runId, input, startedAt, () => timedOut);
+			return await runFastInner(runId, input, startedAt);
 		} catch (error) {
-			// 规格 §7:阶段 1 任何抛错都**升级**,不落终态失败 —— 阶段 2 还没跑过。
-			const reason = timedOut
-				? `阶段 1 超时(${fp.limits.runTimeoutMs}ms)`
+			// 规格 §7:阶段 1 任何抛错(含超时/撞限额期间下游调用被 abort 打断导致的抛错)都
+			// **升级**,不落终态失败 —— 阶段 2 还没跑过。
+			const tripped = limitState.tripped;
+			const reason = tripped
+				? describeTripped(tripped, fp.limits)
 				: `阶段 1 抛错:${error instanceof Error ? error.message : String(error)}`;
 			emit("fast_path_escalated", { reason });
 			return {
 				verdict: { accept: false, reason },
-				result: normalize(runId, startedAt, session.getLastAssistantText() ?? ""),
+				result: normalize(runId, startedAt, session.getLastAssistantText() ?? "", {
+					status: tripped === "runTimeout" ? "aborted" : tripped ? "limit_exceeded" : "error",
+					errorMessage: reason,
+					limit: tripped,
+				}),
 			};
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
 	}
 
-	async function runFastInner(
-		runId: string,
-		input: string,
-		startedAt: number,
-		isTimedOut: () => boolean,
-	): Promise<FastPathRun> {
+	async function runFastInner(runId: string, input: string, startedAt: number): Promise<FastPathRun> {
 		// 抢跑:用原始 query 先检索一次,与模型①**并行**。唯一目的是吃掉检索后端首次调用的
 		// 模型懒加载耗时(规格 §1.2)。命中结果一并保留,不是白跑。
 		// catch 成空列表:抢跑失败不该打死整条路径 —— 改写词那几次检索还没跑。
@@ -333,7 +469,23 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 			.catch(() => [] as RetrievalHit[]);
 
 		const rewriteText = await promptOnce(`${fp.rewritePrompt}\n\n${input}`);
+		// 早退检查 1/3:模型①这一轮就可能撞上超时或限额,继续往下走会发出一次没有任何上限的
+		// 检索 + 模型②调用(见 checkPreempted 的文档)。
+		const preemptedAfterRewrite = checkPreempted(runId, startedAt, rewriteText);
+		if (preemptedAfterRewrite) return preemptedAfterRewrite;
+
 		const terms = parseRewriteTerms(rewriteText);
+		if (terms.length === 0) {
+			// M-5:这本身是规格 §2.4 认可的降级(用抢跑结果继续、不升级,见下面),不发
+			// fast_path_escalated——但"永远静默"意味着哪天 fastPath.rewritePrompt 被改歪
+			// (比如不再要求模型输出 {"queries": [...]}),快路径会**永久退化**成只用抢跑那
+			// 一次检索,而且没有任何信号能让人发现。留一条进程日志,不升成事件。
+			console.error(
+				`[FastPathRuntime] stage 1 rewrite for spec "${options.spec.id}" produced no usable queries; ` +
+					"falling back to the head-start retrieval only. If this keeps happening, fastPath.rewritePrompt " +
+					'is probably no longer asking the model for {"queries": [...]}.',
+			);
+		}
 		// 解析失败 / 空数组 ⇒ **不升级**,用抢跑那次的结果继续(规格 §2.4)。抢跑本来就在跑,
 		// 代价为零。这里刻意不发第二次模型调用去重试改写 —— 那会破坏「固定 2 次」。
 		const rewriteLists = await Promise.all(
@@ -348,23 +500,28 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		// lists[0] 是抢跑那次 —— 轮询交错时它排第一位(merge-hits.ts 的约定)。
 		const merged = mergeHitsRoundRobin([await headStart, ...rewriteLists], fp.maxClauses);
 		if (merged.length === 0) {
-			const result = normalize(runId, startedAt, rewriteText);
-			return { verdict: { accept: false, reason: "检索无命中" }, result };
+			const reason = "检索无命中";
+			emit("fast_path_escalated", { reason });
+			return {
+				verdict: { accept: false, reason },
+				result: normalize(runId, startedAt, rewriteText, { status: "error", errorMessage: reason }),
+			};
 		}
 
 		// 一次取全 —— `get_clause_detail` 的 clause_ids 是数组、minItems:1、无上限。
 		const detail = (await assembled.callTool("get_clause_detail", {
 			clause_ids: merged.map((hit) => hit.clause_id),
 		})) as { items?: unknown } | null;
-		const items = (Array.isArray(detail?.items) ? detail.items : []).filter(
-			(item): item is DetailItem =>
-				typeof item === "object" &&
-				item !== null &&
-				typeof (item as { clause_id?: unknown }).clause_id === "string",
-		);
+		// C-1:`hasFetchedText` 同时要求 clause_id 与非空 text —— "详情行回来了"不等于
+		// "正文取到了",见该函数上方的文档。
+		const items = (Array.isArray(detail?.items) ? detail.items : []).filter(hasFetchedText);
 		if (items.length === 0) {
-			const result = normalize(runId, startedAt, rewriteText);
-			return { verdict: { accept: false, reason: "检索命中但一条正文都没取到" }, result };
+			const reason = "检索命中但一条正文都没取到";
+			emit("fast_path_escalated", { reason });
+			return {
+				verdict: { accept: false, reason },
+				result: normalize(runId, startedAt, rewriteText, { status: "error", errorMessage: reason }),
+			};
 		}
 
 		// 🔴 clauseIds 自维护(规格 §5)。
@@ -374,31 +531,46 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		// (output-contract.ts 的 checkConditional 注释里列的第 3 种病因「本 run 压根没调用过
 		// 任何工具」正是这个)。
 		//
-		// 取值是 **items 的 id,不是 merged 的 id** —— 两者可以不同:merged 里的某条可能
-		// PG 查不到正文(落进 detail.not_found)。
+		// 取值是 **items 的 id,不是 merged 的 id** —— 两者可以不同,且不只是"merged 里某条
+		// PG 查不到正文"这一种(那种落进 detail.not_found,`hasFetchedText` 已经把它连同
+		// "详情行回来但 text 是 null"的那种一起滤掉了,见该函数文档):
 		//   - 少收 ⇒ 真引用被误判臆造;
-		//   - 多收(比如用 merged) ⇒ 模型能引用一条自己只看过标题、没看过正文的条款,
-		//     而那正是本项目取证纪律要拦的事(agent 路径的 system.md:12 写的是同一条规矩)。
+		//   - 多收(比如用 merged,或用"详情行存在"当判据而不检查 text) ⇒ 模型能引用一条
+		//     自己只看过标题、没看过正文的条款,而那正是本项目取证纪律要拦的事
+		//     (agent 路径的 system.md:12 写的是同一条规矩)。
 		// 不变量:**渲染进 prompt 的集合 === clauseIds 集合**,两者必须由同一个 items 派生。
 		const clauseIds = items.map((item) => item.clause_id);
 		const byId = new Map(merged.map((hit) => [hit.clause_id, hit]));
 
+		// 早退检查 2/3:两次 search_policy(Promise.all)+ 一次 get_clause_detail 这几步检索
+		// 期间也可能撞上超时或限额,发出模型②之前必须再查一次。
+		const preemptedBeforeAnswer = checkPreempted(runId, startedAt, rewriteText);
+		if (preemptedBeforeAnswer) return preemptedBeforeAnswer;
+
 		const answerText = await promptOnce(`${fp.answerPrompt}\n\n${renderEvidence(items, byId)}`);
-		// abort 在 pi 里不是粘滞状态(见 final-judge.ts 里 runFinalJudges 对这件事的说明),
-		// 超时后 prompt() 可能正常返回一段被截断的文本 —— 必须自己复查一次,否则半截答案会被
-		// 当成合格结果收下。
-		if (isTimedOut()) {
-			const reason = `阶段 1 超时(${fp.limits.runTimeoutMs}ms)`;
-			emit("fast_path_escalated", { reason });
-			return { verdict: { accept: false, reason }, result: normalize(runId, startedAt, answerText) };
-		}
+		// 早退检查 3/3:abort 在 pi 里不是粘滞状态(见 final-judge.ts 里 runFinalJudges 对这件
+		// 事的说明),超时/撞限额后 prompt() 可能正常返回一段被截断的文本 —— 必须自己复查一次,
+		// 否则半截答案会被当成合格结果收下。
+		const preemptedAfterAnswer = checkPreempted(runId, startedAt, answerText);
+		if (preemptedAfterAnswer) return preemptedAfterAnswer;
+
 		// 判官读的、与最终交给调用方的 `RunResult.output`,必须是**同一段**文本:两者都来自
 		// `promptOnce` 的返回值(`session.getLastAssistantText()`),这里的 `answerText` 就是
 		// 那份返回值,原样传给 `judgeFastPathOutput` 与 `normalize`,不重新读取一次 ——
 		// 重新读取会有极小的窗口读到助手消息被后续事件(比如下一次 prompt)覆盖后的状态。
 		const verdict = judgeFastPathOutput(answerText, options.outputContractSchema, clauseIds);
 		if (!verdict.accept) emit("fast_path_escalated", { reason: verdict.reason });
-		return { verdict, result: normalize(runId, startedAt, answerText) };
+		return {
+			verdict,
+			result: normalize(
+				runId,
+				startedAt,
+				answerText,
+				// I-3:verdict 与 result.status 必须同步——被判负的答案不能带着 "completed"
+				// 状态往下游走(见 normalize 上方的注释)。
+				verdict.accept ? undefined : { status: "error", errorMessage: verdict.reason },
+			),
+		};
 	}
 
 	return {

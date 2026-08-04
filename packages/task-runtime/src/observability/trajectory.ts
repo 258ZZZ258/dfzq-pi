@@ -24,6 +24,13 @@ export const RECORDED_TYPES: ReadonlySet<string> = new Set([
 	"compaction_end",
 	"agent_end",
 	"entry_appended",
+	// `fast-path-runtime.ts` 在每次升级(verdict.accept===false)时发一次。上面这段警告针对
+	// 的是**高频**类型(token 级 delta 那种,每个 token 一次同步 DB 事务);这一条每个 run
+	// 最多发一次(runFast() 一条调用路径只可能落进一个升级分支就返回),成本与 turn_end /
+	// agent_end 同一量级,不是警告要拦的那类。缺它的后果是实的:规格 §8.1 判据 2("升级率
+	// 如实记录")在这条不落库之前没有任何可查询的凭证通路——`fast_path_escalated` 会被
+	// `shouldRecord()` 拦下,`attachTrajectory` 与 `run-manager.ts` 都按这份白名单过滤。
+	"fast_path_escalated",
 ]);
 
 export function shouldRecord(type: string): boolean {

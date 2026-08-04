@@ -20,7 +20,7 @@ function addUsage(a: RunUsage, b: RunUsage): RunUsage {
  *
  * 🔴 **两阶段不共用 MCP 会话**(规格 D-5)。代价是升级路径要多装配一次 Runtime —— 一次新的
  * assemble() 调用,以及检索后端的一次首次调用开销(与 fast-path-runtime.ts 里"抢跑"要吃掉
- * 的是同一类冷启动耗时,见该文件 runFastInner 上方"抢跑"的注释),这份代价只落在已经放弃
+ * 的是同一类冷启动耗时,见该文件 runFastInner 开头"抢跑"的注释),这份代价只落在已经放弃
  * 30s 窗口的那条路径上。换来的是**阶段 2 逐字等于今天的行为**:同一个 spec、同一次
  * assemble()、干净 context。于是
  *   - 阶段 1 检索过的 id 不会累进阶段 2 的 unfetched;
@@ -39,6 +39,10 @@ export function createEscalatingRuntime(options: {
 	const listeners = new Set<(event: RuntimeEvent) => void>();
 	let full: Runtime | undefined;
 	let unsubscribeFull: (() => void) | undefined;
+	// 假设同一个实例只 `run()` 一次:第二次 `run()` 会直接覆盖 full/unsubscribeFull,旧的
+	// 阶段 2 既不会被解订阅、也不会被 dispose。生产上不可达(RunManager.drive() 每个 run
+	// 用一个新装配的 Runtime、一次 dispose 收尾),但 `Runtime.run()` 的类型签名本身没有
+	// 禁止调用方多次调用同一个实例——这里不做防御,只把假设写清楚。
 
 	// 落库层按 (run_id, seq) 做主键(store/sqlite.ts:30-37,`appendEvents` 撞主键会抛,由
 	// `run-manager.ts` 的 `subscribeEvents` 接住、只打日志、判"this event is dropped")。
@@ -70,8 +74,14 @@ export function createEscalatingRuntime(options: {
 		if (verdict.accept) return fastResult;
 
 		// 升级。阶段 1 的输出到此为止:不进 output、不进 answer、不进阶段 2 的 context。
-		// `fast_path_escalated` 事件已由 FastPathRuntime 发过(payload 只带 reason,不带任何
-		// 阶段 1 的输出内容)。
+		// `fast_path_escalated` 事件已由 FastPathRuntime 发过,payload 只带 `reason`。`reason`
+		// 是判负原因的人可读描述(judgeFastPathOutput 拼出),**可能内嵌阶段 1 输出里的
+		// clause_id / finish_reason / confidence 取值**(output-contract.ts 的
+		// checkConditional 命中反幻觉分支时,会把模型编造的 clause_id 原样拼进
+		// `${detail}`);但 judgeFastPathOutput 读的是 `checked.detail`,不是带原文片段的
+		// `checked.followUp`,所以不含条款正文、也不含完整答案 JSON —— 与 run-manager.ts
+		// 落库前"只记标识、不记内容"的脱敏投影同口径。该事件在 trajectory.ts 的白名单里、
+		// 会落库。
 		full = await options.createFull();
 		unsubscribeFull = full.subscribe(fanOut);
 		const fullResult = await full.run(input, opts);

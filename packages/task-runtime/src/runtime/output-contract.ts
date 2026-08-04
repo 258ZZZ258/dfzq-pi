@@ -184,9 +184,9 @@ function checkConditional(json: ContractShape, clauseIds: readonly string[]): st
 export type ContractCheck = { ok: true; value: unknown } | { ok: false; detail: string; followUp: string };
 
 /**
- * 输出契约校验的**唯一实现**。C6 判官(`createOutputContractJudge`)调它;快路径
- * (后续任务)将调它 —— 两处各写一套必然漂移,而这一份正是反幻觉兜底(风险 10)的
- * 唯一落点。
+ * 输出契约校验的**唯一实现**。C6 判官(`createOutputContractJudge`)调它;快路径的
+ * `judgeFastPathOutput`(`fast-path-runtime.ts`)也调它 —— 两处各写一套必然漂移,而这一份
+ * 正是反幻觉兜底(风险 10)的唯一落点。
  */
 export function validateOutputContract(text: string, schema: unknown, clauseIds: readonly string[]): ContractCheck {
 	const extracted = extractJsonBlock(text);

@@ -27,6 +27,12 @@ export function judgeFastPathOutput(text: string, schema: unknown, clauseIds: re
 	if (json.confidence !== "high" && json.confidence !== "medium") {
 		return { accept: false, reason: `confidence 不在 {high, medium}(实际:${String(json.confidence)})` };
 	}
+	// 纵深防御,当前不可达:能走到这里意味着判据 1(`validateOutputContract`)已通过、且
+	// `finish_reason === "stop"`;而 `output-contract.ts` 的 `checkConditional` 已经把
+	// "finish_reason 为 stop 且 basis 为空" 判进判据 1 的失败分支(`basis` 非数组时被同一段
+	// 三元表达式塌成 `[]`,同样命中该分支),所以这里的条件此刻恒为 false —— 实测把这个 if
+	// 整块删掉,`fast-path-runtime.test.ts` 全部用例照样全绿。留着不删是防 `checkConditional`
+	// 未来改动后这条判据悄悄失去着落;不是在断言它现在拦得住什么。
 	if (!Array.isArray(json.basis) || json.basis.length === 0) {
 		return { accept: false, reason: "basis 为空" };
 	}

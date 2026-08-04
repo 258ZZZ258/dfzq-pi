@@ -2,10 +2,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Runtime } from "../src/runtime/contract.ts";
 import { createDefaultRuntimeFactory, startServer } from "../src/server/main.ts";
 import * as sqliteModule from "../src/store/sqlite.ts";
 import { createSqliteRunStore } from "../src/store/sqlite.ts";
+import { startMockOpenAiServer } from "./fixtures/mock-openai-server.mjs";
 import { createStubRuntime, type StubRuntime } from "./helpers/stub-runtime.ts";
 
 /** 构造期不会真的拨号验证 provider——这里只要是能被 JSON.parse 成 ProviderProfile 形状的
@@ -486,6 +489,148 @@ describe("createDefaultRuntimeFactory - fastPath wiring is actually taken when e
 			}),
 		).rejects.toThrow(/createFastPathRuntime requires outputContractSchema/);
 	});
+});
+
+// 2026-08-04 复审 I-3:上面那条锁只证明了"路由进了 createFastPathRuntime",装配在
+// outputContractSchema 缺失那一步就提前 reject 了,够不到"两阶段各自的 buildToolsets() 是否
+// 真的独立"、"createEscalatingRuntime 是否真的把 FastPathRuntime 包了起来"这两件事——它们只在
+// 真的发生一次升级、两次 buildToolsets() 都被调用到时才会暴露。要抓住这两类 bug 必须真正驱动
+// 一次"阶段 1 判负 → 真升级 → 阶段 2 重新装配",光靠不落地的假装配置不够。
+//
+// 复用仓库里已有的两个端到端 fixture(test/cli.test.ts 已经在用它们跑真实子进程):
+//   - echo-mcp-server.mjs:真 spawn 的 stdio MCP server,只提供 "echo"/"boom"/"leak" 三个工具。
+//   - mock-openai-server.mjs:进程内 HTTP、OpenAI 兼容,不区分请求内容,固定回一段非 JSON 文本。
+//
+// 触发真实升级不需要伪造"模型两次给不同回答"或额外基础设施,固定回复就够:
+//   1. 抢跑 `assembled.callTool("search_policy", …)`(fast-path-runtime.ts 的 headStart)—— toolset
+//      只提供 "echo" 不提供 "search_policy",这次调用会抛"toolset 不提供该工具"(assembler.ts 的
+//      Assembled.callTool / PluginContext.callTool 是同一个函数,按 toolset 实际提供的工具名找,
+//      不看 spec.tools 白名单),被 headStart 的 `.catch(() => [])` 吃掉,得到空列表。
+//   2. 模型①(改写检索词)收到的是 mock server 固定回的非 JSON 文本,`parseRewriteTerms` 解析成
+//      空数组,规格 §2.4 的降级路径生效(不升级、继续用抢跑结果),但抢跑本身也是空列表。
+//   3. 两条线索合并后 `merged.length === 0` ⇒ 用"检索无命中"升级——`spec.tools` 只需要声明
+//      "echo"(echo-mcp-server.mjs 真的提供的工具),不需要声明 "search_policy" 之类的名字:
+//      阶段 1 的模型本来就看不到任何工具(setActiveToolsByName([])),这条工具白名单只用来过
+//      assemble() 的交叉校验,不影响上面第 1 步能不能调用到 "search_policy"。
+describe("createDefaultRuntimeFactory - 快路径真升级时的接线(2026-08-04 复审 I-3 配方 A + B)", () => {
+	const SERVER = fileURLToPath(new URL("./fixtures/echo-mcp-server.mjs", import.meta.url));
+	const API_KEY_ENV = "DFZQ_TEST_FASTPATH_ESCALATION_KEY";
+
+	let mockServer: Awaited<ReturnType<typeof startMockOpenAiServer>> | undefined;
+	let rt: Runtime | undefined;
+
+	afterEach(async () => {
+		if (rt) await rt.dispose();
+		rt = undefined;
+		delete process.env[API_KEY_ENV];
+		if (mockServer) {
+			await mockServer.close();
+			mockServer = undefined;
+		}
+	});
+
+	async function buildEscalatingRuntime(): Promise<Runtime> {
+		mockServer = await startMockOpenAiServer({ finalText: "mock: 不是 JSON,逼真实升级发生。" });
+		const specsDir = join(root, "specs");
+		await writeFile(join(specsDir, "esc-fp-system.md"), "快路径 system prompt 正文\n");
+		await writeFile(join(specsDir, "esc-fp-rewrite.md"), "快路径改写 prompt 正文\n");
+		await writeFile(join(specsDir, "esc-fp-answer.md"), "快路径回答 prompt 正文\n");
+		await writeFile(
+			join(specsDir, "esc-schema.json"),
+			JSON.stringify({
+				type: "object",
+				required: ["conclusion", "basis", "finish_reason", "confidence"],
+				properties: {
+					conclusion: { type: "string" },
+					basis: { type: "array" },
+					finish_reason: { enum: ["stop", "refused"] },
+					confidence: { enum: ["high", "medium", "low"] },
+				},
+			}),
+		);
+		await writeFile(
+			join(specsDir, "escalation.json"),
+			JSON.stringify({
+				id: "escalation",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["echo"],
+				// maxTurns 故意压得很低:阶段 2 的固定假回复大概率过不了 C6,不需要让重试/repair
+				// 循环跑完才终止,压低 maxTurns 让它尽快撞 limit_exceeded,测试更快、更确定。
+				limits: { maxTurns: 2 },
+				mcpServers: [{ id: "echo", command: process.execPath, args: [SERVER], env: {} }],
+				outputContract: { schema: "esc-schema.json" },
+				fastPath: {
+					enabled: true,
+					systemPrompt: "esc-fp-system.md",
+					rewritePrompt: "esc-fp-rewrite.md",
+					answerPrompt: "esc-fp-answer.md",
+					maxClauses: 5,
+					limits: { runTimeoutMs: 5000 },
+				},
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		process.env[API_KEY_ENV] = "sk-test-unused";
+		await writeFile(
+			profilePath,
+			JSON.stringify({
+				id: "test",
+				baseUrl: mockServer.baseUrl,
+				apiKeyEnv: API_KEY_ENV,
+				api: "openai-completions",
+				roles: {
+					main: {
+						provider: "mock",
+						modelId: "mock-model",
+						contextWindow: 8192,
+						maxTokens: 1024,
+						reasoning: false,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					},
+				},
+			}),
+		);
+		const factory = await createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir });
+		return factory({
+			specId: "escalation",
+			sessionId: "s1",
+			runId: "r1",
+			// 空 corpusTypes 会被 mcp/adapter.ts 的 assertScope 判"无授权范围"直接拒绝
+			// (fail-closed,不是本测试要触碰的分支)——两个阶段都要真的走到 assemble() 的
+			// 工具解析,必须给一个非空值。
+			filters: { corpusTypes: ["internal"] },
+			options: {},
+		});
+	}
+
+	it(
+		"配方 A:装配后拿到的对象不是 FastPathRuntime 本身 —— 证明真的被 createEscalatingRuntime 包过",
+		{ timeout: CASE_TIMEOUT_MS },
+		async () => {
+			rt = await buildEscalatingRuntime();
+			// createEscalatingRuntime(escalating-runtime.ts)的返回对象只满足 Runtime 接口,
+			// 没有 runFast;FastPathRuntime 才有(fast-path-runtime.ts 的 FastPathRuntime extends
+			// Runtime,多出 runFast)。main.ts 若漏了包装、直接把 fast 当 Runtime 返回,这里会是
+			// true——这条断言不依赖真的调用 .run(),装配完成的那一刻就能查。
+			expect("runFast" in rt).toBe(false);
+		},
+	);
+
+	it(
+		"配方 B:真实升级发生时,阶段 2 的 buildToolsets() 独立成功(不会撞 already registered)",
+		{ timeout: CASE_TIMEOUT_MS },
+		async () => {
+			rt = await buildEscalatingRuntime();
+			const result = await rt.run("测试问题:员工能不能这样操作?", {});
+			// 不断言具体 status——阶段 2 用同一个固定假回复,大概率过不了 C6 的 schema 校验或撞
+			// maxTurns,两种都是合理终态。这里要锁的只是"升级过程本身没有抛错"(尤其不是
+			// `Toolset "..." is already registered`),以及"阶段 2 真的发起了自己的模型请求"
+			// (不是被短路掉、什么都没做就返回)。
+			expect(typeof result.status).toBe("string");
+			expect(mockServer?.requests.length ?? 0).toBeGreaterThan(1);
+		},
+	);
 });
 
 // 以下用例来自评审对 main.ts 的复审(Critical + Important),补在 brief 逐字采用的

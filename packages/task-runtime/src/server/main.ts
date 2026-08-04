@@ -191,9 +191,13 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
 		// 🔴 每次调用都新建一个 ToolsetRegistry。ToolsetRegistry **必须按 run 新建**
-		// (toolsets/registry.ts 的类注释),同一个实例上 register 第二次会直接抛
-		// `Toolset "policy-query" is already registered`。两阶段各调一次 ——
-		// 不共用 MCP 会话正是规格 D-5,而"共用一个 registry"会在升级那一刻炸。
+		// (toolsets/registry.ts 的类注释)。两阶段各调一次这个闭包 —— 不共用 MCP 会话正是
+		// 规格 D-5。⚠ 会炸的不是"把同一个 registry 实例传给两个 runtime"本身(`register` 只
+		// 调一次、`assemble()` 只调 `resolve()`,`createMcpToolset` 的 provider 每次
+		// `resolve()` 都重新 spawn 一整套子进程,registry 自己不追踪句柄,复用同一实例反而
+		// 无害);真正会炸的是**这个闭包自己**如果被改成复用同一个 registry 实例、却仍然在
+		// 每次调用里执行 `register(...)`——那样第二次调用会在一个已经登记过 `spec.toolset`
+		// 的实例上再登记一次,直接抛 `Toolset "policy-query" is already registered`。
 		const buildToolsets = (): ToolsetRegistry => {
 			const registry = new ToolsetRegistry();
 			registry.register(
@@ -233,7 +237,20 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			cwd: join(workdir, "fast", "workspace"),
 			agentDir: join(workdir, "fast", "agent"),
 			outputContractSchema: outputContractSchemas.get(specId),
-			skillPaths: skillPaths.get(specId),
+			// 🔴 阶段 1 刻意不传 skillPaths(2026-08-04 复审 I-2,协调者裁定):deriveFastSpec
+			// 没摘 spec.skills。pi 的 buildSystemPrompt(coding-agent/src/core/system-prompt.ts)
+			// 只在 selectedTools 包含 "read" 时才会把 additionalSkillPaths 拼成
+			// <available_skills> 常驻进 system prompt(实测确认过这道闸门,见任务报告)——
+			// policy-query 的 spec.tools 是固定的 5 个领域工具,今天两个阶段都不含 "read",
+			// 所以传不传 skillPaths 眼下不改变阶段 1 装配出的 system prompt。这里仍然不传,
+			// 理由是防御性的,不是在堵一个正在发生的泄漏:阶段 1 执行了
+			// `setActiveToolsByName([])`,模型没有任何工具,skillPaths 对它没有用处;而
+			// evidence-standard.md 的 description 里本身就含 "confidence" 一词,一旦这个
+			// taskKind 的工具白名单将来加入 "read"(或这套两阶段模式被复用到别的、真的会给
+			// "read" 的 spec 上),同一处代码会立刻从"无影响"变成"confidence 真的泄漏进两次
+			// 模型调用共用的 system prompt"——硬约束 5 要求的是输出契约措辞只能待在
+			// answerPrompt 里,不能进两次调用共用的 system prompt。阶段 2(下面的
+			// buildFull)照旧传 skillPaths,行为不变。
 		});
 		// createFull 惰性 —— 不升级就一次都不调,不起第二个 MCP 子进程。
 		return createEscalatingRuntime({ fast, createFull: buildFull });

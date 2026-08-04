@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import { assemble } from "../src/runtime/assembler.ts";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
+import { deriveFastSpec } from "../src/runtime/fast-path-runtime.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 import { resolveSpecPromptPaths } from "../src/spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
@@ -274,6 +275,84 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 			expect(assembled.session.systemPrompt).not.toContain("policy-query/output-format.md");
 		} finally {
 			await cleanup();
+		}
+	});
+});
+
+// 2026-08-04 复审 I-2:文件级断言(下面 "keeps the fast answer prompt carrying the output
+// contract..." 那条)只读 fast-system.md 的**文件内容**,断不到 main.ts 有没有把 skillPaths
+// 一并透传给 createFastPathRuntime。这里直接调用 deriveFastSpec(生产代码本体,不是重新实现
+// 一遍派生逻辑)+ assemble(),断在**装配后**的 assembled.session.systemPrompt 上。
+//
+// ⚠ 实测记录,不是凭空推断:第一条用例本想用"传 skillPaths vs 不传"做对照来证明断言有区分力,
+// 但实测发现 pi 的 buildSystemPrompt(packages/coding-agent/src/core/system-prompt.ts:64-66)
+// 有一道 assembler.ts 注释没提到的额外闸门 —— customPrompt 分支下,只有 selectedTools 包含
+// "read" 时才会把 additionalSkillPaths 拼进 <available_skills>。policy-query 的 spec.tools
+// 是固定的 5 个领域工具,两个阶段都从未包含 "read",于是"传不传 skillPaths"在出厂 spec 原样的
+// tools 下**结果相同**——今天的系统提示里本来就不会出现 <available_skills>,不是靠不传
+// skillPaths 才躲开的。第一条用例只断言"不传 skillPaths 时确实没有",不再声称这个断言有实测
+// 区分力;第二条用例改用人为加了 "read" 的 tools 列表,实测复现"传 skillPaths 确实会把
+// evidence-standard.md 描述里的 confidence 一词带进 system prompt"这个机制是真实存在的,以此
+// 说明 main.ts 为什么仍然刻意不给阶段 1 传 skillPaths(阶段 1 本来就没有任何工具,传
+// skillPaths 对它没有用处;而工具白名单一旦将来变化到包含 "read",同一处代码会从"无影响"
+// 变成"真的泄漏")——不是假装这个症状在今天的出厂 spec 上就能观察到。
+describe("阶段 1 装配后的 system prompt 不该带 skills 摘要(2026-08-04 复审 I-2)", () => {
+	it("omitting skillPaths keeps the skills digest out of the assembled prompt", async () => {
+		const runtimeSpec = freshRuntimeSpec();
+		await resolveSpecPromptPaths(runtimeSpec, specDir);
+		const derived = deriveFastSpec(runtimeSpec);
+
+		const harness = await createFauxHarness();
+		const assembled = await assemble({
+			pluginContext: fauxPluginContext(),
+			spec: derived,
+			profile: fauxProfile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: policyQueryToolsets(derived.tools),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			// 刻意不传 skillPaths —— main.ts 现在装配阶段 1 时也是这么做的(I-2)。
+		});
+		try {
+			expect(assembled.session.systemPrompt).not.toContain("<available_skills>");
+			expect(assembled.session.systemPrompt).not.toContain("confidence");
+		} finally {
+			await assembled.dispose();
+			await harness.cleanup();
+		}
+	});
+
+	it("demonstrates the skills→'confidence' leak mechanism with a synthetic 'read'-inclusive tool list — the reason stage 1 deliberately omits skillPaths, even though today's real whitelist never triggers it", async () => {
+		const runtimeSpec = freshRuntimeSpec();
+		await resolveSpecPromptPaths(runtimeSpec, specDir);
+		const derived = deriveFastSpec(runtimeSpec);
+		// 与 createDefaultRuntimeFactory 构造期算 skillPaths 的方式一致(server/main.ts):
+		// spec.skills 相对 specsDir 解析成绝对路径。
+		const resolvedSkillPaths = (runtimeSpec.skills ?? []).map((rel) => resolve(specDir, rel));
+		expect(resolvedSkillPaths.length).toBeGreaterThan(0); // 前提:出厂 spec 真的声明了 skills
+		// 人为加 "read"——policy-query 出厂 spec 今天不会这么配,这里只是撬开
+		// customPromptHasRead 那道闸门,复现机制本身。
+		const withReadTool = { ...derived, tools: [...derived.tools, "read"] };
+
+		const harness = await createFauxHarness();
+		const assembled = await assemble({
+			pluginContext: fauxPluginContext(),
+			spec: withReadTool,
+			profile: fauxProfile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: policyQueryToolsets(withReadTool.tools),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			skillPaths: resolvedSkillPaths, // 复现"仍然传 skillPaths"的写法
+		});
+		try {
+			expect(assembled.session.systemPrompt).toContain("<available_skills>");
+			expect(assembled.session.systemPrompt).toContain("confidence"); // evidence-standard.md 的 description
+		} finally {
+			await assembled.dispose();
+			await harness.cleanup();
 		}
 	});
 });

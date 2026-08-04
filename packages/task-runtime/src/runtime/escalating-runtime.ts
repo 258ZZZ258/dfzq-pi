@@ -74,14 +74,21 @@ export function createEscalatingRuntime(options: {
 		if (verdict.accept) return fastResult;
 
 		// 升级。阶段 1 的输出到此为止:不进 output、不进 answer、不进阶段 2 的 context。
-		// `fast_path_escalated` 事件已由 FastPathRuntime 发过,payload 只带 `reason`。`reason`
-		// 是判负原因的人可读描述(judgeFastPathOutput 拼出),**可能内嵌阶段 1 输出里的
-		// clause_id / finish_reason / confidence 取值**(output-contract.ts 的
-		// checkConditional 命中反幻觉分支时,会把模型编造的 clause_id 原样拼进
-		// `${detail}`);但 judgeFastPathOutput 读的是 `checked.detail`,不是带原文片段的
-		// `checked.followUp`,所以不含条款正文、也不含完整答案 JSON —— 与 run-manager.ts
-		// 落库前"只记标识、不记内容"的脱敏投影同口径。该事件在 trajectory.ts 的白名单里、
-		// 会落库。
+		// `fast_path_escalated` 事件已由 FastPathRuntime 发过,payload 只带 `reason`。
+		// `reason` 有 5 个 emit 点(`grep -n 'emit("fast_path_escalated"' fast-path-
+		// runtime.ts`,逐一核对过),来源不止一种,泄漏面也不是同一个量级:
+		//   - 限额/超时(checkPreempted):`describeTripped()` 拼配置数值(runTimeoutMs /
+		//     maxCostUsd / maxTotalTokens),有界;
+		//   - 检索无命中 / 一条正文都没取到:固定串;
+		//   - 判负(judgeFastPathOutput 的 verdict.reason):可能内嵌阶段 1 输出里的
+		//     clause_id / finish_reason / confidence 取值(judgeFastPathOutput 读的是
+		//     `checked.detail`,不是带原文片段的 `checked.followUp`),不含条款正文、也不含
+		//     完整答案 JSON;
+		//   - 🔴 阶段 1 抛错且未撞限额/超时(runFast 的 catch 分支):`\`阶段 1 抛错:
+		//     ${error.message}\``——**被捕获异常的 message,内容不受约束**。与
+		//     `store/sqlite.ts` 的 `runs.error_message`(`TEXT`,按既有设计就存任意错误
+		//     消息)同类,不是本组合子新开的口子。
+		// 该事件在 trajectory.ts 的白名单里、会落库。
 		full = await options.createFull();
 		unsubscribeFull = full.subscribe(fanOut);
 		const fullResult = await full.run(input, opts);

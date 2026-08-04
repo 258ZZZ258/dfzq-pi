@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -106,6 +108,37 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(options.maxChars.get_clause_detail).toBe(7700);
 		expect(options.maxChars.enumerate_clauses).toBe(14900);
 		expect(options.maxChars.default).toBe(3000);
+	});
+
+	it("ships fastPath disabled by default", () => {
+		const fastPath = spec.fastPath as { enabled?: boolean } | undefined;
+		expect(fastPath?.enabled).toBe(false);
+	});
+
+	it("points fastPath at three prompt files that exist", async () => {
+		const fastPath = spec.fastPath as Record<"systemPrompt" | "rewritePrompt" | "answerPrompt", string>;
+		for (const key of ["systemPrompt", "rewritePrompt", "answerPrompt"] as const) {
+			await expect(readFile(resolve(specDir, fastPath[key]), "utf8")).resolves.toBeTruthy();
+		}
+	});
+
+	// deriveFastSpec 的注释(fast-path-runtime.ts)与 M-1 的裁定:`result-budget` 挂在 pi 的
+	// `tool_result` hook 上做截断,而阶段 1 的检索全部经 `Assembled.callTool` 直打
+	// `tool.execute()`,绕过 agent loop,该 hook 不会触发。`fastPath.maxChars` 因此是一份配了
+	// 也不生效的配置——出厂 spec 不设它,防止未来有人照着 `resultPolicy.options.maxChars` 的
+	// 样子给 fastPath 也填一份、造出一句看着在生效实则空转的谎。阶段 1 证据块大小唯一生效的
+	// 护栏是 `maxClauses`。
+	it("does not configure fastPath.maxChars — the result-budget hook never fires on the fast path's direct tool.execute() retrieval, so the key would be dead config", () => {
+		const fastPath = spec.fastPath as { maxChars?: unknown } | undefined;
+		expect(fastPath?.maxChars).toBeUndefined();
+	});
+
+	it("keeps the fast answer prompt carrying the output contract, not the system prompt", async () => {
+		const fastPath = spec.fastPath as Record<"systemPrompt" | "answerPrompt", string>;
+		const sys = await readFile(resolve(specDir, fastPath.systemPrompt), "utf8");
+		const ans = await readFile(resolve(specDir, fastPath.answerPrompt), "utf8");
+		expect(sys).not.toContain("finish_reason");
+		expect(ans).toContain("finish_reason");
 	});
 });
 

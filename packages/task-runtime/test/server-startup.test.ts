@@ -430,6 +430,64 @@ describe("createDefaultRuntimeFactory - fastPath prompt resolution (Task 4 复�
 	});
 });
 
+// Task 10 变异检验的回归锁:main.ts 的 runtimeFactory 尾部有一条 `if (!spec.fastPath?.enabled)
+// return buildFull();` 分支,决定一个 run 是直接走既有的 agent 路径,还是先经
+// createFastPathRuntime + createEscalatingRuntime 走快路径。这条分支只在「真的存在一个
+// fastPath.enabled:true 的 spec 被真的调用」时才会被走到——出厂 spec 缺省 enabled:false,
+// 所有既有测试都只经过 buildFull() 那半边,这条分支本身此前**零覆盖**。实测:把它改成
+// `if (true) return buildFull();`(即无论 enabled 是什么都直接走 agent 路径),
+// `npm test --workspace=@dfzq/task-runtime` 在补这条用例之前一条都不红。
+//
+// 探针选择:createFastPathRuntime 装配期第一件事就是校验 outputContractSchema 存在,不存在
+// 直接抛"requires outputContractSchema"(fast-path-runtime.ts),且这一步在它自己调用
+// assemble() 之前——这是它区别于 agent 路径(createSessionRuntime)最早暴露的行为:agent
+// 路径缺省不挂 C6,压根不要求这个参数。用一个不声明 outputContract 的 fastPath spec 当探针:
+// 真的被路由进 createFastPathRuntime 才会看到这句报错;被 buildFull() 接住的话,minimalProfile()
+// 用的 apiKeyEnv 指向一个不存在的环境变量 "X",assemble() 会先撞上 provider-profile.ts 那句
+// "Environment variable X is not set"——变异检验实测(下面把判据分支改成 `if (true)
+// return buildFull();`)看到的正是这条,不是本条注释最初设想的工具白名单校验(那一步排在
+// apiKeyEnv 解析之后,轮不到它报错)。两条路径给出的错误互不相同就够用,不依赖真实 MCP 子进程
+// 或真实模型调用,构造和断言都很轻量。
+describe("createDefaultRuntimeFactory - fastPath wiring is actually taken when enabled (Task 10 变异检验)", () => {
+	it("routes an enabled fastPath spec through createFastPathRuntime, not straight into the agent path", async () => {
+		const specsDir = join(root, "specs");
+		await writeFile(join(specsDir, "wired-fp-system.md"), "快路径 system prompt 正文\n");
+		await writeFile(join(specsDir, "wired-fp-rewrite.md"), "快路径改写 prompt 正文\n");
+		await writeFile(join(specsDir, "wired-fp-answer.md"), "快路径回答 prompt 正文\n");
+		await writeFile(
+			join(specsDir, "fastpath-wired.json"),
+			JSON.stringify({
+				id: "fastpath-wired",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				// 刻意不声明 outputContract——是这条探针成立的前提,见上方 describe 的注释。
+				fastPath: {
+					enabled: true,
+					systemPrompt: "wired-fp-system.md",
+					rewritePrompt: "wired-fp-rewrite.md",
+					answerPrompt: "wired-fp-answer.md",
+					maxClauses: 5,
+					limits: { runTimeoutMs: 1000 },
+				},
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		const factory = await createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir });
+		await expect(
+			factory({
+				specId: "fastpath-wired",
+				sessionId: "s1",
+				runId: "r1",
+				filters: { corpusTypes: [] },
+				options: {},
+			}),
+		).rejects.toThrow(/createFastPathRuntime requires outputContractSchema/);
+	});
+});
+
 // 以下用例来自评审对 main.ts 的复审(Critical + Important),补在 brief 逐字采用的
 // describe("server startup", ...) 之外,不动上面那段。
 describe("server shutdown safety", () => {

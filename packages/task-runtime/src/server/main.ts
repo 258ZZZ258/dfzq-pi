@@ -4,6 +4,8 @@ import { type ServerType, serve } from "@hono/node-server";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
+import { createEscalatingRuntime } from "../runtime/escalating-runtime.ts";
+import { createFastPathRuntime } from "../runtime/fast-path-runtime.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
@@ -188,29 +190,52 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		const spec = specFiles.get(specId);
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
-		const toolsets = new ToolsetRegistry();
-		toolsets.register(
-			spec.toolset,
-			createMcpToolset(spec.mcpServers ?? [], {
-				runId,
-				// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
-				// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
-				permTags: filters.permTags ?? [],
-				corpusTypes: filters.corpusTypes,
-				options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
-			}),
-		);
+		// 🔴 每次调用都新建一个 ToolsetRegistry。ToolsetRegistry **必须按 run 新建**
+		// (toolsets/registry.ts 的类注释),同一个实例上 register 第二次会直接抛
+		// `Toolset "policy-query" is already registered`。两阶段各调一次 ——
+		// 不共用 MCP 会话正是规格 D-5,而"共用一个 registry"会在升级那一刻炸。
+		const buildToolsets = (): ToolsetRegistry => {
+			const registry = new ToolsetRegistry();
+			registry.register(
+				spec.toolset,
+				createMcpToolset(spec.mcpServers ?? [], {
+					runId,
+					// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
+					// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
+					permTags: filters.permTags ?? [],
+					corpusTypes: filters.corpusTypes,
+					options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
+				}),
+			);
+			return registry;
+		};
 
 		const workdir = join(options.workRoot, sessionId);
-		return createSessionRuntime({
+		const buildFull = () =>
+			createSessionRuntime({
+				spec,
+				profile,
+				registry: plugins,
+				toolsets: buildToolsets(),
+				cwd: join(workdir, "workspace"),
+				agentDir: join(workdir, "agent"),
+				outputContractSchema: outputContractSchemas.get(specId),
+				skillPaths: skillPaths.get(specId),
+			});
+
+		if (!spec.fastPath?.enabled) return buildFull();
+
+		const fast = await createFastPathRuntime({
 			spec,
 			profile,
 			registry: plugins,
-			toolsets,
-			cwd: join(workdir, "workspace"),
-			agentDir: join(workdir, "agent"),
+			toolsets: buildToolsets(),
+			cwd: join(workdir, "fast", "workspace"),
+			agentDir: join(workdir, "fast", "agent"),
 			outputContractSchema: outputContractSchemas.get(specId),
 			skillPaths: skillPaths.get(specId),
 		});
+		// createFull 惰性 —— 不升级就一次都不调,不起第二个 MCP 子进程。
+		return createEscalatingRuntime({ fast, createFull: buildFull });
 	};
 }

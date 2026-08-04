@@ -76,6 +76,20 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(Object.keys(schema.properties.basis.items.properties).sort()).toEqual([...BASIS_KEYS].sort());
 	});
 
+	// 2026-08-04 复审 必修1:fast-answer.md 是本分支新增的第二份契约正文(policy-query 提速
+	// 规格的两阶段快路径专用,与 output-format.md 共用同一份 output-contract.schema.json)。
+	// 上面那条八键联动用例只读 output-format.md —— fast-answer.md 此前唯一的断言是下面
+	// "keeps the fast answer prompt carrying the output contract..." 那条的
+	// toContain("finish_reason"),八个 basis 键里其余七个(尤其 source_code —— 缺了它
+	// 下游按 source_code 回查权威库装配条款正文的那一步会断)完全没人守。这里把同一个
+	// BASIS_KEYS 循环也跑一遍 fast-answer.md —— 今天全中,是纯加固,不改变现状。
+	it("keeps the eight basis keys present in fast-answer.md's contract text too", () => {
+		const contract = readFileSync(`${specDir}policy-query/fast-answer.md`, "utf8");
+		for (const key of BASIS_KEYS) {
+			expect(contract).toContain(key);
+		}
+	});
+
 	// output-contract.ts:42-59 那条寄生前提的静态半边:schema 少了这个 required,
 	// 反幻觉兜底会静默消失而所有测试照常通过。动态半边是 Task 18 的 A8。
 	it("requires clause_id on every basis element — the anti-hallucination carrier", () => {
@@ -280,9 +294,16 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 });
 
 // 2026-08-04 复审 I-2:文件级断言(下面 "keeps the fast answer prompt carrying the output
-// contract..." 那条)只读 fast-system.md 的**文件内容**,断不到 main.ts 有没有把 skillPaths
-// 一并透传给 createFastPathRuntime。这里直接调用 deriveFastSpec(生产代码本体,不是重新实现
-// 一遍派生逻辑)+ assemble(),断在**装配后**的 assembled.session.systemPrompt 上。
+// contract..." 那条)只读 fast-system.md 的**文件内容**,断不到 skillPaths 传/不传对装配后的
+// system prompt 有什么影响。这里直接调用 deriveFastSpec(生产代码本体,不是重新实现一遍派生
+// 逻辑)+ assemble(),把断言下沉到**装配后**的 assembled.session.systemPrompt 上,锁的是
+// "skillPaths 传/不传如何影响 assemble() 的产出"这条机制本身。
+//
+// **这条 describe 不锁什么**:两条用例都直接调 deriveFastSpec + assemble(),不经过
+// createDefaultRuntimeFactory 里 buildFast()/createFastPathRuntime 那次真实调用(server/main.ts
+// 232-256 行)——main.ts 那个调用点到底有没有真的省略 skillPaths,不在这条 describe 的覆盖范围
+// 内:下面第一条用例"刻意不传 skillPaths"是测试自己选定的输入,不是从 main.ts 读出来的实际调用
+// 参数;main.ts 那个调用点即便被人改成也传 skillPaths,这两条用例都不会跟着翻红。
 //
 // ⚠ 实测记录,不是凭空推断:第一条用例本想用"传 skillPaths vs 不传"做对照来证明断言有区分力,
 // 但实测发现 pi 的 buildSystemPrompt(packages/coding-agent/src/core/system-prompt.ts:64-66)

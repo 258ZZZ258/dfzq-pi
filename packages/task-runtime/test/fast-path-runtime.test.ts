@@ -517,7 +517,7 @@ describe("createFastPathRuntime", () => {
 		// runTimeoutMs 与 hangAnswerMs 之间留足余量(30ms vs 150ms):模型①与三次检索(无人为
 		// 延迟)必须在 30ms 内跑完,不能让计时器提前在检查点 1/2 触发——那样这条用例就退化成
 		// 重复测检查点 1/2,而不是它本该测的检查点 3。上面两条 hangRewriteMs/hangDetailMs 用例
-		// 用 runTimeoutMs:5 是刻意贴着"快腿"的真实延迟走(复审已用满载 CPU 验过 3 次不翻车),
+		// 用 runTimeoutMs:5 是刻意贴着"快腿"的真实延迟走,
 		// 这条反过来要给"快腿"(模型①+检索)留出比它宽裕得多的余量,两种取舍互不通用。
 		const rt = await createFastPathRuntime(
 			await fastOptions({

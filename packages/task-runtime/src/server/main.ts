@@ -240,7 +240,9 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			// 🔴 阶段 1 刻意不传 skillPaths(2026-08-04 复审 I-2,协调者裁定):deriveFastSpec
 			// 没摘 spec.skills。pi 的 buildSystemPrompt(coding-agent/src/core/system-prompt.ts)
 			// 只在 selectedTools 包含 "read" 时才会把 additionalSkillPaths 拼成
-			// <available_skills> 常驻进 system prompt(实测确认过这道闸门,见任务报告)——
+			// <available_skills> 常驻进 system prompt(这道闸门的实测复现见
+			// test/policy-query-spec.test.ts 的 "demonstrates the skills→'confidence' leak
+			// mechanism..." 用例)——
 			// policy-query 的 spec.tools 是固定的 5 个领域工具,今天两个阶段都不含 "read",
 			// 所以传不传 skillPaths 眼下不改变阶段 1 装配出的 system prompt。这里仍然不传,
 			// 理由是防御性的,不是在堵一个正在发生的泄漏:阶段 1 执行了

@@ -18,13 +18,14 @@
     { "clause_id": "…", "score": 0.91, "doc_title": "…", "clause_path": "…", "status": "effective",
       "source_code": "…", "source_doc_id": "…", "corpus_type": "external" }
   ],
-  "reasoning": "推理过程(可选)",
   "confidence": "high | medium | low",
   "finish_reason": "stop | refused",
   "exhausted_scope": ["检索过的范围(拒答时必填)"],
   "gaps": ["已知缺口(可选)"]
 }
 ```
+
+**不要输出 `reasoning` 字段** —— 上面这份字段列表里没有它,即使不写它也是完全合法的输出。
 
 **`basis[]` 的元素只能有上面列出的这八个键,一个都不能多。**
 

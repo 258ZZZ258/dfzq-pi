@@ -10,6 +10,7 @@ import {
 	type FastPathRuntimeOptions,
 	judgeFastPathOutput,
 	parseRewriteTerms,
+	renderEvidence,
 } from "../src/runtime/fast-path-runtime.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
@@ -156,6 +157,26 @@ describe("deriveFastSpec", () => {
 	it("drops outputContract so no C6 judge is registered", () => {
 		const got = deriveFastSpec({ ...spec, outputContract: { schema: "s.json" } });
 		expect(got.outputContract).toBeUndefined();
+	});
+});
+
+// 2026-08-04 定点修复(第一刀):search_policy 原样返回 Milvus 分区码(如 "P-EXT"),模型忠实
+// 抄进 basis[].corpus_type,而 output-contract.schema.json 的 corpus_type enum 只认
+// {internal, external, qa, case} —— 分区码原样印进证据块必然导致模型抄写出一个 enum 校验挂不住
+// 的值。这两条用例锁住 renderEvidence 的反向映射:已知分区码要翻成语义标签,未知分区码原样
+// 透传(不猜、不抛)。
+describe("renderEvidence", () => {
+	it("maps a known Milvus partition code to the schema's corpus_type label", () => {
+		const byId = new Map([["C-1", { clause_id: "C-1", corpus_type: "P-EXT", score: 0.9 }]]);
+		const rendered = renderEvidence([{ clause_id: "C-1", doc_title: "某规则", text: "正文" }], byId);
+		expect(rendered).toContain("corpus_type: external");
+		expect(rendered).not.toContain("P-EXT");
+	});
+
+	it("passes an unrecognized partition code through unchanged rather than guessing", () => {
+		const byId = new Map([["C-1", { clause_id: "C-1", corpus_type: "P-MYSTERY", score: 0.9 }]]);
+		const rendered = renderEvidence([{ clause_id: "C-1", doc_title: "某规则", text: "正文" }], byId);
+		expect(rendered).toContain("corpus_type: P-MYSTERY");
 	});
 });
 

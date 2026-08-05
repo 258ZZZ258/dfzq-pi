@@ -90,6 +90,22 @@ describe("出厂 spec: policy-query.json", () => {
 		}
 	});
 
+	// 2026-08-04 定点修复(第二刀):真 run 判负实锤之一是模型在 reasoning 这个自由文本字段里
+	// 写了未转义的双引号,JSON 语法断裂。reasoning 不在 schema 的 required 里、类型是
+	// string——不输出它完全合法,顺带还少一段自由文本输出。fast-answer.md 因此不该再用一行
+	// JSON 示例邀请模型去填它。
+	//
+	// ⚠ 这里只断言 JSON 示例里不再出现 `"reasoning"` 这个**带双引号的键形态**(它才是诱使模型
+	// 抄写出该字段的直接原因),不是断言全文任何地方都不出现"reasoning"这个词 —— 下面那道
+	// 显式禁令必须点名这个字段(用反引号 `reasoning` 而非 JSON 双引号)才有意义,两者不是同一
+	// 种出现形态,不冲突。全文字面零命中"reasoning"这个约束与"必须写一句明确点名它的禁令"
+	// 本身互斥,这里取的是两条要求背后真正要防的事(schema 挡不住的自由文本字段)。
+	it("drops the JSON-example reasoning key from fast-answer.md and explicitly tells the model not to emit it", () => {
+		const contract = readFileSync(`${specDir}policy-query/fast-answer.md`, "utf8");
+		expect(contract).not.toContain('"reasoning"');
+		expect(contract).toContain("不要输出 `reasoning` 字段");
+	});
+
 	// output-contract.ts:42-59 那条寄生前提的静态半边:schema 少了这个 required,
 	// 反幻觉兜底会静默消失而所有测试照常通过。动态半边是 Task 18 的 A8。
 	it("requires clause_id on every basis element — the anti-hallucination carrier", () => {

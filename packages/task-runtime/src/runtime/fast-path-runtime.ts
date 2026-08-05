@@ -187,8 +187,46 @@ function describeTripped(kind: LimitKind, limits: RuntimeLimits): string {
 	return `阶段 1 撞到限额:${kind}`;
 }
 
-/** 把取到正文的条款渲染成给模型②看的正文块。**只渲染 items** —— 见下面 clauseIds 的注释。 */
-function renderEvidence(items: readonly DetailItem[], byId: ReadonlyMap<string, RetrievalHit>): string {
+/**
+ * Milvus 分区码 → output-contract schema 的 `corpus_type` 语义标签。**照抄**
+ * dfzq-audit-ai 的 `query/query/mcp/scope.py:19` 的 `_CORPUS_MAP`(该文件注释注明它本身
+ * "照抄 routes_boundary.py:31",是边界契约的映射)。反过来的键值对恰好与
+ * `output-contract.schema.json` 的 `corpus_type` enum 是同一套四项。
+ *
+ * ⚠ `query/query/api/service.py` 里还有一个**同名但只有两项**的 map(会话式路径用)——
+ * scope.py 那句同款警告写的就是这个,别拿错。
+ */
+const CORPUS_TYPE_BY_PARTITION: Readonly<Record<string, string>> = {
+	"P-INT": "internal",
+	"P-EXT": "external",
+	"P-QA": "qa",
+	"P-CASE": "case",
+};
+
+/**
+ * 把 search_policy 命中里的 `corpus_type`(Milvus 分区码,如 `"P-EXT"`)映射成
+ * output-contract schema 要求的语义标签(如 `"external"`)。`search_policy` 原样返回分区码,
+ * 模型忠实抄写进 `basis[].corpus_type` 就会撞上 schema 的 enum 校验(`{internal, external,
+ * qa, case}`),这正是快路径两道判负之一的病因。
+ *
+ * 未知分区码(不在 `CORPUS_TYPE_BY_PARTITION` 里,含 `undefined`)→ **原样透传**,不猜、不抛:
+ * 透传等于退回今天的行为(模型抄写 → schema 挡下 → 升级路径兜底),是已知的安全降级;猜一个
+ * 值会把"数据有问题"悄悄变成"给了个错的标签",更难排查。
+ *
+ * 🔴 诚实边界:这个映射**只在快路径**(本文件的 `renderEvidence`)生效。agent 路径的模型直接
+ * 读 `search_policy` 的原始工具返回,同样会看到分区码而不是语义标签 —— 那条路径上的这个不
+ * 匹配依然存在,只是靠 C6 判官的重判(反幻觉/契约校验不通过 → 重试一次)把它兜住了,不是被
+ * 修好了。不要把这次改动理解成"corpus_type 分区码问题已经全局修复"。
+ */
+function mapCorpusType(raw: unknown): string {
+	if (typeof raw !== "string") return String(raw ?? "");
+	return CORPUS_TYPE_BY_PARTITION[raw] ?? raw;
+}
+
+/** 把取到正文的条款渲染成给模型②看的正文块。**只渲染 items** —— 见下面 clauseIds 的注释。
+ *  export 仅为了让 test/fast-path-runtime.test.ts 能直测 corpus_type 映射(上面 mapCorpusType
+ *  的反向映射),生产代码里没有别的调用方。 */
+export function renderEvidence(items: readonly DetailItem[], byId: ReadonlyMap<string, RetrievalHit>): string {
 	return items
 		.map((item, index) => {
 			const hit = byId.get(item.clause_id);
@@ -199,7 +237,7 @@ function renderEvidence(items: readonly DetailItem[], byId: ReadonlyMap<string, 
 				`  status: ${String(item.status ?? "")}`,
 				`  source_code: ${String(item.source_code ?? "")}`,
 				`  source_doc_id: ${String(item.source_doc_id ?? "")}`,
-				`  corpus_type: ${String(hit?.corpus_type ?? "")}`,
+				`  corpus_type: ${mapCorpusType(hit?.corpus_type)}`,
 				`  score: ${hit?.score === undefined ? "null" : String(hit.score)}`,
 				`  正文: ${String(item.text ?? "")}`,
 			];

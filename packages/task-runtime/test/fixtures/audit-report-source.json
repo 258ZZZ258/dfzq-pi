@@ -1,0 +1,60 @@
+{
+  "审计项目": [{
+    "caseId": "CASE-001", "description": "最小常规审计测试", "taskId": "TASK-001",
+    "projectId": "PROJECT-001", "reportType": "regular", "organizationId": "ORG-001",
+    "auditStart": "2025-01-01", "auditEnd": "2025-12-31", "auditGroupEstablishedMonth": "2026年1月",
+    "reportDate": "2026年2月1日", "templateId": "regular-v1", "templateVersion": "1",
+    "closingOrganization": "测试证券公司", "feedbackCompleted": true
+  }],
+  "营业部基础库": [{
+    "organizationId": "ORG-001", "organizationCode": "BR001", "fullName": "测试证券营业部",
+    "address": "测试市测试路1号", "areaSquareMeters": 300, "asOf": "2025-12-31", "historyStatement": "无机构变更。"
+  }],
+  "人员快照": [{ "organizationId": "ORG-001", "employeeCount": 8, "brokerCount": 2, "asOf": "2025-12-31" }],
+  "OA任免发文": [],
+  "审计发现": [{
+    "findingId": "F-001", "projectId": "PROJECT-001", "organizationId": "ORG-001",
+    "category": "综合管理", "subcategory": "信息公示", "findingType": "制度执行类", "severity": "一般",
+    "title": "个别公示信息更新不及时", "policyBasis": "公司制度要求营业部及时更新公示信息。",
+    "factText": "抽查发现1项人员公示信息未及时更新。", "rawDetail": "问题标题、制度依据和事实描述完整。",
+    "responsibility": "管理责任", "majorConfirmed": false, "sourceOrder": 1, "issueCount": 1,
+    "foundDate": "2026-01-10", "status": "rectifying", "isSubjectResponsible": true
+  }],
+  "整改记录": [{
+    "findingId": "F-001", "organizationId": "ORG-001", "projectId": "PROJECT-001",
+    "rectificationId": "RECT-001", "status": "in-progress", "requirement": "及时更新并完善复核机制。",
+    "deadline": "2026-03-01"
+  }],
+  "风险事项": [
+    { "organizationId": "ORG-001", "eventId": "R-1", "type": "security-incident", "state": "VERIFIED_NONE" },
+    { "organizationId": "ORG-001", "eventId": "R-2", "type": "emergency", "state": "VERIFIED_NONE" },
+    { "organizationId": "ORG-001", "eventId": "R-3", "type": "litigation", "state": "VERIFIED_NONE" },
+    { "organizationId": "ORG-001", "eventId": "R-4", "type": "complaint", "state": "VERIFIED_NONE" },
+    { "organizationId": "ORG-001", "eventId": "R-5", "type": "regulatory-penalty", "state": "VERIFIED_NONE" },
+    { "organizationId": "ORG-001", "eventId": "R-6", "type": "financial-loss", "state": "VERIFIED_NONE" }
+  ],
+  "反洗钱领域事实": [], "反洗钱新开户风险等级": [], "反洗钱定期审核": [], "反洗钱协查函": [],
+  "总部可疑交易认定": [], "重大事项判断": [], "绩效考核": [],
+  "反洗钱汇总": [{
+    "organizationId": "ORG-001", "suspiciousTransactionCount": 0, "suspiciousTransactionType": "一般可疑交易",
+    "generalSuspiciousTransactionCount": 0, "keySuspiciousTransactionCount": 0,
+    "allSuspiciousTransactionsReported": true, "humanApprovedNoProblemBranch": false,
+    "problemQueryComplete": true, "majorMatterQueryComplete": true
+  }],
+  "审计叙述事实": [{
+    "organizationId": "ORG-001", "auditProcedures": "实施了审核、查询和访谈等审计程序。",
+    "internalControlSummary": "营业部岗位设置符合内部控制基本要求。",
+    "managerDutySummary": "审计期内，营业部负责人履行了经营管理责任。",
+    "previousRectificationSummary": "上次审计问题已完成整改。", "historicalFindingSummary": "无历次未整改问题。",
+    "cleanPracticeSummary": "未发现负责人存在重大违法违规事项。"
+  }],
+  "数据源目录": [
+    { "sourceId": "DS-01", "name": "审计项目", "implementationStatus": "ready", "authority": "primary", "requiredCapabilities": "audit-project", "providedCapabilities": "audit-project" },
+    { "sourceId": "DS-02", "name": "机构主数据", "implementationStatus": "ready", "authority": "primary", "requiredCapabilities": "organization-snapshot", "providedCapabilities": "organization-snapshot" },
+    { "sourceId": "DS-03", "name": "审计发现", "implementationStatus": "ready", "authority": "primary", "requiredCapabilities": "finding-detail", "providedCapabilities": "finding-detail" },
+    { "sourceId": "DS-04", "name": "经营数据", "implementationStatus": "ready", "authority": "primary", "requiredCapabilities": "operating-metrics", "providedCapabilities": "operating-metrics" }
+  ],
+  "经营数据": [["分支机构名称", "分支机构代码", "指标名称", "2025年", null], [null, null, null, "金额", "排名"], ["测试证券营业部", "BR001", "考核收入", 120.5, 10]],
+  "指标字典": [{ "metricCode": "assessment_revenue", "sourceMetricName": "考核收入", "reportLabel": "考核收入", "table": "financial", "unit": "万元", "includeInRanking": true }],
+  "排名参与家数": [{ "period": "2025年", "participants": 100 }]
+}

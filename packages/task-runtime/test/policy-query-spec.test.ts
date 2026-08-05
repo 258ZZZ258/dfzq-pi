@@ -106,6 +106,23 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(contract).toContain("不要输出 `reasoning` 字段");
 	});
 
+	// 2026-08-05 定点修复(第三刀):去掉 reasoning 字段没有根治转义问题 —— 真 run 判负实锤
+	// 显示模型在 basis[] 之外、schema 里*必填*的 conclusion 这个自由文本字段里也会写英文直引号
+	// (两例:「独立董事最多可以在几家上市公司兼任」在 conclusion 附近断裂于 position 545;
+	// 「投顾荐股违规怎么认定」模型用直引号包住了"违规行为"、断裂于 position 112)。conclusion
+	// 不能像 reasoning 那样直接从契约里去掉 —— 它是必填字段,唯一能做的是引导模型换一种引用词句
+	// 的写法。
+	//
+	// ⚠ 这条断言只锁"指令文本还在 fast-answer.md 里"这一件事 —— 挡的是有人以后重构/精简这份
+	// 契约时把这句顺手删掉。它不能也不试图证明模型会遵守这条指令:提示词指令对模型只是软约束,
+	// 13% 基线的转义错误率是否下降,只能靠真实 runFast() 调用观测方向性信号,不是靠这条纯文本
+	// 存在性断言。toContain 的字符串特意取到"不要用英文直引号"为止,不含后面解释"为什么"的分句
+	// (避免断言过脆 —— 解释句可以改写而不影响这条指令的可执行部分)。
+	it("tells the model to use Chinese quotation marks instead of straight double quotes inside string fields", () => {
+		const contract = readFileSync(`${specDir}policy-query/fast-answer.md`, "utf8");
+		expect(contract).toContain("请用中文引号「」,不要用英文直引号");
+	});
+
 	// output-contract.ts:42-59 那条寄生前提的静态半边:schema 少了这个 required,
 	// 反幻觉兜底会静默消失而所有测试照常通过。动态半边是 Task 18 的 A8。
 	it("requires clause_id on every basis element — the anti-hallucination carrier", () => {

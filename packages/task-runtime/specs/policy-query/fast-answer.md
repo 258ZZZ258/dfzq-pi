@@ -37,6 +37,9 @@
 
 条款的具体内容要说给用户听,就写在 `conclusion` 里(用你自己的话概括,或明确标注为引述)。
 
+字符串字段里(尤其 `conclusion`)如果需要引用词句,请用中文引号「」,不要用英文直引号 `"` ——
+直引号会截断 JSON 字符串,导致整份输出解析失败、判负退回。
+
 - `finish_reason: "stop"` 时 `basis` 必须非空
 - `finish_reason: "refused"` 时 `basis` 可空,但 `exhausted_scope` 必须非空
 

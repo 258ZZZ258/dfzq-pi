@@ -3,8 +3,13 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { recordReportToolTrace, requireAuditReportRequestContext } from "./report-context.ts";
-import { type AuditFinding, type ReportDraft, ReportDraftSchema } from "./report-contracts.ts";
+import {
+	createAuditReportRequestContext,
+	recordReportToolTrace,
+	requireAuditReportRequestContext,
+	withAuditReportRequestContext,
+} from "./report-context.ts";
+import type { AuditFinding, AuditReportDataset, ReportDraft } from "./report-contracts.ts";
 import {
 	buildFactPack,
 	comparePreviousAuditFindings,
@@ -12,11 +17,10 @@ import {
 	normalizeChineseProse,
 } from "./report-pipeline.ts";
 
-function result(text: string, details: Record<string, unknown>, terminate = false) {
+function result(text: string, details: Record<string, unknown>) {
 	return {
 		content: [{ type: "text" as const, text }],
 		details,
-		...(terminate ? { terminate: true } : {}),
 	};
 }
 
@@ -401,16 +405,15 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 		},
 	});
 
-	const submitDraft = defineTool({
-		name: "submit_report_draft",
-		label: "Submit report draft for human review",
+	const reviseDraft = defineTool({
+		name: "revise_report_draft",
+		label: "Revise model-editable report paragraphs",
 		description:
-			"Submit the generated draft unchanged or patch only allowlisted analysis paragraphs. For turnover reports, the model must resolve every ambiguous previous/current finding match in turnover-historical-findings from the retrieved finding details before submission. Template text is locked; the tool validates schema, completeness and evidence and never publishes or archives.",
+			"Patch only allowlisted semantic-analysis paragraphs and return the complete evidence-bound draft. Template text is locked. Final output validation belongs to the Runtime output contract.",
 		promptSnippet:
-			"Prefer mode=baseline only when no semantic-comparison ambiguity remains. If turnover-historical-findings says rule matching is uncertain, you must use paragraph-patch to give a report-ready consistency conclusion. paragraph-patch may change only regular-operating-analysis, turnover-operating-analysis, or turnover-historical-findings; never rebuild the full report or alter other template text.",
+			"Call this tool only when semantic processing is necessary. It may change only regular-operating-analysis, turnover-operating-analysis, or turnover-historical-findings; never alter template-locked content.",
 		parameters: Type.Object({
-			mode: Type.Union([Type.Literal("baseline"), Type.Literal("paragraph-patch")]),
-			paragraphChangesJson: Type.Optional(Type.String({ minLength: 2, maxLength: 50000 })),
+			paragraphChangesJson: Type.String({ minLength: 2, maxLength: 50000 }),
 		}),
 		executionMode: "sequential",
 		async execute(_id, params) {
@@ -418,39 +421,16 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 			context.factPack ??= buildFactPack(context.dataset);
 			const baseline = context.draft ?? generateReportDraft(context.dataset, context.factPack);
 			context.draft = baseline;
-			const previousAuditComparison =
-				context.dataset.task.reportType === "turnover"
-					? comparePreviousAuditFindings(context.dataset.findings)
-					: undefined;
-			if (params.mode === "baseline" && (previousAuditComparison?.needsReview.length ?? 0) > 0) {
-				return result(
-					"Submission rejected: turnover-historical-findings contains unresolved previous/current finding matches; use paragraph-patch and provide a report-ready conclusion.",
-					{
-						valid: false,
-						candidates: previousAuditComparison?.needsReview.map(({ previous, current }) => ({
-							previousFindingId: previous.findingId,
-							previousTitle: previous.title,
-							currentFindingId: current.findingId,
-							currentTitle: current.title,
-						})),
-					},
-				);
-			}
-			let parsed: unknown = baseline;
-			if (params.mode === "paragraph-patch") {
-				if (!params.paragraphChangesJson) {
-					return result("Submission rejected: paragraphChangesJson is required for paragraph-patch mode.", {
-						valid: false,
-					});
-				}
+			let parsed: unknown;
+			{
 				let changes: unknown;
 				try {
 					changes = JSON.parse(params.paragraphChangesJson);
 				} catch {
-					return result("Submission rejected: paragraphChangesJson is invalid.", { valid: false });
+					return result("Revision rejected: paragraphChangesJson is invalid.", { valid: false });
 				}
 				if (!Value.Check(ParagraphChangesSchema, changes)) {
-					return result("Submission rejected: paragraphChangesJson does not match the patch schema.", {
+					return result("Revision rejected: paragraphChangesJson does not match the patch schema.", {
 						valid: false,
 					});
 				}
@@ -462,7 +442,7 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 					.map((change) => change.paragraphId)
 					.filter((paragraphId) => !paragraphs.has(paragraphId));
 				if (unknownParagraphIds.length > 0) {
-					return result(`Submission rejected: unknown paragraph IDs: ${unknownParagraphIds.join(", ")}`, {
+					return result(`Revision rejected: unknown paragraph IDs: ${unknownParagraphIds.join(", ")}`, {
 						valid: false,
 						errors: unknownParagraphIds,
 					});
@@ -472,7 +452,7 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 					.filter((paragraphId) => !llmEditableParagraphIds.has(paragraphId));
 				if (lockedParagraphIds.length > 0) {
 					return result(
-						`Submission rejected: template-locked paragraphs cannot be changed: ${lockedParagraphIds.join(", ")}`,
+						`Revision rejected: template-locked paragraphs cannot be changed: ${lockedParagraphIds.join(", ")}`,
 						{
 							valid: false,
 							errors: lockedParagraphIds,
@@ -505,7 +485,7 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 							exposesInternalReasoning
 						) {
 							return result(
-								"Submission rejected: turnover-historical-findings must keep the complete previous-title list, disclose every confirmed unrectified problem, use at most two report-ready sentences, and omit finding IDs or internal comparison reasoning.",
+								"Revision rejected: turnover-historical-findings must keep the complete previous-title list, disclose every confirmed unrectified problem, use at most two report-ready sentences, and omit finding IDs or internal comparison reasoning.",
 								{
 									valid: false,
 									errors: [
@@ -524,15 +504,6 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 				}
 				parsed = patched;
 			}
-			if (!Value.Check(ReportDraftSchema, parsed)) {
-				const schemaErrors = [...Value.Errors(ReportDraftSchema, parsed)]
-					.slice(0, 20)
-					.map((error) => `${error.instancePath || "/"}: ${error.message}`);
-				return result(`Submission rejected: draft schema is invalid; ${schemaErrors.join("; ")}`, {
-					valid: false,
-					errors: schemaErrors,
-				});
-			}
 			const draft = parsed as ReportDraft;
 			const knownEvidence = new Set(context.dataset.evidence.map((item) => item.evidenceId));
 			const cited = reportEvidenceIds(draft);
@@ -546,16 +517,11 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 					: []),
 			];
 			if (errors.length > 0) {
-				return result(`Submission rejected: ${errors.join("; ")}`, { valid: false, errors });
+				return result(`Revision rejected: ${errors.join("; ")}`, { valid: false, errors });
 			}
 			context.draft = draft;
-			context.draftSchemaValidated = true;
-			recordReportToolTrace("submit_report_draft", [draft.taskId]);
-			return result(
-				"Draft accepted for human review; no publish or archive action was performed.",
-				{ valid: true, draft },
-				true,
-			);
+			recordReportToolTrace("revise_report_draft", [draft.taskId]);
+			return result(JSON.stringify(draft, null, 2), { valid: true, draft });
 		},
 	});
 
@@ -573,6 +539,16 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 		getAmlFacts,
 		prepareFactPack,
 		generateDraft,
-		submitDraft,
+		reviseDraft,
 	];
+}
+
+/** Bind one immutable source dataset and one mutable drafting context to a single runtime/toolset. */
+export function createBoundAuditReportTools(dataset: AuditReportDataset, skillRoot: string): ToolDefinition[] {
+	const context = createAuditReportRequestContext(dataset);
+	return createAuditReportTools(skillRoot).map((tool) => ({
+		...tool,
+		execute: async (...args: Parameters<typeof tool.execute>) =>
+			await withAuditReportRequestContext(context, () => tool.execute(...args)),
+	}));
 }

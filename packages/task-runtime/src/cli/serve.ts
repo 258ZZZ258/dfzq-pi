@@ -33,8 +33,20 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 	const specsDir = requireEnv(env, "TASK_RUNTIME_SPECS_DIR");
 	const profilePath = requireEnv(env, "TASK_RUNTIME_PROFILE");
 	const workRoot = requireEnv(env, "TASK_RUNTIME_WORK_ROOT");
+	const auditApiBaseUrl = env.AUDIT_REPORT_API_BASE_URL;
+	const operatingWorkbookPath = env.AUDIT_REPORT_OPERATING_WORKBOOK;
+	if ((auditApiBaseUrl === undefined) !== (operatingWorkbookPath === undefined)) {
+		throw new Error("AUDIT_REPORT_API_BASE_URL and AUDIT_REPORT_OPERATING_WORKBOOK must be configured together");
+	}
 
-	const runtimeFactory = await createDefaultRuntimeFactory({ profilePath, workRoot, specsDir });
+	const runtimeFactory = await createDefaultRuntimeFactory({
+		profilePath,
+		workRoot,
+		specsDir,
+		...(auditApiBaseUrl && operatingWorkbookPath
+			? { auditReportSources: { apiBaseUrl: auditApiBaseUrl, operatingWorkbookPath } }
+			: {}),
+	});
 	return startServer({
 		port,
 		dbPath,

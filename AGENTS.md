@@ -4,6 +4,16 @@
 
 - Put all subsequent DFZQ task-runtime feature development in `packages/task-runtime`.
 - Do not modify Pi upstream packages (`packages/agent`, `packages/ai`, `packages/coding-agent`, or `packages/tui`) for this work unless the user explicitly requests it.
+- New task agents must use the repository runtime chain: `RuntimeSpec` → `ProviderProfile` → `ToolsetRegistry` → `SessionRuntime`. Do not create parallel session factories or hard-code providers/models.
+- Put task-owned prompts, output contracts, and skills under `packages/task-runtime/specs/<task>/`; keep `src/` for reusable runtime and tool code.
+
+## Product Assets and SDD
+
+- Never commit customer documents, generated reports, Office binaries, screenshots, exports, full simulated business datasets, credentials, or local absolute paths.
+- Tests may keep minimal CSV/JSON facts and must construct XLSX/DOCX inputs at runtime.
+- Keep package documentation executable and contract-oriented. Product proposals, meeting materials, field catalogues, and project-value narratives belong outside the repository.
+- Before broad task-agent changes, maintain the external `dfzq-pi开发任务/` SDD set: specification, implementation plan, progress, and final handoff.
+- Python retained in the product path requires pinned dependencies, a package command, an automated test, and a documented reproducible output.
 
 ## Conversational Style
 

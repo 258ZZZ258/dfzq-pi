@@ -666,7 +666,7 @@ function evaluateItem(
 				"semantic-heuristic",
 			);
 		case "RULE-012":
-			return pass(draft.closingOrganization === "东方证券股份有限公司", "落款主体核对");
+			return pass(draft.closingOrganization === dataset.task.closingOrganization, "落款主体核对");
 		case "RULE-013":
 			return pass(
 				dataset.task.reportType === "turnover" || draft.addressee === `${dataset.organization.fullName}：`,

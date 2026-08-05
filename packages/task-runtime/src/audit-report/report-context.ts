@@ -11,7 +11,6 @@ export interface AuditReportRequestContext {
 	dataset: AuditReportDataset;
 	factPack?: ReportFactPack;
 	draft?: ReportDraft;
-	draftSchemaValidated?: boolean;
 	trace: ReportToolTrace[];
 }
 

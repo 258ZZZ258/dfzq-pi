@@ -702,19 +702,21 @@ function operatingNarrative(dataset: AuditReportDataset, pack: ReportFactPack): 
 	const latestRevenue = revenueMetrics
 		.map((metric) => ({ metric, value: metric.points.at(-1)?.value ?? 0 }))
 		.sort((a, b) => b.value - a.value)[0];
-	const primary = latestRevenue?.metric.reportLabel.replace(/^其中：/u, "") ?? "经纪业务收入";
+	const primary = latestRevenue?.metric.reportLabel.replace(/^其中：/u, "");
 	const clientAssets = dataset.operatingMetrics.find((metric) => metric.metricCode === "client_assets");
 	const stockFund = dataset.operatingMetrics.find((metric) => metric.metricCode === "stock_fund_volume");
 	const increasing = (metric: OperatingMetric | undefined): boolean =>
-		metric?.points.every((point, index, values) => index === 0 || point.value >= (values[index - 1]?.value ?? 0)) ??
-		false;
+		(metric?.points.length ?? 0) >= 2 &&
+		(metric?.points.every((point, index, values) => index === 0 || point.value >= (values[index - 1]?.value ?? 0)) ??
+			false);
 	const decreasing = (metric: OperatingMetric | undefined): boolean =>
-		metric?.points.every((point, index, values) => index === 0 || point.value <= (values[index - 1]?.value ?? 0)) ??
-		false;
+		(metric?.points.length ?? 0) >= 2 &&
+		(metric?.points.every((point, index, values) => index === 0 || point.value <= (values[index - 1]?.value ?? 0)) ??
+			false);
 	const trend = (metric: OperatingMetric | undefined): string => {
 		if (increasing(metric)) return "逐年增长";
 		if (decreasing(metric)) return "总体下降";
-		return "有所波动";
+		return "";
 	};
 	const bands = unique(pack.derivedRanks.map((rank) => rank.band));
 	const bandText =
@@ -722,10 +724,23 @@ function operatingNarrative(dataset: AuditReportDataset, pack: ReportFactPack): 
 			? "中游至中下游"
 			: bands.length > 0
 				? bands.join("、")
-				: "待确认";
-	return `审计期内，财务指标方面，营业部以${primary}为主要收入来源。业绩指标方面，客户资产规模${trend(
-		clientAssets,
-	)}，股基交易量${trend(stockFund)}。从指标排名情况来看，营业部各项指标排名基本处于公司所有营业部${bandText}水平。`;
+				: undefined;
+	const statements: string[] = [];
+	if (primary) statements.push(`财务指标方面，营业部以${primary}为主要收入来源`);
+	const trendStatements = [
+		clientAssets ? `客户资产规模${trend(clientAssets) || "详见上表"}` : undefined,
+		stockFund ? `股基交易量${trend(stockFund) || "详见上表"}` : undefined,
+	].filter((item): item is string => item !== undefined);
+	if (trendStatements.length > 0) statements.push(`业绩指标方面，${trendStatements.join("，")}`);
+	if (bandText) statements.push(`从指标排名情况来看，营业部各项指标排名基本处于公司所有营业部${bandText}水平`);
+	if (statements.length === 0) {
+		const latestValues = dataset.operatingMetrics.flatMap((metric) => {
+			const point = metric.points.at(-1);
+			return point ? [`${point.period}${metric.reportLabel}为${point.value}${metric.unit}`] : [];
+		});
+		return latestValues.length > 0 ? `审计期内，${latestValues.join("，")}。` : "审计期内，经营数据未就绪。";
+	}
+	return `审计期内，${statements.join("。")}。`;
 }
 
 function turnoverOperatingNarrative(dataset: AuditReportDataset, pack: ReportFactPack, subjectName: string): string {
@@ -1083,7 +1098,7 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 			unique([...projectEvidenceIds(dataset), ...sourceFieldEvidenceIds(dataset, "DS-10", "auditProcedures")]),
 		),
 		sections,
-		closingOrganization: "东方证券股份有限公司",
+		closingOrganization: dataset.task.closingOrganization,
 		reportDate: dataset.task.reportDate,
 		status: pack.blockers.length > 0 ? "needs-input" : "ready-for-review",
 		blockers: pack.blockers,
@@ -1257,7 +1272,7 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 			]),
 		),
 		sections,
-		closingOrganization: "东方证券股份有限公司",
+		closingOrganization: dataset.task.closingOrganization,
 		reportDate: dataset.task.reportDate,
 		status: pack.blockers.length > 0 ? "needs-input" : "ready-for-review",
 		blockers: pack.blockers,
@@ -1387,7 +1402,7 @@ function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraf
 			unique([...projectEvidenceIds(dataset), ...sourceFieldEvidenceIds(dataset, "DS-10", "auditProcedures")]),
 		),
 		sections,
-		closingOrganization: "东方证券股份有限公司",
+		closingOrganization: dataset.task.closingOrganization,
 		reportDate: dataset.task.reportDate,
 		status: pack.blockers.length > 0 ? "needs-input" : "ready-for-review",
 		blockers: pack.blockers,

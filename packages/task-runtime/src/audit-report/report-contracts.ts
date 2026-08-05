@@ -1,3 +1,5 @@
+import { Type } from "typebox";
+
 export type AuditReportType = "regular" | "turnover" | "aml";
 
 export type ReportValueState =
@@ -30,6 +32,7 @@ export interface ReportTask {
 	reportDate: string;
 	templateId: string;
 	templateVersion: string;
+	closingOrganization: string;
 	subjectPersonId?: string;
 	subjectPersonName?: string;
 	appointmentStart?: string;
@@ -508,5 +511,3 @@ export interface SourceCoverageAssessment {
 	missingCapabilities: readonly string[];
 	pendingSources: readonly string[];
 }
-
-import { Type } from "typebox";

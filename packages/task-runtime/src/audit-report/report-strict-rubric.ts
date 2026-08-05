@@ -804,7 +804,7 @@ function claimCandidates(dataset: AuditReportDataset): ClaimCandidate[] {
 			dataset.aml.majorMatters.filter((matter) => matter.confirmedMajor).length,
 			[
 				"未发现营业部反洗钱工作存在重大或重要内控缺陷",
-				"未发现上海浦东新区启帆路证券营业部反洗钱工作存在重大违法违规事项或重大内控缺陷",
+				`未发现${dataset.organization.fullName}反洗钱工作存在重大违法违规事项或重大内控缺陷`,
 			],
 			majorEvidence,
 			false,

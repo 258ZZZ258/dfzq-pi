@@ -1,10 +1,29 @@
-export * from "./report-context.ts";
-export * from "./report-contracts.ts";
-export * from "./report-data-source.ts";
-export * from "./report-extension.ts";
-export * from "./report-mock-system.ts";
-export * from "./report-pipeline.ts";
-export * from "./report-rubric.ts";
-export * from "./report-runtime.ts";
-export * from "./report-strict-rubric.ts";
-export * from "./report-tools.ts";
+export type {
+	AuditFinding,
+	AuditReportDataset,
+	AuditReportType,
+	EvidenceRecord,
+	ReportDraft,
+	ReportFactPack,
+	RubricScore,
+	SourceCoverageAssessment,
+} from "./report-contracts.ts";
+export { ReportDraftSchema } from "./report-contracts.ts";
+export {
+	type LoadAuditReportDatasetOptions,
+	type LoadedAuditReportDataset,
+	loadAuditReportDataset,
+	type SourceReadTrace,
+} from "./report-data-source.ts";
+export {
+	assessSourceCoverage,
+	buildFactPack,
+	comparePreviousAuditFindings,
+	findAdjacentRepeatedPhrase,
+	generateReportDraft,
+	normalizeChineseProse,
+	renderReportMarkdown,
+} from "./report-pipeline.ts";
+export { getExecutableRubricItemCount, type ReportRunEvidence, scoreReport } from "./report-rubric.ts";
+export { scoreStrictReportClaims } from "./report-strict-rubric.ts";
+export { createAuditReportTools, createBoundAuditReportTools } from "./report-tools.ts";

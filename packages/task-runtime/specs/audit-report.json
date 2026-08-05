@@ -1,0 +1,52 @@
+{
+  "id": "audit-report",
+  "description": "常规、离任和反洗钱审计报告生成",
+  "model": { "role": "main" },
+  "thinkingLevel": "medium",
+  "toolset": "audit-report",
+  "tools": [
+    "read",
+    "get_report_task",
+    "get_organization_snapshot",
+    "get_personnel_snapshot",
+    "list_appointment_records",
+    "get_operating_metrics",
+    "list_audit_findings",
+    "get_audit_finding_detail",
+    "list_rectification_records",
+    "list_risk_events",
+    "get_aml_facts",
+    "prepare_report_fact_pack",
+    "generate_report_draft",
+    "revise_report_draft"
+  ],
+  "systemPrompt": "audit-report/system.md",
+  "skills": ["audit-report/skills/SKILL.md"],
+  "appendSystemPrompt": ["audit-report/output-format.md"],
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 12000,
+    "keepRecentTokens": 18000
+  },
+  "limits": {
+    "maxTurns": 24,
+    "runTimeoutMs": 900000,
+    "maxTotalTokens": 1000000,
+    "maxCostUsd": 1
+  },
+  "stopPolicy": {
+    "name": "audit-report-readiness",
+    "options": { "maxAttempts": 1 }
+  },
+  "resultPolicy": {
+    "name": "result-budget",
+    "options": {
+      "maxChars": { "default": 60000 }
+    }
+  },
+  "outputContract": {
+    "schema": "audit-report/output-contract.schema.json",
+    "maxRepairAttempts": 2
+  },
+  "observability": { "contextSnapshot": "hash" }
+}

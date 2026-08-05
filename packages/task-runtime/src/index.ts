@@ -1,6 +1,35 @@
 export const PACKAGE_NAME = "@dfzq/task-runtime";
 
-export * from "./audit-report/index.ts";
+export type {
+	AuditFinding,
+	AuditReportDataset,
+	AuditReportType,
+	EvidenceRecord,
+	LoadAuditReportDatasetOptions,
+	LoadedAuditReportDataset,
+	ReportDraft,
+	ReportFactPack,
+	ReportRunEvidence,
+	RubricScore,
+	SourceCoverageAssessment,
+	SourceReadTrace,
+} from "./audit-report/index.ts";
+export {
+	assessSourceCoverage,
+	buildFactPack,
+	comparePreviousAuditFindings,
+	createAuditReportTools,
+	createBoundAuditReportTools,
+	findAdjacentRepeatedPhrase,
+	generateReportDraft,
+	getExecutableRubricItemCount,
+	loadAuditReportDataset,
+	normalizeChineseProse,
+	ReportDraftSchema,
+	renderReportMarkdown,
+	scoreReport,
+	scoreStrictReportClaims,
+} from "./audit-report/index.ts";
 
 export type { ProviderProfile, RoleBinding } from "./env/provider-profile.ts";
 export { reconcile, reconcileRunEvents } from "./observability/reconcile.ts";
@@ -39,6 +68,7 @@ export type { RuntimeSpec } from "./spec/types.ts";
 export { validateSpec } from "./spec/validate.ts";
 export type { RunRecord, RunStore, StoredRunStatus } from "./store/contract.ts";
 export { createSqliteRunStore } from "./store/sqlite.ts";
+export { type AuditReportToolsetOptions, createAuditReportToolset } from "./toolsets/audit-report.ts";
 export { createMcpToolset } from "./toolsets/mcp/adapter.ts";
 export { McpClient } from "./toolsets/mcp/client.ts";
 export { ToolsetRegistry } from "./toolsets/registry.ts";

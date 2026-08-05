@@ -8,6 +8,7 @@ import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
 import { createSqliteRunStore } from "../store/sqlite.ts";
+import { createAuditReportToolset } from "../toolsets/audit-report.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
 import { createApp } from "./app.ts";
@@ -129,6 +130,10 @@ export interface DefaultFactoryOptions {
 	 * router 只会是死参数。
 	 */
 	specsDir: string;
+	auditReportSources?: {
+		apiBaseUrl: string;
+		operatingWorkbookPath: string;
+	};
 }
 
 /** spec 文件在 RuntimeSpec 之外多带一个 mcpServers,与 cli/main.ts 的 SpecFile 同一形状。 */
@@ -189,17 +194,36 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
 		const toolsets = new ToolsetRegistry();
-		toolsets.register(
-			spec.toolset,
-			createMcpToolset(spec.mcpServers ?? [], {
-				runId,
-				// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
-				// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
-				permTags: filters.permTags ?? [],
-				corpusTypes: filters.corpusTypes,
-				options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
-			}),
-		);
+		if (spec.toolset === "audit-report") {
+			if (!options.auditReportSources) {
+				throw new Error("audit-report source configuration is not available");
+			}
+			if (!runOptions.reportTaskId || !runOptions.reportType) {
+				throw new Error("audit-report requires options.reportTaskId and options.reportType");
+			}
+			toolsets.register(
+				spec.toolset,
+				createAuditReportToolset({
+					taskId: runOptions.reportTaskId,
+					reportType: runOptions.reportType,
+					apiBaseUrl: options.auditReportSources.apiBaseUrl,
+					operatingWorkbookPath: options.auditReportSources.operatingWorkbookPath,
+					skillRoot: resolve(options.specsDir, "audit-report/skills"),
+				}),
+			);
+		} else {
+			toolsets.register(
+				spec.toolset,
+				createMcpToolset(spec.mcpServers ?? [], {
+					runId,
+					// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
+					// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
+					permTags: filters.permTags ?? [],
+					corpusTypes: filters.corpusTypes,
+					options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
+				}),
+			);
+		}
 
 		const workdir = join(options.workRoot, sessionId);
 		return createSessionRuntime({

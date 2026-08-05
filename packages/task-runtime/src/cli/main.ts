@@ -8,6 +8,7 @@ import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
+import { createAuditReportToolset } from "../toolsets/audit-report.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
 import { cleanupAfterRun } from "./cleanup.ts";
@@ -27,6 +28,10 @@ async function main(): Promise<void> {
 			input: { type: "string" },
 			trajectory: { type: "string" },
 			runId: { type: "string" },
+			"report-task-id": { type: "string" },
+			"report-type": { type: "string" },
+			"audit-api-base-url": { type: "string" },
+			"operating-workbook": { type: "string" },
 		},
 	});
 
@@ -76,22 +81,42 @@ async function main(): Promise<void> {
 	await resolveSpecPromptPaths(spec, dirname(values.spec as string));
 
 	const toolsets = new ToolsetRegistry();
-	toolsets.register(
-		spec.toolset,
-		createMcpToolset(
-			(spec.mcpServers ?? []).map((server) => ({
-				...server,
-				// eval 模式:把每任务的工具调用日志路径传进 MCP server
-				env: {
-					...server.env,
-					...(process.env.EVAL_TASK_LOG ? { EVAL_TASK_LOG: process.env.EVAL_TASK_LOG } : {}),
-				},
-			})),
-			// eval / CLI 不是权限场景:没有 POST /runs 的 filters,也没有 runId。
-			// 显式 null 而不是省略 —— 参数不可省略,于是生产路径漏传 scope 是编译错误。
-			null,
-		),
-	);
+	if (spec.toolset === "audit-report") {
+		const reportType = values["report-type"];
+		if (reportType !== "regular" && reportType !== "turnover" && reportType !== "aml") {
+			throw new Error("--report-type must be regular, turnover, or aml");
+		}
+		for (const key of ["report-task-id", "audit-api-base-url", "operating-workbook"] as const) {
+			if (!values[key]) throw new Error(`--${key} is required for audit-report`);
+		}
+		toolsets.register(
+			spec.toolset,
+			createAuditReportToolset({
+				taskId: values["report-task-id"] as string,
+				reportType,
+				apiBaseUrl: values["audit-api-base-url"] as string,
+				operatingWorkbookPath: values["operating-workbook"] as string,
+				skillRoot: resolve(dirname(values.spec as string), "audit-report/skills"),
+			}),
+		);
+	} else {
+		toolsets.register(
+			spec.toolset,
+			createMcpToolset(
+				(spec.mcpServers ?? []).map((server) => ({
+					...server,
+					// eval 模式:把每任务的工具调用日志路径传进 MCP server
+					env: {
+						...server.env,
+						...(process.env.EVAL_TASK_LOG ? { EVAL_TASK_LOG: process.env.EVAL_TASK_LOG } : {}),
+					},
+				})),
+				// eval / CLI 不是权限场景:没有 POST /runs 的 filters,也没有 runId。
+				// 显式 null 而不是省略 —— 参数不可省略,于是生产路径漏传 scope 是编译错误。
+				null,
+			),
+		);
+	}
 
 	const runtime = await createSessionRuntime({
 		spec,

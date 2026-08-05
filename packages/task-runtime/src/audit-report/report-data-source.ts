@@ -358,6 +358,7 @@ export async function loadAuditReportDataset(
 		reportDate: text(taskRecord, "reportDate"),
 		templateId: text(taskRecord, "templateId"),
 		templateVersion: text(taskRecord, "templateVersion"),
+		closingOrganization: text(taskRecord, "closingOrganization"),
 		...(optionalText(taskRecord, "subjectPersonId")
 			? { subjectPersonId: optionalText(taskRecord, "subjectPersonId") }
 			: {}),
@@ -382,6 +383,7 @@ export async function loadAuditReportDataset(
 		"reportDate",
 		"templateId",
 		"templateVersion",
+		"closingOrganization",
 		"subjectPersonId",
 		"subjectPersonName",
 		"appointmentStart",

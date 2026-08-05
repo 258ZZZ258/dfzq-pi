@@ -1,0 +1,12 @@
+{
+  "systemApi": {
+    "kind": "http",
+    "workbook": "模拟审计系统数据.xlsx"
+  },
+  "operatingMetrics": {
+    "kind": "excel",
+    "workbook": "模拟经营数据.xlsx",
+    "organizationMatch": "organizationCode"
+  },
+  "jobs": "报告任务输入.json"
+}

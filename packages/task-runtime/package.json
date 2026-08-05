@@ -4,12 +4,17 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test": "vitest --run"
+		"test": "vitest --run",
+		"test:audit-report": "vitest --run test/audit-report/audit-report-agent.test.ts",
+		"demo:audit-reports": "tsx src/audit-report/report-demo.ts",
+		"demo:audit-reports:live": "tsx src/audit-report/report-live-demo.ts",
+		"evaluate:audit-reports:strict": "tsx src/audit-report/report-strict-batch.ts"
 	},
 	"bin": {
 		"task-runtime": "./src/cli/main.ts"
 	},
 	"dependencies": {
+		"@e965/xlsx": "0.20.3",
 		"@earendil-works/pi-coding-agent": "^0.82.1",
 		"@hono/node-server": "2.0.12",
 		"hono": "4.12.32",

@@ -1,5 +1,7 @@
 export const PACKAGE_NAME = "@dfzq/task-runtime";
 
+export * from "./audit-report/index.ts";
+
 export type { ProviderProfile, RoleBinding } from "./env/provider-profile.ts";
 export { reconcile, reconcileRunEvents } from "./observability/reconcile.ts";
 export { attachTrajectory, readTrajectory } from "./observability/trajectory.ts";

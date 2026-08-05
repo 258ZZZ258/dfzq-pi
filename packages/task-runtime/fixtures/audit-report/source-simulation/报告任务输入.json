@@ -1,0 +1,17 @@
+[
+  {
+    "caseId": "QIFAN-REGULAR-REPLAY",
+    "taskId": "TASK-QF-REG-001",
+    "reportType": "regular"
+  },
+  {
+    "caseId": "QIFAN-TURNOVER-SIMULATION",
+    "taskId": "TASK-QF-TUR-001",
+    "reportType": "turnover"
+  },
+  {
+    "caseId": "QIFAN-AML-SIMULATION",
+    "taskId": "TASK-QF-AML-001",
+    "reportType": "aml"
+  }
+]

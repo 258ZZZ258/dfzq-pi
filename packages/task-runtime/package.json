@@ -5,10 +5,8 @@
 	"type": "module",
 	"scripts": {
 		"test": "vitest --run",
-		"test:audit-report": "vitest --run test/audit-report/audit-report-agent.test.ts",
-		"demo:audit-reports": "tsx src/audit-report/report-demo.ts",
-		"demo:audit-reports:live": "tsx src/audit-report/report-live-demo.ts",
-		"evaluate:audit-reports:strict": "tsx src/audit-report/report-strict-batch.ts"
+		"test:audit-report": "vitest --run test/audit-report-agent.test.ts && python scripts/audit-report/test_render_report_docx.py",
+		"render:audit-report": "python scripts/audit-report/render_report_docx.py"
 	},
 	"bin": {
 		"task-runtime": "./src/cli/main.ts"

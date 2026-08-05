@@ -203,6 +203,18 @@ afterEach(async () => {
 	cleanups = [];
 });
 
+/** Polls `predicate` until it's true, sleeping `stepMs` between checks. Throws after `timeoutMs`
+ *  so a stuck condition fails fast with a clear message instead of hanging until vitest's own
+ *  test timeout. 与 test/session-runtime.test.ts 的同名 helper 逐字同源(两个测试文件各自
+ *  file-local,不共享一个 helpers 模块——与该文件里这份的既有先例一致)。 */
+async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`waitUntil: condition not met within ${timeoutMs}ms`);
+		await new Promise((resolve) => setTimeout(resolve, stepMs));
+	}
+}
+
 interface FastOpts {
 	modelReplies: string[];
 	hitCount?: number;
@@ -637,5 +649,32 @@ describe("createFastPathRuntime", () => {
 		noText.subscribe((e) => events.push(e.type));
 		await noText.runFast("原始问题");
 		expect(events).toContain("fast_path_escalated");
+	});
+
+	// C-1(整支终审 Critical,顺手一并修对的那一半):`run()`/`runFast()` 此前把"自己的
+	// abort() 被调用过"这件事报成 status:"error"——与 checkPreempted() 那支的 "limit_exceeded"
+	// 撞不上(tripped 从未被 abort() 设置过,这条走的是判官分支),但同样错把"被取消"混进
+	// "系统性失败"的桶里。这里不设 runTimeoutMs(排除限额/超时通路),只让 promptOnce(answer)
+	// 挂住,在挂住期间调用 abort()——与 session-runtime.test.ts 的
+	// "abort() resolves only after..." 用例同一手法:等 isIdle 变 false 再 abort,避免同一
+	// tick 内的 no-op。
+	it('reports status "aborted" (not "error") when abort() is called mid-flight and no limit ever tripped', async () => {
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				hangAnswerMs: 200,
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+
+		const runPromise = rt.runFast("原始问题");
+		await waitUntil(() => !rt.isIdle);
+		await rt.abort();
+		const got = await runPromise;
+
+		expect(got.verdict.accept).toBe(false);
+		expect(got.result.status).toBe("aborted");
+		expect(got.result.limit).toBeUndefined(); // 不是限额/超时,别把两者混进同一个值
+		expect(got.result.turns).toBe(2); // 两次模型调用都真的发生过,如实带回
 	});
 });

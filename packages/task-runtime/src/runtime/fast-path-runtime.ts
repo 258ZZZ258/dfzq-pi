@@ -381,6 +381,12 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	const id = randomUUID();
 	let lastActiveAt = Date.now();
 	let modelCalls = 0;
+	// C-1(整支终审 Critical):有人调用过下面 return 里的 `abort()`。`session.prompt()` 的返回值
+	// 本身分不出"这次没通过是判负"还是"被打断"——两者都可能是抛错(catch 分支),也都可能是
+	// prompt() 正常返回一段半截文本(走到 judgeFastPathOutput 才被判负,见 checkPreempted 上方
+	// 的注释:"abort 在 pi 里不是粘滞状态")。这个标志是唯一能分辨"有人明确要求停"的信号,只能
+	// 记在这里——被调用的这一层——不能从任何返回值反推。
+	let stopRequested = false;
 
 	async function promptOnce(text: string): Promise<string> {
 		modelCalls += 1;
@@ -458,6 +464,25 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		};
 	}
 
+	/**
+	 * C-1:把"判负"与"被取消"分开的唯一落点。只在 `stopRequested`(下面 return 里的
+	 * `abort()` 被调用过)且 `result.status === "error"` 时才改写成 `"aborted"`——两个条件
+	 * 缺一都不动:
+	 *   - 不动 `"limit_exceeded"`(checkPreempted() 与 runFast() 的 catch 分支里 tripped 为真
+	 *     的那支):限额/超时是另一件事,不能被这里的改写吞掉,见 checkPreempted 上方注释里
+	 *     "自相矛盾组合" 那段——`status:"aborted"` 配 `limit:"runTimeout"` 正是那种组合。
+	 *   - 不动 `"completed"`(verdict.accept 为真的那支):abort() 与"答案已经合规"这两件事
+	 *     可能在极窄的窗口内竞速,但没有理由把一份已经通过 `judgeFastPathOutput` 的答案硬改
+	 *     成"取消"——收下即止,不因为外部另有一次 abort() 调用就推翻这个判定。
+	 * 单点收口(不去逐一改 checkPreempted() 的三处早退、"检索无命中"/"一条正文都没取到"两条、
+	 * 判官分支、catch 分支):这几处 status==="error" 的产出路径全部先落进这个函数、再决定要不要
+	 * 改写,行为对每一条路径一致,不用在每处分别记一遍"是不是被取消的"。
+	 */
+	function finalizeIfStopped(outcome: FastPathRun): FastPathRun {
+		if (!stopRequested || outcome.result.status !== "error") return outcome;
+		return { verdict: outcome.verdict, result: { ...outcome.result, status: "aborted" } };
+	}
+
 	async function runFast(input: string, opts?: RunOptions): Promise<FastPathRun> {
 		const runId = opts?.runId ?? randomUUID();
 		currentRunId = runId;
@@ -484,7 +509,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 			}, fp.limits.runTimeoutMs);
 		}
 		try {
-			return await runFastInner(runId, input, startedAt);
+			return finalizeIfStopped(await runFastInner(runId, input, startedAt));
 		} catch (error) {
 			// 规格 §7:阶段 1 任何抛错(含超时/撞限额期间下游调用被 abort 打断导致的抛错)都
 			// **升级**,不落终态失败 —— 阶段 2 还没跑过。
@@ -493,16 +518,19 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 				? describeTripped(tripped, fp.limits)
 				: `阶段 1 抛错:${error instanceof Error ? error.message : String(error)}`;
 			emit("fast_path_escalated", { reason });
-			return {
+			return finalizeIfStopped({
 				verdict: { accept: false, reason },
 				// status 同 checkPreempted() 的口径:tripped 一律 "limit_exceeded"(含
-				// runTimeout),不映射成 "aborted" —— 见 checkPreempted 上方的注释。
+				// runTimeout),不映射成 "aborted" —— 见 checkPreempted 上方的注释。非
+				// tripped 的 "error" 分支才可能被 finalizeIfStopped 改写成 "aborted"
+				// (C-1:`stopRequested` 且不是限额/超时时——即这次抛错是 abort() 打断的,
+				// 不是别的运行期失败)。
 				result: normalize(runId, startedAt, session.getLastAssistantText() ?? "", {
 					status: tripped ? "limit_exceeded" : "error",
 					errorMessage: reason,
 					limit: tripped,
 				}),
-			};
+			});
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
@@ -635,11 +663,20 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		// 已经收紧的「只在 status === "completed" 时才填 answer」是同一类闸门缺失
 		// (2026-07-31 复审 Important 记录在案)——被 C6 拒掉的臆造应答不能因为解析得出语法
 		// 合法的 JSON,就被当成已校验的答案继续往下游走。
+		// C-1:`run()` 复用 `runFast()`,`status:"aborted"` 的改写(见 finalizeIfStopped)因此
+		// 在这条路径上同样生效——不需要在这里另外处理一遍。
 		run: async (input: string, opts?: RunOptions) => (await runFast(input, opts)).result,
 		activeToolNamesForTest: () => session.getActiveToolNames(),
 		steer: (text: string) => session.steer(text),
 		followUp: (text: string) => session.followUp(text),
-		abort: () => session.abort(),
+		// C-1:`stopRequested` 只能记在这里 —— 这是 FastPathRuntime 唯一能确定"有人明确要求停"
+		// 的地方,见上面 `stopRequested` 声明处的注释。先置位再转发:与 run-manager.ts 的
+		// cancel()"置标志再 abort"同一条纪律,取消意图要先落下来,不依赖 session.abort() 是否
+		// 成功。
+		abort: () => {
+			stopRequested = true;
+			return session.abort();
+		},
 		waitForIdle: () => session.waitForIdle(),
 		subscribe: (listener: (event: RuntimeEvent) => void) => {
 			listeners.add(listener);

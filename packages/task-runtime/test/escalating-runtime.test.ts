@@ -43,6 +43,18 @@ function fullStub(r: RunResult): Runtime {
 	return { ...base, run: async () => r };
 }
 
+/** Polls `predicate` until it's true, sleeping `stepMs` between checks. Throws after `timeoutMs`
+ *  so a stuck condition fails fast with a clear message instead of hanging until vitest's own
+ *  test timeout. 与 test/session-runtime.test.ts / test/fast-path-runtime.test.ts 的同名
+ *  file-local helper逐字同源。 */
+async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`waitUntil: condition not met within ${timeoutMs}ms`);
+		await new Promise((resolve) => setTimeout(resolve, stepMs));
+	}
+}
+
 describe("EscalatingRuntime", () => {
 	it("returns the fast result and NEVER builds stage 2 when the verdict accepts", async () => {
 		const createFull = vi.fn(async () => fullStub(result({ output: "full" })));
@@ -151,6 +163,92 @@ describe("EscalatingRuntime", () => {
 		await rt.abort();
 		expect(fullAbort).toHaveBeenCalled();
 		expect(fastAbort).not.toHaveBeenCalled();
+	});
+
+	// C-1(整支终审 Critical):RunManager.cancel() 唯一的动作是调用下面的 abort()
+	// (run-manager.ts 的 cancel())。此前 abort() 之后若阶段 1 恰好以 accept:false 收尾
+	// (无论是 runFast 的 catch 分支把"抛错"报成 error,还是半截文本正常返回后被判官判负),
+	// run() 只看 verdict.accept,分不出"判负"与"被取消",于是照常 createFull() —— 一次
+	// cancel 会被悄悄改判成再起一次完整的、900s 上限的 agent 路径。
+	//
+	// 这里模拟真实时序:abort() 在 fast.runFast() 尚未 resolve 时就被调用(cancel 落在阶段 1
+	// 期间,与 RunManager.cancel() 的唯一触发路径完全一致);runFast() 之后才 resolve,带着
+	// verdict:{accept:false} —— 特意让它的 result.status 仍是 "error"(不是 "aborted"),
+	// 用来证明这条判断**不依赖** FastPathRuntime 自己是否把 status 修对:即便 fast 一侧的
+	// 状态还停在旧值,EscalatingRuntime 也必须凭自己记下的"abort() 被调用过"这件事拦住
+	// createFull(),不能指望从 fastResult.status 里反推。
+	it("never builds stage 2 once abort() has been called, and reports status aborted with stage-1 usage/turns carried through", async () => {
+		const createFull = vi.fn(async () => fullStub(result({ output: "full" })));
+		const fastAbort = vi.fn(async () => {});
+		let resolveRunFast!: (run: FastPathRun) => void;
+		const pendingRunFast = new Promise<FastPathRun>((resolve) => {
+			resolveRunFast = resolve;
+		});
+		const fast: FastPathRuntime = {
+			...fastStub({ verdict: { accept: true }, result: result({}) }),
+			abort: fastAbort,
+			runFast: async () => pendingRunFast,
+		};
+		const rt = createEscalatingRuntime({ fast, createFull });
+
+		const runPromise = rt.run("q");
+		await rt.abort(); // cancel arrives while stage 1 is still in flight
+		expect(fastAbort).toHaveBeenCalled(); // forwarded to the only stage that exists yet
+
+		resolveRunFast({
+			verdict: { accept: false, reason: "阶段 1 被取消" },
+			result: result({
+				output: "半截答案",
+				status: "error", // 刻意不是 "aborted" —— 见上面用例文档字符串
+				errorMessage: "阶段 1 抛错:AbortError",
+				turns: 2,
+				usage: usage(0.02),
+			}),
+		});
+
+		const got = await runPromise;
+		expect(createFull).not.toHaveBeenCalled(); // 不起第二个 MCP 子进程
+		expect(got.status).toBe("aborted");
+		expect(got.turns).toBe(2); // 阶段 1 已经花掉的 turns 如实带回,不是 0
+		expect(got.usage.cost).toBeCloseTo(0.02); // 阶段 1 已经花掉的 usage 如实带回
+	});
+
+	// C-1(两阶段交界处,报告里"顺带想一件事"那部分对应的代码):上一条用例的 cancel 落在
+	// `await options.fast.runFast()` 还没 resolve 时——那个窗口里 abort() 转发给的是
+	// `options.fast`,还有东西可打断。这里让 cancel 落在**下一个**挂起点:`fastResult` 已经
+	// resolve(verdict:false,决定要升级了),但 `await options.createFull()` 还没 resolve。
+	// 这个窗口里 `full` 仍是 undefined,abort() 转发给的是**已经跑完**的 `options.fast`——一次
+	// no-op,拦不住即将发生的 `full.run()`。若只查一次 stopRequested(在 fastResult resolve
+	// 之后那次),这次 cancel 会被彻底放过,`full.run()` 照常起跑,复现同一个 Critical(只是
+	// 窗口从"阶段 1 期间"变成了"阶段 2 装配期间")。
+	it("does not start stage 2's run() when abort() lands between deciding to escalate and stage 2 finishing assembly", async () => {
+		const fullRun = vi.fn(async () => result({ output: "full" }));
+		const fullAbort = vi.fn(async () => {});
+		let resolveCreateFull!: (rt: Runtime) => void;
+		const pendingFull = new Promise<Runtime>((resolve) => {
+			resolveCreateFull = resolve;
+		});
+		const createFull = vi.fn(() => pendingFull);
+		const rt = createEscalatingRuntime({
+			fast: fastStub({ verdict: { accept: false, reason: "x" }, result: result({ turns: 2, usage: usage(0.01) }) }),
+			createFull,
+		});
+
+		const runPromise = rt.run("q");
+		// fast.runFast() 在这个 stub 里同步 resolve(没有人为延迟)——等 run() 真正跑到
+		// "await options.createFull()" 这一步,而不是还停在 "await options.fast.runFast()" 上,
+		// 否则测的就是上一条用例已经覆盖过的窗口。
+		await waitUntil(() => createFull.mock.calls.length > 0);
+
+		await rt.abort(); // cancel 落在两阶段交界处:full 还没装配完,没有 runtime 可以真正 abort
+
+		resolveCreateFull({ ...fullStub(result({})), run: fullRun, abort: fullAbort });
+		const got = await runPromise;
+
+		expect(fullRun).not.toHaveBeenCalled(); // 不起 900s 的 agent 路径
+		expect(fullAbort).toHaveBeenCalled(); // 仍然调了(与 run-manager.ts 的 admitAndDrive() 同一条纪律),即便预期是 no-op
+		expect(got.status).toBe("aborted");
+		expect(got.turns).toBe(2); // 阶段 1 已经花掉的 turns 如实带回
 	});
 
 	// fast 与 full 是两个独立的 Runtime 实例,各自的内部 seq 计数器都从 0 起跳

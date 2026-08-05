@@ -386,6 +386,14 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	// prompt() 正常返回一段半截文本(走到 judgeFastPathOutput 才被判负,见 checkPreempted 上方
 	// 的注释:"abort 在 pi 里不是粘滞状态")。这个标志是唯一能分辨"有人明确要求停"的信号,只能
 	// 记在这里——被调用的这一层——不能从任何返回值反推。
+	//
+	// N-4(定向复审):这个标志本身**是**粘滞的——这与上一段引的"abort 在 pi 里不是粘滞状态"
+	// 说的不是同一件事。pi 那边"不粘滞"指的是 `session.abort()` 不会让**之后的**
+	// `session.prompt()` 调用也提前失败(同一个 run 里两次模型调用都得靠 checkPreempted() 各自
+	// 复查一遍,见该函数文档)。这里的 `stopRequested` 粘滞的范围只到"当前这次 `runFast()`"为
+	// 止——它与 `modelCalls`/`limitState.turns`/`limitState.tripped` 一样是 per-run 状态,必须
+	// 在下面 `runFast()` 开头随它们一起重置,否则同一个 runtime 上一次早就过去的 `abort()` 会
+	// 把后续任何一次全新的 `status:"error"` 都永久错判成 `"aborted"`。
 	let stopRequested = false;
 
 	async function promptOnce(text: string): Promise<string> {
@@ -488,6 +496,9 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		currentRunId = runId;
 		currentInput = input;
 		modelCalls = 0;
+		// N-4:`stopRequested` 与下面这两行一样是 per-run 状态,同一条纪律一起重置——理由见上面
+		// `stopRequested` 声明处的注释。
+		stopRequested = false;
 		// 每次 run() 开头重置:不重置的话,同一个 runtime 上的第二次 run() 会继承上一次已经
 		// tripped 的 limitState,一进来就被 checkPreempted() 判掉(与 session-runtime.ts 的
 		// run() 开头重置 state.turns/state.tripped 同一条纪律)。

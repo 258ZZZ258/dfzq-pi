@@ -201,6 +201,12 @@ describe("EscalatingRuntime", () => {
 				output: "半截答案",
 				status: "error", // 刻意不是 "aborted" —— 见上面用例文档字符串
 				errorMessage: "阶段 1 抛错:AbortError",
+				// N-3:刻意带一个非 undefined 的 limit——模拟"限额/超时与取消极窄时间内竞速"
+				// 那种边界情形(abortedResult 上方注释点名过的场景)。若不清掉它,这个值会原样
+				// 跟着 status:"aborted" 一起带出去,形成 escalating-runtime.ts 里
+				// checkPreempted 注释点名过的"自相矛盾组合"——不带这个字段,删掉
+				// `limit: undefined` 那半行不会有任何用例翻红(该值本来就是 undefined)。
+				limit: "maxCostUsd",
 				turns: 2,
 				usage: usage(0.02),
 			}),
@@ -211,9 +217,10 @@ describe("EscalatingRuntime", () => {
 		expect(got.status).toBe("aborted");
 		expect(got.turns).toBe(2); // 阶段 1 已经花掉的 turns 如实带回,不是 0
 		expect(got.usage.cost).toBeCloseTo(0.02); // 阶段 1 已经花掉的 usage 如实带回
+		expect(got.limit).toBeUndefined(); // N-3:不能带着 "aborted" 一起漏出一个限额种类
 	});
 
-	// C-1(两阶段交界处,报告里"顺带想一件事"那部分对应的代码):上一条用例的 cancel 落在
+	// C-1(两阶段交界处):上一条用例的 cancel 落在
 	// `await options.fast.runFast()` 还没 resolve 时——那个窗口里 abort() 转发给的是
 	// `options.fast`,还有东西可打断。这里让 cancel 落在**下一个**挂起点:`fastResult` 已经
 	// resolve(verdict:false,决定要升级了),但 `await options.createFull()` 还没 resolve。
@@ -230,7 +237,12 @@ describe("EscalatingRuntime", () => {
 		});
 		const createFull = vi.fn(() => pendingFull);
 		const rt = createEscalatingRuntime({
-			fast: fastStub({ verdict: { accept: false, reason: "x" }, result: result({ turns: 2, usage: usage(0.01) }) }),
+			fast: fastStub({
+				verdict: { accept: false, reason: "x" },
+				// N-3:同上一条用例,刻意带一个非 undefined 的 limit,验证这个检查点也清得掉它
+				// (两处检查点共用同一个 abortedResult(),但各自都要有用例覆盖到才算真锁住)。
+				result: result({ turns: 2, usage: usage(0.01), limit: "runTimeout" }),
+			}),
 			createFull,
 		});
 
@@ -249,6 +261,7 @@ describe("EscalatingRuntime", () => {
 		expect(fullAbort).toHaveBeenCalled(); // 仍然调了(与 run-manager.ts 的 admitAndDrive() 同一条纪律),即便预期是 no-op
 		expect(got.status).toBe("aborted");
 		expect(got.turns).toBe(2); // 阶段 1 已经花掉的 turns 如实带回
+		expect(got.limit).toBeUndefined(); // N-3:同上一条用例,不能带着 "aborted" 一起漏出限额种类
 	});
 
 	// fast 与 full 是两个独立的 Runtime 实例,各自的内部 seq 计数器都从 0 起跳

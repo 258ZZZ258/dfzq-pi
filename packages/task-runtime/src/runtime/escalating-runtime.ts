@@ -124,6 +124,17 @@ export function createEscalatingRuntime(options: {
 		//     `store/sqlite.ts` 的 `runs.error_message`(`TEXT`,按既有设计就存任意错误
 		//     消息)同类,不是本组合子新开的口子。
 		// 该事件在 trajectory.ts 的白名单里、会落库。
+		//
+		// N-6:上面这段说的是"升级发生时"的语境,但 `fast_path_escalated` 这个事件名本身**不**
+		// 蕴含"这次一定真的升级了"——`FastPathRuntime.runFast()` 在判负的当下并不知道调用方
+		// (这里)接下来会不会因为 `stopRequested` 而在 `:109` 早退、放弃升级。也就是说,`:109`
+		// 那条分支命中时,这个事件同样已经发过(由 `options.fast.runFast()` 内部发出、早于这里
+		// 拿到 verdict),但这次 run **没有**真的起第二个 MCP 子进程。审计口径受影响的程度见下:
+		// 升级率若在离线评测语料上统计,那里没有人调 cancel,口径不受污染;真实流量里被这么
+		// 标记过的 run 终态都是 "aborted",从 `runs` 表按 status 就能把它们摘出去单独复核,口径
+		// 可以事后修正。没有为这条专门改 `fast_path_escalated` 的 5 个 emit 点(动它们会改变
+		// `trajectory.ts` 的落库语义,超出这次 C-1 的验收范围),这里只记录这条"事件名与实际
+		// 发生的事不完全对应"的事实,留给下一轮决定要不要收紧。
 		full = await options.createFull();
 		unsubscribeFull = full.subscribe(fanOut);
 		// C-1(两阶段交界处):`stopRequested` 可能是在 `createFull()` 还没 resolve 时才被置位

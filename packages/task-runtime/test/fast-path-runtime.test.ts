@@ -205,8 +205,9 @@ afterEach(async () => {
 
 /** Polls `predicate` until it's true, sleeping `stepMs` between checks. Throws after `timeoutMs`
  *  so a stuck condition fails fast with a clear message instead of hanging until vitest's own
- *  test timeout. 与 test/session-runtime.test.ts 的同名 helper 逐字同源(两个测试文件各自
- *  file-local,不共享一个 helpers 模块——与该文件里这份的既有先例一致)。 */
+ *  test timeout. 与 test/session-runtime.test.ts 的同名 helper 逐字同源——这一个函数本身没有
+ *  被搬进 test/helpers/(该目录下现有的 faux.ts 这份共享模块,本文件顶部已经在 import,不受
+ *  这句影响),只是这份 file-local 复制品与另一份尚未合并成一份。 */
 async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!predicate()) {
@@ -676,5 +677,29 @@ describe("createFastPathRuntime", () => {
 		expect(got.result.status).toBe("aborted");
 		expect(got.result.limit).toBeUndefined(); // 不是限额/超时,别把两者混进同一个值
 		expect(got.result.turns).toBe(2); // 两次模型调用都真的发生过,如实带回
+	});
+
+	// N-4(定向复审):`stopRequested` 与 `modelCalls`/`limitState.turns`/`limitState.tripped`
+	// 一样是 per-run 状态,但最初的实现漏了在 `runFast()` 开头重置它——同一个实例上,一次早就
+	// 过去、与这次 run 毫无关系的 `abort()` 调用(此刻没有任何 prompt 在飞,`session.abort()`
+	// 对它是 no-op,但 `stopRequested` 已经被置位),会把这次全新 run 里任何合法的
+	// `status:"error"` 都永久错判成 `"aborted"`。这里复用"escalates instead of failing when
+	// stage 1 throws"那条用例的 `toolThrows` 固定装置(确定性触发 catch 分支的 status:"error",
+	// 不依赖任何计时),先调一次孤立的 `abort()`,再验证紧接着的第一次 `runFast()` 没有被那次
+	// 陈旧调用污染。
+	it('resets stopRequested at the top of runFast() -- a stale abort() call with nothing in flight must not turn a later status:"error" into "aborted"', async () => {
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				toolThrows: "get_clause_detail",
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+
+		await rt.abort(); // 没有任何 prompt 在飞的一次 abort()——session 侧是 no-op
+
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict.accept).toBe(false);
+		expect(got.result.status).toBe("error"); // 不是 "aborted"——上面那次 abort() 早就过去了
 	});
 });

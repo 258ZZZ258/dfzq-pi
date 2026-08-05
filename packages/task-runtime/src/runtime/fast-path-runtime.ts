@@ -378,6 +378,29 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	assembled.session.setActiveToolsByName([]);
 
 	const session = assembled.session;
+
+	// M-4:此前这里从不调 session.subscribe() —— 一个被收下的快路径 run,run_events 里只有
+	// emitPluginToolEvent 合成的 tool_execution_* 与 fast_path_escalated,没有 turn_start /
+	// turn_end / agent_end,事件流里没有任何时间戳能把这次 run 的总耗时拆成"模型调用花了多久"
+	// 与"检索花了多久"。补上转发,与 session-runtime.ts 的 session.subscribe() 同一形状:
+	//
+	// - **复用同一个 seq 计数器**:直接调上面已经定义的 `emit()`(与 `emitPluginToolEvent` /
+	//   `fast_path_escalated` 共用同一个 `seq` 闭包变量),不另起一套——落库是 `ORDER BY seq`,
+	//   两套计数器会把事件排错位。
+	// - **fan-out 的 try/catch 已经在 `emit()` 内部**,不用在这里重复一遍:这段代码跑在 pi 的
+	//   `AgentSession._emit` 里,那里没有 try/catch,一个监听器抛出去会直接打死正在跑的 run
+	//   (与 session-runtime.ts 的 `session.subscribe()` 回调同一条纪律)。
+	// - **不碰 clauseIds**:FastPathRuntime 根本没有 session-runtime.ts 那个
+	//   `collectClauseIds`/`clauseIds` 追踪通路——它自己的 clauseIds 是在 `runFastInner` 里从
+	//   `items`(真正拼进模型② prompt 的那批)派生的一个局部 `const`(见该处注释),这条订阅
+	//   只把 session 事件转发给 `listeners`,不写任何共享状态,结构上碰不到 clauseIds。
+	// - **不会与 `emitPluginToolEvent` 合成的 tool_execution_* 重复**:阶段 1 的模型看不到任何
+	//   工具(上面 `setActiveToolsByName([])`),检索全部经 `assembled.callTool` 直打
+	//   `tool.execute()`,绕过 pi 的 agent loop、不触发 pi 自己的 `tool_execution_*`
+	//   (assembler.ts 里 `callTool` 的文档字符串:"绕过 pi 的 agent loop —— 不产生
+	//   tool_execution_* 事件")——session 本身在这条路径上恒不发 tool_execution_*,两批事件
+	//   来源结构上互斥。
+	const unsubscribeSession = session.subscribe((event) => emit(event.type, event));
 	const id = randomUUID();
 	let lastActiveAt = Date.now();
 	let modelCalls = 0;
@@ -551,6 +574,18 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		// 抢跑:用原始 query 先检索一次,与模型①**并行**。唯一目的是吃掉检索后端首次调用的
 		// 模型懒加载耗时(规格 §1.2)。命中结果一并保留,不是白跑。
 		// catch 成空列表:抢跑失败不该打死整条路径 —— 改写词那几次检索还没跑。
+		//
+		// 🔴 延迟分解提醒(写给以后要把 run_events 拆成"模型时间 / 工具时间"的人):这次调用
+		// 下面**不 await**,`headStart` 要到 `mergeHitsRoundRobin` 那行才被 `await`——它与紧接着
+		// 的 `promptOnce(rewrite)` 结构上并行发起,这正是上面说的"抢跑"要的效果。也就是说,它的
+		// `tool_execution_start`/`end`(`emitPluginToolEvent` 合成)区间,与模型①的
+		// `turn_start`/`turn_end`(M-4 起才转发的 session 事件)区间,在设计上可能互相重叠,不能
+		// 假定二者互斥。朴素的"Σ turn 区间当模型时间 + Σ tool_execution 区间当工具时间,两者相加
+		// 等于总时长"这类加总,在这一段会把并发发生的时间重复计入、算出一个偏大的数字——要按
+		// 区间(而不是按事件类型求和)才能算对。
+		// 干净、可以直接相减的是模型①的 `turn_end` 到模型②的 `turn_start` 之间那一段:下面
+		// `rewriteLists` 与 `get_clause_detail` 那次调用都发生在 `await promptOnce(rewrite)`
+		// 之后、`await promptOnce(answer)` 之前,严格串行,不存在这个重叠问题。
 		const headStart = assembled
 			.callTool("search_policy", { query: input })
 			.then(toHits)
@@ -701,6 +736,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		},
 		snapshot: () => ({ sessionId: session.sessionId, sessionFile: session.sessionFile ?? undefined }),
 		dispose: async () => {
+			unsubscribeSession();
 			listeners.clear();
 			await assembled.dispose();
 		},

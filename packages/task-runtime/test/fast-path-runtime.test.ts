@@ -14,7 +14,7 @@ import {
 } from "../src/runtime/fast-path-runtime.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
-import { createFauxHarness, fauxAssistantMessage } from "./helpers/faux.ts";
+import { capturingReply, createFauxHarness, fauxAssistantMessage } from "./helpers/faux.ts";
 
 const SCHEMA = {
 	type: "object",
@@ -241,7 +241,17 @@ interface FastOpts {
 	/** 让 get_clause_detail 对这些 clause_id 返回"详情行存在但正文缺失"(C-1:text 是 null,
 	 *  audit-ai 的 get_clause_detail.py:100-101"正文缺失是 null,不是错误")。 */
 	detailNullText?: string[];
+	/** I-1:提供时,每次 `session.prompt()` 实际发送的文本(pi 组装进 provider 请求的
+	 *  `context.messages` 最后一条 user 消息,不是 faux 编出来的)按调用顺序 push 进这个数组
+	 *  ——见 `test/helpers/faux.ts` 的 `capturingReply`。缺省(不传)时用普通的
+	 *  `fauxAssistantMessage`,行为与此前完全一致,不影响任何既有用例。 */
+	capturePrompts?: string[];
 }
+
+// I-1:单一事实来源——`fastOptions()` 装配 spec 时与下面的判别性用例断言时都读这两个常量,
+// 不重复写字面量。两段文本互不为对方的子串,swap 之后断言不会因为字符串重叠而假阳性通过。
+const FAST_REWRITE_PROMPT = '把问题改写成检索词,只输出 JSON 对象 {"queries": [...]}。';
+const FAST_ANSWER_PROMPT = "依据下面的条款作答,输出契约 JSON。";
 
 /** 模型①的改写词回复:约定形状是 `{"queries": [...]}`(与 parseRewriteTerms 的文档同一份约定)。 */
 function rewriteReply(terms: string[]): string {
@@ -270,9 +280,10 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 	const hangMsByIndex = [o.hangRewriteMs, o.hangAnswerMs];
 	const responses: unknown[] = o.modelReplies.map((reply, index) => {
 		const hangMs = hangMsByIndex[index];
-		return hangMs === undefined
-			? fauxAssistantMessage(reply)
-			: () => new Promise((resolve) => setTimeout(() => resolve(fauxAssistantMessage(reply)), hangMs));
+		if (hangMs !== undefined) {
+			return () => new Promise((resolve) => setTimeout(() => resolve(fauxAssistantMessage(reply)), hangMs));
+		}
+		return o.capturePrompts ? capturingReply(reply, o.capturePrompts) : fauxAssistantMessage(reply);
 	});
 	harness.faux.setResponses(responses as never);
 
@@ -349,8 +360,8 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 				// ⚠ 这三个在生产上是路径,但 resolveSpecPromptPaths 在**构造期**已把它们读成正文,
 				// createFastPathRuntime 拿到的就是正文。测试直接给正文,与生产形态一致。
 				systemPrompt: "你是制度查询助手。",
-				rewritePrompt: '把问题改写成检索词,只输出 JSON 对象 {"queries": [...]}。',
-				answerPrompt: "依据下面的条款作答,输出契约 JSON。",
+				rewritePrompt: FAST_REWRITE_PROMPT,
+				answerPrompt: FAST_ANSWER_PROMPT,
 				maxClauses: o.maxClauses ?? 12,
 				limits: {
 					maxCostUsd: 1,
@@ -701,5 +712,135 @@ describe("createFastPathRuntime", () => {
 		const got = await rt.runFast("原始问题");
 		expect(got.verdict.accept).toBe(false);
 		expect(got.result.status).toBe("error"); // 不是 "aborted"——上面那次 abort() 早就过去了
+	});
+
+	// M-4:FastPathRuntime 此前从不调 session.subscribe(),一个被收下的快路径 run 的 run_events
+	// 里只有 emitPluginToolEvent 合成的 tool_execution_* 与 fast_path_escalated,没有
+	// turn_start/turn_end/agent_end——事件流里没有任何时间戳能把总耗时拆成"模型调用花了多久"
+	// 与"检索花了多久"。这条锁住修复:订阅收到的事件里必须包含 turn_start/turn_end,且 seq
+	// 严格单调(落库是 ORDER BY seq,错位的计数器会让事件在库里排错位置)。
+	it("forwards session turn events to subscribers with a strictly monotonic seq (M-4)", async () => {
+		const rt = await createFastPathRuntime(
+			await fastOptions({ modelReplies: [rewriteReply(["改写词一"]), answerReply()] }),
+		);
+		cleanups.push(rt.dispose);
+		const events: Array<{ type: string; seq: number }> = [];
+		rt.subscribe((e) => events.push({ type: e.type, seq: e.seq }));
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict).toEqual({ accept: true });
+
+		const types = events.map((e) => e.type);
+		expect(types).toContain("turn_start");
+		expect(types).toContain("turn_end");
+		// 两次模型调用(阶段 1 改写 + 阶段 2 作答)各应有自己的一对 turn_start/turn_end。
+		expect(types.filter((t) => t === "turn_start").length).toBe(2);
+		expect(types.filter((t) => t === "turn_end").length).toBe(2);
+
+		const seqs = events.map((e) => e.seq);
+		for (let i = 1; i < seqs.length; i++) {
+			expect(seqs[i]).toBeGreaterThan(seqs[i - 1]!);
+		}
+	});
+});
+
+// I-1:此前"模型实际看到什么"这一面零覆盖——`renderEvidence` 虽然已 export,但没有测试直接调
+// 它去核对渲染出的证据块进了模型②的消息;faux 模型按位置吐回复、完全不看送进去的文本,
+// `onToolCall` 只记工具名、没有任何一处断言过 `args.query`。三处变异因此全绿(把
+// `fp.rewritePrompt` 与 `fp.answerPrompt` 互换 / 删掉证据渲染里的 `正文: ${item.text}` 那一行 /
+// 把抢跑的 `{ query: input }` 改成常量)——本文件下面这几条用例就是为了让这三处变异翻红。
+//
+// 这里用 `test/helpers/faux.ts` 的 `capturingReply`:它把 `FauxResponseStep` 换成一个读
+// `context.messages`(pi 组装进 provider 请求的、真正的对话历史)的工厂函数,而不是让 faux 按
+// 位置纯回放——这样能拿到"这次 `session.prompt()` 到底发了什么文本"这个此前完全观测不到的量。
+describe("what the model actually sees (I-1)", () => {
+	it("stage 1 receives the rewrite prompt (not the answer prompt), stage 2 receives the answer prompt (not the rewrite prompt)", async () => {
+		const captured: string[] = [];
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				capturePrompts: captured,
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict).toEqual({ accept: true });
+
+		expect(captured).toHaveLength(2);
+		// 模型①收到改写指令 + 原始问题,不是输出契约。
+		expect(captured[0]).toContain(FAST_REWRITE_PROMPT);
+		expect(captured[0]).not.toContain(FAST_ANSWER_PROMPT);
+		expect(captured[0]).toContain("原始问题");
+		// 模型②收到输出契约 + 证据块,不是改写指令。
+		expect(captured[1]).toContain(FAST_ANSWER_PROMPT);
+		expect(captured[1]).not.toContain(FAST_REWRITE_PROMPT);
+	});
+
+	it("stage 2's message contains the '正文:' line with the real fetched text for every clause it can reference", async () => {
+		const captured: string[] = [];
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				capturePrompts: captured,
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict).toEqual({ accept: true });
+
+		// fastOptions() 的 get_clause_detail 固定桩:未被 detailNotFound/detailNullText 覆盖时,
+		// text 是 `${clause_id} 的正文`(hitCount 缺省 3 ⇒ 命中 C-1/C-2/C-3 全部真实取到正文)。
+		expect(captured[1]).toContain("正文: C-1 的正文");
+		expect(captured[1]).toContain("正文: C-2 的正文");
+		expect(captured[1]).toContain("正文: C-3 的正文");
+	});
+
+	it("every item's clause_id and text reach stage 2's message, and ids dropped by maxClauses do not", async () => {
+		const captured: string[] = [];
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				capturePrompts: captured,
+				hitCount: 30,
+				maxClauses: 12,
+				modelReplies: [rewriteReply(["改写词一"]), body({ ...GOOD, basis: [{ clause_id: "C-1" }] })],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("原始问题");
+		expect(got.verdict).toEqual({ accept: true });
+
+		// merge-hits.ts 的轮询交错在"两份候选列表完全相同"(headStart 与改写词一各自命中同一批
+		// C-1..C-30)时退化成取列表原序的前 maxClauses 条——merged 因此是 C-1..C-12,这就是唯一
+		// 被送去 get_clause_detail、进而唯一可能出现在模型②消息里的集合。
+		for (let i = 1; i <= 12; i++) {
+			expect(captured[1]).toContain(`clause_id: C-${i}`);
+			expect(captured[1]).toContain(`正文: C-${i} 的正文`);
+		}
+		// C-13..C-30 命中过、但预算不够,从未被 get_clause_detail 请求过,不可能出现在模型②的
+		// 消息里——用 C-13/C-20/C-30 抽样(边界 + 中段 + 尾部),不逐条穷举 18 个。
+		for (const droppedId of ["C-13", "C-20", "C-30"]) {
+			expect(captured[1]).not.toContain(droppedId);
+		}
+	});
+
+	// I-1 任务背景里点名的第三处盲区(不在验收口径的 3 条硬性断言里,但同一份任务背景明确点了名,
+	// 顺手一并补上):`onToolCall` 此前只记工具名,从没有任何用例断言过 `args.query`——"抢跑的
+	// `{ query: input }` 改成常量" 这个变异因此全绿(fastOptions() 的 search_policy 桩完全不看
+	// query 内容,常量查询照样命中同一批固定桩数据,后续判官照样通过)。
+	it("the head-start retrieval uses the real input as its query, not a hardcoded constant", async () => {
+		const searchCalls: Record<string, unknown>[] = [];
+		const rt = await createFastPathRuntime(
+			await fastOptions({
+				onToolCall: (name, args) => {
+					if (name === "search_policy") searchCalls.push(args);
+				},
+				modelReplies: [rewriteReply(["改写词一"]), answerReply()],
+			}),
+		);
+		cleanups.push(rt.dispose);
+		const got = await rt.runFast("这是一个独一无二的原始问题");
+		expect(got.verdict).toEqual({ accept: true });
+		// searchCalls[0] 是抢跑那次(在改写词那次 search_policy 之前发起,见
+		// "makes exactly two model calls…" 用例已经锁住的调用顺序)。
+		expect(searchCalls[0]?.query).toBe("这是一个独一无二的原始问题");
 	});
 });

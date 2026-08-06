@@ -118,6 +118,12 @@ export interface RuntimeSpec {
 
 	/** 缺省即不挂 C6(输出契约判官)—— 既有 spec 的行为不变。 */
 	outputContract?: OutputContractSpec;
+
+	/**
+	 * 非空时,本 spec 由**确定性工作流** runtime 驱动,而不是 SessionRuntime。
+	 * 取值即工作流名,由 server/main.ts 的工厂分派。缺省 = SessionRuntime(agent 自主编排)。
+	 */
+	workflow?: "policy-compare";
 }
 
 export function pluginName(ref: PluginRef): string {

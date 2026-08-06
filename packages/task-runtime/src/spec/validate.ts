@@ -61,4 +61,11 @@ export function validateSpec(spec: RuntimeSpec, ctx: ValidateContext): void {
 			throw new Error(`RuntimeSpec "${spec.id}": outputContract.maxRepairAttempts must be a non-negative integer`);
 		}
 	}
+
+	// 取值写死而不是「非空即放行」:工厂是按这个字符串分派的,拼错一个字母会让 spec
+	// 静默退回 SessionRuntime —— 那条路上模型看得见工具、能自主编排,与本 spec 的
+	// 全部不变量(固定调用次数、正文不由模型产)背道而驰,且不会有任何报错。
+	if (spec.workflow !== undefined && spec.workflow !== "policy-compare") {
+		throw new Error(`RuntimeSpec "${spec.id}": unknown workflow "${spec.workflow}"`);
+	}
 }

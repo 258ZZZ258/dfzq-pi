@@ -4,6 +4,9 @@ import { type ServerType, serve } from "@hono/node-server";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
+import { createArtifactStore, createMinioObjectGetter } from "../runtime/policy-compare/artifact-store.ts";
+import { createDocumentsClient } from "../runtime/policy-compare/documents-client.ts";
+import { createPolicyCompareRuntime } from "../runtime/policy-compare/runtime.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
@@ -184,7 +187,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 
 	// ⚠ run 的 options 必须改名:外层 `options` 是 DefaultFactoryOptions(含 workRoot),
 	// 同名解构会把它遮蔽掉,下面的 join(options.workRoot, ...) 会解析到错的目录。
-	return async ({ specId, sessionId, runId, filters, options: runOptions }) => {
+	return async ({ specId, sessionId, runId, filters, options: runOptions, payload }) => {
 		const spec = specFiles.get(specId);
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
@@ -202,6 +205,42 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		);
 
 		const workdir = join(options.workRoot, sessionId);
+
+		if (spec.workflow === "policy-compare") {
+			// 确定性工作流:模型不编排,工具由代码经 Assembled.callTool 发起。
+			// 三个外部依赖走 env —— 凭证绝不入库,缺任何一个都在这里 fail-closed。
+			// batchSize 不在 RunOptions 类型上(run-manager.ts 的注释:该接口刻意不收窄,
+			// 加字段不该变成一次 HTTP 层改动)—— 与 app.ts 的 `body.options as RunOptions`
+			// 同一条纪律,在读取处窄化,不去反过来给 RunOptions 加一个只有本工作流用得到的字段。
+			const rawBatchSize = (runOptions as { batchSize?: unknown }).batchSize;
+			const baseUrl = requireEnv("AUDIT_AI_BASE_URL");
+			const internalToken = requireEnv("AUDIT_AI_INTERNAL_TOKEN");
+			const bucket = requireEnv("DFZQ_UPLOADS_BUCKET");
+			return createPolicyCompareRuntime({
+				spec,
+				profile,
+				registry: plugins,
+				toolsets,
+				cwd: join(workdir, "workspace"),
+				agentDir: join(workdir, "agent"),
+				outputContractSchema: outputContractSchemas.get(specId),
+				payload,
+				documents: createDocumentsClient({ baseUrl, internalToken }),
+				artifacts: createArtifactStore({
+					bucket,
+					get: createMinioObjectGetter({
+						endPoint: requireEnv("DFZQ_MINIO_ENDPOINT"),
+						port: process.env.DFZQ_MINIO_PORT ? Number(process.env.DFZQ_MINIO_PORT) : undefined,
+						useSSL: process.env.DFZQ_MINIO_USE_SSL === "1",
+						accessKey: requireEnv("DFZQ_MINIO_ACCESS_KEY"),
+						secretKey: requireEnv("DFZQ_MINIO_SECRET_KEY"),
+					}),
+				}),
+				batchSize: typeof rawBatchSize === "number" ? rawBatchSize : undefined,
+				skillPaths: skillPaths.get(specId),
+			});
+		}
+
 		return createSessionRuntime({
 			spec,
 			profile,
@@ -213,4 +252,11 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			skillPaths: skillPaths.get(specId),
 		});
 	};
+}
+
+/** env 缺失即抛。工作流的外部依赖没有「跑起来再说」的降级路径。 */
+function requireEnv(name: string): string {
+	const value = process.env[name];
+	if (!value) throw new Error(`环境变量 ${name} 未配置 —— 制度比对工作流拒绝启动(fail-closed)`);
+	return value;
 }

@@ -1,0 +1,37 @@
+{
+  "id": "policy-compare-coverage",
+  "description": "制度比对 · 外规对内规覆盖度核查",
+  "workflow": "policy-compare",
+  "$comment": "workflow 非空 ⇒ 由 PolicyCompareRuntime 驱动,不是 SessionRuntime。模型看不见 tools 里的工具(runtime 装配后 setActiveToolsByName([])),tools 仍必须是非空白名单——validate.ts 拒绝空白名单,且 assemble() 要靠它解析出工具供 callTool 使用。thinkingLevel 固定 off:阶段 5 是逐对判定,不需要长链推理,off 的开销最低。runTimeoutMs=1800000 与 maxCostUsd=2.0 见规格 §3.5。刻意不配 stopPolicy / resultPolicy:前者的动作是 followUp 重问,破坏「模型调用次数可算」(验收 A8);后者挂在 pi 的 tool_result hook 上,而本 runtime 全部工具调用经 Assembled.callTool 直打 tool.execute()、绕过 agent loop,配了也不生效。",
+  "model": { "role": "main" },
+  "thinkingLevel": "off",
+  "toolset": "policy-compare",
+  "tools": ["list_internal_obligations", "resolve_source_law"],
+  "systemPrompt": "policy-compare/system.md",
+  "$comment2": "🔴 maxTurns 必须**严格大于** ceil(阶段2义务条款数 / batchSize) —— 撞到 maxTurns 时 PolicyCompareRuntime 返回 status:\"limit_exceeded\" 且**不返回 output**(fail-closed),所以一个模型工作全做完、只是批数恰好等于 maxTurns 的 run 会被整个丢弃。最坏情况是 MAX_OBLIGATIONS=500 配 batchSize=1(下界允许 1),即 500 批。600 是它加余量。⚠ 调低这个值、或调高 MAX_OBLIGATIONS 之前,先算这条不等式(Task 9 复审发现)。",
+  "limits": {
+    "maxTurns": 600,
+    "runTimeoutMs": 1800000,
+    "maxTotalTokens": 3000000,
+    "maxCostUsd": 2.0
+  },
+  "outputContract": {
+    "schema": "policy-compare/coverage.schema.json",
+    "maxRepairAttempts": 0
+  },
+  "observability": { "contextSnapshot": "hash" },
+  "mcpServers": [
+    {
+      "id": "policy-compare",
+      "command": "${DFZQ_AUDIT_AI_PYTHON}",
+      "args": ["-m", "query.mcp.server"],
+      "cwd": "${DFZQ_AUDIT_AI_ROOT}",
+      "env": {
+        "PIPELINE_CONFIG_DIR": "${PIPELINE_CONFIG_DIR}",
+        "POLICY_MCP_AUDIT_LOG": "${POLICY_MCP_AUDIT_LOG}",
+        "HF_HUB_OFFLINE": "1",
+        "PATH": "${PATH}"
+      }
+    }
+  ]
+}

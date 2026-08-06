@@ -35,6 +35,19 @@ describe("normalizeClauseKey", () => {
 	it("null 归一成空串", () => {
 		expect(normalizeClauseKey(null)).toBe("");
 	});
+
+	// Finding 3: 两位数及以上中文数字覆盖 cnToInt 的主分支
+	it("两位数中文数字:第二十条 与 第20条 归一后相等", () => {
+		expect(normalizeClauseKey("第二十条")).toBe(normalizeClauseKey("第20条"));
+	});
+
+	it("三位数中文数字:第一百零五条 与 第105条 归一后相等", () => {
+		expect(normalizeClauseKey("第一百零五条")).toBe(normalizeClauseKey("第105条"));
+	});
+
+	it("三位数中文数字:第一百二十三条 与 第123条 归一后相等", () => {
+		expect(normalizeClauseKey("第一百二十三条")).toBe(normalizeClauseKey("第123条"));
+	});
 });
 
 describe("alignClauses", () => {
@@ -136,5 +149,83 @@ describe("alignClauses", () => {
 		);
 		expect(got.pairs).toEqual([]);
 		expect(got.unmatched).toHaveLength(1);
+	});
+
+	// Finding 1: 上传件文档为空数组,clause_path 为 null → 应进 unmatched
+	it("文档为空数组(clauses: []),source_law clause_path 为 null → unmatched with reason 'uploaded_document_has_no_clauses'", () => {
+		const emptyDoc: ExternalDocument = {
+			uploadId: "U2",
+			title: "空文档",
+			docNo: "测试〔2026〕99号",
+			clauses: [],
+		};
+		const got = alignClauses(
+			emptyDoc,
+			[ob("G")],
+			[
+				{
+					chunkId: "G",
+					sourceLaws: [{ docNo: "测试〔2026〕99号", docTitle: null, clausePath: null, sourceCode: "X" }],
+				},
+			],
+		);
+		expect(got.pairs).toEqual([]);
+		expect(got.unmatched).toEqual([{ internalChunkId: "G", reason: "uploaded_document_has_no_clauses" }]);
+	});
+
+	// Finding 2: 多条 sourceLaws,前两条文档不匹配,第三条对得上
+	it("sourceLaws 有多条,前两条文档不匹配,第三条对得上 → 产出 1 pair 用第三条", () => {
+		const got = alignClauses(
+			doc,
+			[ob("H")],
+			[
+				{
+					chunkId: "H",
+					sourceLaws: [
+						{ docNo: "无关法规A", docTitle: null, clausePath: "第一条", sourceCode: "X1" },
+						{ docNo: null, docTitle: "无关法规B", clausePath: "第二条", sourceCode: "X2" },
+						{
+							docNo: "证监发〔2026〕1号",
+							docTitle: null,
+							clausePath: "第二章 报销原则/第五条",
+							sourceCode: "X3",
+						},
+					],
+				},
+			],
+		);
+		expect(got.pairs).toHaveLength(1);
+		expect(got.pairs[0].matchKind).toBe("exact");
+		expect(got.pairs[0].externalClause.seq).toBe(0);
+		expect(got.unmatched).toEqual([]);
+	});
+
+	// Finding 2: 多条 sourceLaws,都指向本文档但 clause_path 都查不到
+	it("sourceLaws 有多条都指向本文档,但全部 clause_path 在上传件中查不到 → unmatched", () => {
+		const got = alignClauses(
+			doc,
+			[ob("I")],
+			[
+				{
+					chunkId: "I",
+					sourceLaws: [
+						{
+							docNo: "证监发〔2026〕1号",
+							docTitle: null,
+							clausePath: "第四章 不存在/第九十九条",
+							sourceCode: "X1",
+						},
+						{
+							docNo: "证监发〔2026〕1号",
+							docTitle: null,
+							clausePath: "第五章 也不存在/第一百条",
+							sourceCode: "X2",
+						},
+					],
+				},
+			],
+		);
+		expect(got.pairs).toEqual([]);
+		expect(got.unmatched).toEqual([{ internalChunkId: "I", reason: "external_clause_not_in_uploaded_document" }]);
 	});
 });

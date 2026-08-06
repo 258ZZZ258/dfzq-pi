@@ -115,8 +115,15 @@ export function alignClauses(
 
 			// 粒度是文档级:映射只说到「衍生自这部外规」,与该文档全部条款成对
 			if (ref.clausePath === null || ref.clausePath === "") {
-				for (const clause of doc.clauses) pairs.push(pairOf(clause, ob, "doc_level"));
-				matchedThis = true;
+				// 文档对上了,但如果文档本身无条款,不能产生任何 pair —— 应进 unmatched
+				if (doc.clauses.length === 0) {
+					// 文档被识别但为空,这是第三种失败形态
+					unmatched.push({ internalChunkId: ob.chunkId, reason: "uploaded_document_has_no_clauses" });
+					matchedThis = true;
+				} else {
+					for (const clause of doc.clauses) pairs.push(pairOf(clause, ob, "doc_level"));
+					matchedThis = true;
+				}
 				break;
 			}
 

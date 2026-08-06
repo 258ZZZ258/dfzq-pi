@@ -330,58 +330,76 @@ describe("buildCoverageResult", () => {
 		expect(got.gaps?.join("\n")).toContain("截断");
 	});
 
-	// 补充覆盖:metrics 在三者并发下恒成立
-	it("metrics 四项之和恒等于 checked:truncated + unmatched + mixed verdicts", () => {
+	// 补充覆盖:metrics 按内规条款计数,不按 pair 计数(doc_level 扇出下守恒)
+	// 这是关键测试:doc_level 会把一条内规扇出多个 pair,metrics 仍按内规计
+	it("doc_level 扇出下守恒:1 条内规 × 3 个外规条款 = 3 个 pair,metrics 按内规计", () => {
+		// 构造: 1 条内规(C-0),扇出到 3 个外规条款,都判 covered
+		const externalClauses = [
+			{ seq: 0, clausePath: "第1条", text: "外规第1条" },
+			{ seq: 1, clausePath: "第2条", text: "外规第2条" },
+			{ seq: 2, clausePath: "第3条", text: "外规第3条" },
+		];
+		const internalObligation = {
+			chunkId: "C-0",
+			clausePath: "条1",
+			docTitle: "内规",
+			docNo: "内〔2026〕1号",
+			deonticType: "obligation" as const,
+			evidence: "应当",
+			text: "内规第1条",
+			sourceCode: "SC-0",
+		};
+
 		const got = buildCoverageResult({
-			alignment: alignment([pair(0), pair(1), pair(2), pair(3)], ["C-9", "C-10"]),
+			alignment: {
+				pairs: externalClauses.map((ec) => ({
+					externalClause: ec,
+					internalObligation,
+					matchKind: "doc_level" as const,
+				})),
+				unmatched: [],
+			},
 			verdicts: [
 				{ pairIndex: 0, state: "covered" },
-				{ pairIndex: 1, state: "missing", gap: "a" },
-				{ pairIndex: 2, state: "conflict", conflictType: "x", gap: "b" },
-				// pairIndex 3 漏判
+				{ pairIndex: 1, state: "covered" },
+				{ pairIndex: 2, state: "covered" },
 			],
-			checkedCount: 6,
-			truncated: true,
+			checkedCount: 1,
+			truncated: false,
 		});
-		const m = got.metrics;
-		// 验证:
-		// - alignment.unmatched.length = 2
-		// - 漏判的对 = 1
-		// - covered = 1
-		// - missing = 1
-		// - conflict = 1
-		// 总计:2 + 1 + 1 + 1 + 1 = 6
-		expect(m.unmatched).toBe(3); // 2 from unmatched + 1 from missing verdict
-		expect(m.covered).toBe(1);
-		expect(m.missing).toBe(1);
-		expect(m.conflict).toBe(1);
-		expect(m.missing + m.conflict + m.covered + m.unmatched).toBe(m.checked);
-		expect(m.checked).toBe(6);
+		// metrics 按内规计:只有 1 条内规,全部 pair 都 covered
+		expect(got.metrics.covered).toBe(1);
+		expect(got.metrics.missing).toBe(0);
+		expect(got.metrics.conflict).toBe(0);
+		expect(got.metrics.unmatched).toBe(0);
+		expect(got.metrics.missing + got.metrics.conflict + got.metrics.covered + got.metrics.unmatched).toBe(
+			got.metrics.checked,
+		);
+		// rows 仍按 pair 出,但都是 covered 所以 rows 为空
+		expect(got.rows).toHaveLength(0);
 	});
 
 	// 补充覆盖:basis 字段来自原始数据(包括可为 null 的字段)
-	it("basis.externalDocNo 来自 internalObligation.docNo", () => {
-		const docNo = "某特定规号";
+	it("basis.externalDocNo 来自 BuildInput.externalDocNo", () => {
+		const externalDocNo = "外规〔2026〕1号";
 		const got = buildCoverageResult({
-			alignment: alignment([
-				pair(0, {
-					internalObligation: {
-						chunkId: "C-0",
-						clausePath: "条1",
-						docTitle: "规章",
-						docNo,
-						deonticType: "obligation",
-						evidence: "应",
-						text: "文",
-						sourceCode: "SC",
-					},
-				}),
-			]),
+			alignment: alignment([pair(0)]),
+			verdicts: [{ pairIndex: 0, state: "missing" }],
+			checkedCount: 1,
+			truncated: false,
+			externalDocNo,
+		});
+		expect(got.rows[0].basis.externalDocNo).toBe(externalDocNo);
+	});
+
+	it("basis.externalDocNo 不传时为 null", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([pair(0)]),
 			verdicts: [{ pairIndex: 0, state: "missing" }],
 			checkedCount: 1,
 			truncated: false,
 		});
-		expect(got.rows[0].basis.externalDocNo).toBe(docNo);
+		expect(got.rows[0].basis.externalDocNo).toBeNull();
 	});
 
 	it("basis.internalSourceCode 来自 sourceCode,可为 null", () => {
@@ -451,5 +469,274 @@ describe("buildCoverageResult", () => {
 		});
 		expect(got.metrics.unmatched).toBe(2);
 		expect(got.gaps?.filter((g) => g.includes("未获模型判定")).length).toBe(2);
+	});
+
+	// 评审要求的新测试 2:最严重档取胜
+	it("最严重档取胜:1 条内规 3 个 pair 分别判 covered/missing/conflict → 只计入 conflict", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([
+				pair(0, {
+					internalObligation: {
+						chunkId: "C-0",
+						clausePath: "条1",
+						docTitle: "内规",
+						docNo: "内号",
+						deonticType: "obligation",
+						evidence: "应",
+						text: "文1",
+						sourceCode: "SC-0",
+					},
+				}),
+				pair(1, {
+					internalObligation: {
+						chunkId: "C-0", // 同一条内规
+						clausePath: "条2",
+						docTitle: "内规",
+						docNo: "内号",
+						deonticType: "obligation",
+						evidence: "应",
+						text: "文2",
+						sourceCode: "SC-0",
+					},
+				}),
+				pair(2, {
+					internalObligation: {
+						chunkId: "C-0", // 同一条内规
+						clausePath: "条3",
+						docTitle: "内规",
+						docNo: "内号",
+						deonticType: "obligation",
+						evidence: "应",
+						text: "文3",
+						sourceCode: "SC-0",
+					},
+				}),
+			]),
+			verdicts: [
+				{ pairIndex: 0, state: "covered" },
+				{ pairIndex: 1, state: "missing", gap: "缺A" },
+				{ pairIndex: 2, state: "conflict", conflictType: "冲突", gap: "冲突B" },
+			],
+			checkedCount: 1,
+			truncated: false,
+		});
+		// 最严重档是 conflict
+		expect(got.metrics.conflict).toBe(1);
+		expect(got.metrics.missing).toBe(0);
+		expect(got.metrics.covered).toBe(0);
+		// rows 仍然按 pair 出:missing 和 conflict 的各一行
+		expect(got.rows).toHaveLength(2);
+		expect(got.rows.map((r) => r.tabKey)).toEqual(["missing", "error"]);
+	});
+
+	// 评审要求的新测试 3:部分漏判
+	it("部分漏判:1 条内规 2 个 pair,一个判 covered、一个无判定 → 计入 covered,但 gaps 有漏判", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([
+				pair(0, {
+					internalObligation: {
+						chunkId: "C-0",
+						clausePath: "条1",
+						docTitle: "内规",
+						docNo: "内号",
+						deonticType: "obligation",
+						evidence: "应",
+						text: "文1",
+						sourceCode: "SC-0",
+					},
+				}),
+				pair(1, {
+					internalObligation: {
+						chunkId: "C-0", // 同一条内规
+						clausePath: "条2",
+						docTitle: "内规",
+						docNo: "内号",
+						deonticType: "obligation",
+						evidence: "应",
+						text: "文2",
+						sourceCode: "SC-0",
+					},
+				}),
+			]),
+			verdicts: [
+				{ pairIndex: 0, state: "covered" },
+				// pairIndex 1 无判定
+			],
+			checkedCount: 1,
+			truncated: false,
+		});
+		// 该内规有部分 pair 无判定,但其他 pair 已判 covered,所以整个内规归 covered
+		expect(got.metrics.covered).toBe(1);
+		expect(got.metrics.unmatched).toBe(0); // 不因为有漏判就计入 unmatched
+		// 漏判的 pair 写进 gaps
+		expect(got.gaps?.join("\n")).toContain("未获模型判定(pairIndex=1)");
+		// rows 空(因为只有 covered 和漏判,都不进 rows)
+		expect(got.rows).toHaveLength(0);
+	});
+
+	// 评审要求的新测试 4:全部漏判
+	it("全部漏判:1 条内规 2 个 pair 都无判定 → 计入 unmatched **一次**", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([
+				pair(0, {
+					internalObligation: {
+						chunkId: "C-0",
+						clausePath: "条1",
+						docTitle: "内规",
+						docNo: "内号",
+						deonticType: "obligation",
+						evidence: "应",
+						text: "文1",
+						sourceCode: "SC-0",
+					},
+				}),
+				pair(1, {
+					internalObligation: {
+						chunkId: "C-0", // 同一条内规
+						clausePath: "条2",
+						docTitle: "内规",
+						docNo: "内号",
+						deonticType: "obligation",
+						evidence: "应",
+						text: "文2",
+						sourceCode: "SC-0",
+					},
+				}),
+			]),
+			verdicts: [],
+			checkedCount: 1,
+			truncated: false,
+		});
+		// 该内规全部 pair 都无判定,计入 unmatched **一次**
+		expect(got.metrics.unmatched).toBe(1);
+		expect(got.metrics.covered).toBe(0);
+		expect(got.metrics.missing).toBe(0);
+		// 两条漏判都写进 gaps
+		expect(got.gaps?.filter((g) => g.includes("未获模型判定")).length).toBe(2);
+	});
+
+	// 评审要求的新测试 5:truncated 用 libraryTotal
+	it("truncated 用 libraryTotal:checkedCount=500、libraryTotal=1200", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([pair(0)]),
+			verdicts: [{ pairIndex: 0, state: "covered" }],
+			checkedCount: 500,
+			truncated: true,
+			libraryTotal: 1200,
+		});
+		const msg = got.gaps?.join("\n") || "";
+		// 文案应该包含 pairs.length 和 libraryTotal
+		expect(msg).toContain("1");
+		expect(msg).toContain("1200");
+		// metrics 仍按 checkedCount 算
+		expect(got.metrics.checked).toBe(500);
+	});
+
+	// 评审要求的新测试 6:改成有判别力的守恒测试
+	it("metrics 守恒:checkedCount 独立于 pairs/unmatched 的算术", () => {
+		// 构造:让 checkedCount、pairs 数量、unmatched 数量都不同,验证守恒仍成立
+		// 4 个内规:C-0(covered)、C-1(missing)、C-2(conflict)、C-3(未对齐)
+		// 但 pair 不一定各 1 个 —— C-0 扇出 3 个 pair
+		const got = buildCoverageResult({
+			alignment: {
+				pairs: [
+					// C-0 扇出 3 个 pair,都 covered
+					{
+						externalClause: { seq: 0, clausePath: "E1", text: "E1" },
+						internalObligation: {
+							chunkId: "C-0",
+							clausePath: "I1",
+							docTitle: "D",
+							docNo: "N",
+							deonticType: "obligation",
+							evidence: "E",
+							text: "T",
+							sourceCode: "S",
+						},
+						matchKind: "doc_level" as const,
+					},
+					{
+						externalClause: { seq: 1, clausePath: "E2", text: "E2" },
+						internalObligation: {
+							chunkId: "C-0",
+							clausePath: "I2",
+							docTitle: "D",
+							docNo: "N",
+							deonticType: "obligation",
+							evidence: "E",
+							text: "T",
+							sourceCode: "S",
+						},
+						matchKind: "doc_level" as const,
+					},
+					{
+						externalClause: { seq: 2, clausePath: "E3", text: "E3" },
+						internalObligation: {
+							chunkId: "C-0",
+							clausePath: "I3",
+							docTitle: "D",
+							docNo: "N",
+							deonticType: "obligation",
+							evidence: "E",
+							text: "T",
+							sourceCode: "S",
+						},
+						matchKind: "doc_level" as const,
+					},
+					// C-1 一个 pair,missing
+					{
+						externalClause: { seq: 3, clausePath: "E4", text: "E4" },
+						internalObligation: {
+							chunkId: "C-1",
+							clausePath: "I4",
+							docTitle: "D",
+							docNo: "N",
+							deonticType: "obligation",
+							evidence: "E",
+							text: "T",
+							sourceCode: "S",
+						},
+						matchKind: "exact" as const,
+					},
+					// C-2 一个 pair,conflict
+					{
+						externalClause: { seq: 4, clausePath: "E5", text: "E5" },
+						internalObligation: {
+							chunkId: "C-2",
+							clausePath: "I5",
+							docTitle: "D",
+							docNo: "N",
+							deonticType: "obligation",
+							evidence: "E",
+							text: "T",
+							sourceCode: "S",
+						},
+						matchKind: "exact" as const,
+					},
+				],
+				unmatched: [{ internalChunkId: "C-3", reason: "source_law_unresolved" }],
+			},
+			verdicts: [
+				{ pairIndex: 0, state: "covered" },
+				{ pairIndex: 1, state: "covered" },
+				{ pairIndex: 2, state: "covered" },
+				{ pairIndex: 3, state: "missing", gap: "缺" },
+				{ pairIndex: 4, state: "conflict", conflictType: "x", gap: "冲" },
+			],
+			checkedCount: 4,
+			truncated: false,
+		});
+
+		const m = got.metrics;
+		// 4 条内规:covered(1) + missing(1) + conflict(1) + unmatched(1) = 4
+		expect(m.covered).toBe(1);
+		expect(m.missing).toBe(1);
+		expect(m.conflict).toBe(1);
+		expect(m.unmatched).toBe(1);
+		// 守恒:内规数自洽
+		expect(m.missing + m.conflict + m.covered + m.unmatched).toBe(m.checked);
+		expect(m.checked).toBe(4);
+		// rows 按 pair 出:2 条非 covered 的 pair(missing + conflict)
+		expect(got.rows).toHaveLength(2);
 	});
 });

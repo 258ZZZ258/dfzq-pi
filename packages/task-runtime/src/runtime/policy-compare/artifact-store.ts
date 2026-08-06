@@ -68,6 +68,18 @@ export function createArtifactStore(opts: { bucket: string; get: ObjectGetter })
 	};
 }
 
+/**
+ * 读完一个可异步迭代的流并按 utf8 拼成字符串。
+ *
+ * 抽成纯函数是因为它是纯逻辑,埋在 `createMinioObjectGetter` 里就只能靠真 MinIO 才能覆盖到。
+ * 关键点: 必须先 `Buffer.concat` 再 `.toString("utf8")`,否则逐 chunk toString 会把跨界的多字节字符切坏。
+ */
+export async function readStreamToString(stream: AsyncIterable<unknown>): Promise<string> {
+	const parts: Buffer[] = [];
+	for await (const chunk of stream) parts.push(Buffer.from(chunk as Buffer));
+	return Buffer.concat(parts).toString("utf8");
+}
+
 export interface MinioConfig {
 	endPoint: string;
 	port?: number;
@@ -78,7 +90,11 @@ export interface MinioConfig {
 
 /**
  * 真 MinIO 后端。凭证走 env,**绝不入库**(与 audit-ai 的 `object_store.py` 同款纪律)。
- * `minio` SDK 懒导入 —— 只有真正用 MinIO 的部署路径才需要它可用。
+ *
+ * ⚠️ **懒导入与安全不变量的测试覆盖**:
+ * - `minio` SDK 懒导入(第 89 行的 `import("minio")`)—— 只有真正用 MinIO 的部署路径才需要它可用。
+ *   懒导入本身**没有测试守护**,改动时需要人工留意是否仍然保持懒加载特性。
+ * - 凭证 fail-closed(第 84-86 行)——  accessKey/secretKey 为空时立即抛错,有测试守护。
  */
 export function createMinioObjectGetter(cfg: MinioConfig): ObjectGetter {
 	if (!cfg.accessKey || !cfg.secretKey) {
@@ -87,6 +103,7 @@ export function createMinioObjectGetter(cfg: MinioConfig): ObjectGetter {
 	let clientPromise: Promise<{ getObject: (b: string, k: string) => Promise<NodeJS.ReadableStream> }> | undefined;
 	const client = async () => {
 		if (!clientPromise) {
+			// 懒导入:只在第一次调用 getObject 时才触发 import("minio")
 			clientPromise = import("minio").then(
 				(m) =>
 					new m.Client({
@@ -102,8 +119,6 @@ export function createMinioObjectGetter(cfg: MinioConfig): ObjectGetter {
 	};
 	return async (bucket, key) => {
 		const stream = await (await client()).getObject(bucket, key);
-		const parts: Buffer[] = [];
-		for await (const chunk of stream) parts.push(Buffer.from(chunk as Buffer));
-		return Buffer.concat(parts).toString("utf8");
+		return readStreamToString(stream);
 	};
 }

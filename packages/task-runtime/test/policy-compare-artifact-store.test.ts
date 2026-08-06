@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { createArtifactStore, parseArtifact } from "../src/runtime/policy-compare/artifact-store.ts";
+import {
+	createArtifactStore,
+	createMinioObjectGetter,
+	parseArtifact,
+	readStreamToString,
+} from "../src/runtime/policy-compare/artifact-store.ts";
 
 const artifact = {
 	upload_id: "U1",
@@ -337,6 +342,24 @@ describe("parseArtifact", () => {
 		expect(got).toHaveProperty("docNo");
 		expect(got.docNo).toBeUndefined();
 	});
+
+	// Minor: chunks 非数组但有值的情形
+	it("chunks 为字符串时抛错(非数组)", () => {
+		expect(() => parseArtifact(JSON.stringify({ upload_id: "U1", chunks: "not-an-array" }))).toThrow(/chunks/);
+	});
+
+	it("chunks 为对象时抛错(非数组)", () => {
+		expect(() => parseArtifact(JSON.stringify({ upload_id: "U1", chunks: { 0: "item" } }))).toThrow(/chunks/);
+	});
+
+	// Minor: doc 键整个缺失的情形
+	it("doc 键缺失时使用空对象作为默认值", () => {
+		const noDoc = { ...artifact };
+		// biome-ignore lint/correctness/noUnusedVariables: 故意排除 doc
+		const { doc, ...rest } = noDoc;
+		const got = parseArtifact(JSON.stringify(rest));
+		expect(got.title).toBe("");
+	});
 });
 
 describe("createArtifactStore", () => {
@@ -368,5 +391,73 @@ describe("createArtifactStore", () => {
 			get: async () => JSON.stringify({ upload_id: "U1", chunks: [] }),
 		});
 		await expect(store.fetch("artifact/U1.json")).rejects.toThrow(/条款/);
+	});
+});
+
+describe("createMinioObjectGetter", () => {
+	it("accessKey 为空时 fail-closed 抛错", () => {
+		expect(() =>
+			createMinioObjectGetter({ endPoint: "minio.example.com", accessKey: "", secretKey: "secret" }),
+		).toThrow(/fail-closed/);
+	});
+
+	it("secretKey 为空时 fail-closed 抛错", () => {
+		expect(() =>
+			createMinioObjectGetter({ endPoint: "minio.example.com", accessKey: "access", secretKey: "" }),
+		).toThrow(/fail-closed/);
+	});
+
+	it("accessKey 和 secretKey 都为空时抛错", () => {
+		expect(() => createMinioObjectGetter({ endPoint: "minio.example.com", accessKey: "", secretKey: "" })).toThrow(
+			/fail-closed/,
+		);
+	});
+});
+
+describe("readStreamToString", () => {
+	it("单个 chunk 正常拼接", async () => {
+		const stream = (async function* () {
+			yield Buffer.from("hello");
+		})();
+		const result = await readStreamToString(stream);
+		expect(result).toBe("hello");
+	});
+
+	it("多个 chunk 顺序拼接", async () => {
+		const stream = (async function* () {
+			yield Buffer.from("hello");
+			yield Buffer.from(" ");
+			yield Buffer.from("world");
+		})();
+		const result = await readStreamToString(stream);
+		expect(result).toBe("hello world");
+	});
+
+	it("空流返回空字符串", async () => {
+		const stream = (async function* () {})();
+		const result = await readStreamToString(stream);
+		expect(result).toBe("");
+	});
+
+	it("处理 Uint8Array 类型 chunk", async () => {
+		const stream = (async function* () {
+			yield new Uint8Array([104, 101, 108, 108, 111]); // "hello"
+		})();
+		const result = await readStreamToString(stream);
+		expect(result).toBe("hello");
+	});
+
+	it("跨 chunk 的多字节 UTF-8 字符正确处理", async () => {
+		// "中文" 是 3 字节每个字符的 UTF-8
+		// 将字节拆分到两个 chunk 中: "中" 的后两字节在第一个 chunk,最后一个字节在第二个 chunk
+		const chineseBytes = Buffer.from("中文");
+		const stream = (async function* () {
+			// 第一个 chunk: "中" 的前两字节 + "文" 的第一字节(跨界)
+			yield chineseBytes.subarray(0, 5);
+			// 第二个 chunk: "文" 的最后两字节
+			yield chineseBytes.subarray(5);
+		})();
+		const result = await readStreamToString(stream);
+		expect(result).toBe("中文");
 	});
 });

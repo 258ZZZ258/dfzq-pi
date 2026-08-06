@@ -212,7 +212,11 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			// batchSize 不在 RunOptions 类型上(run-manager.ts 的注释:该接口刻意不收窄,
 			// 加字段不该变成一次 HTTP 层改动)—— 与 app.ts 的 `body.options as RunOptions`
 			// 同一条纪律,在读取处窄化,不去反过来给 RunOptions 加一个只有本工作流用得到的字段。
-			const rawBatchSize = (runOptions as { batchSize?: unknown }).batchSize;
+			// 存在但不是数字 → 响亮拒绝,不是悄悄落回默认值:与本工作流其余每一处 fail-loud
+			// 姿态一致(env 缺失即拒绝启动、未知 workflow 取值即抛、payload.outputTypes 非全选
+			// 即 422)。静默吞掉反而会掩盖 createPolicyCompareRuntime 自己对 batchSize 的
+			// 1..MAX_BATCH_SIZE 整数校验——那道校验只在值到达之后才有意义。
+			const rawBatchSize = parseBatchSizeOption((runOptions as { batchSize?: unknown }).batchSize);
 			const baseUrl = requireEnv("AUDIT_AI_BASE_URL");
 			const internalToken = requireEnv("AUDIT_AI_INTERNAL_TOKEN");
 			const bucket = requireEnv("DFZQ_UPLOADS_BUCKET");
@@ -236,7 +240,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 						secretKey: requireEnv("DFZQ_MINIO_SECRET_KEY"),
 					}),
 				}),
-				batchSize: typeof rawBatchSize === "number" ? rawBatchSize : undefined,
+				batchSize: rawBatchSize,
 				skillPaths: skillPaths.get(specId),
 			});
 		}
@@ -259,4 +263,18 @@ function requireEnv(name: string): string {
 	const value = process.env[name];
 	if (!value) throw new Error(`环境变量 ${name} 未配置 —— 制度比对工作流拒绝启动(fail-closed)`);
 	return value;
+}
+
+/**
+ * `RunOptions.batchSize` 的窄化 + fail-loud 校验。缺省(`undefined`)放行,交给
+ * `createPolicyCompareRuntime` 自己的默认值(`DEFAULT_BATCH_SIZE`);存在但不是数字就在这里
+ * 响亮拒绝,不悄悄落回默认值——静默吞掉会掩盖下游对 batchSize 的 1..MAX_BATCH_SIZE 整数校验,
+ * 那道校验只有在值真的到达之后才有意义。
+ */
+function parseBatchSizeOption(raw: unknown): number | undefined {
+	if (raw === undefined) return undefined;
+	if (typeof raw !== "number") {
+		throw new Error(`options.batchSize 必须是数字(收到:${JSON.stringify(raw)})`);
+	}
+	return raw;
 }

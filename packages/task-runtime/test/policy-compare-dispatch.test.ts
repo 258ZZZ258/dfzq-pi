@@ -1,8 +1,21 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as policyCompareRuntimeModule from "../src/runtime/policy-compare/runtime.ts";
 import { createDefaultRuntimeFactory } from "../src/server/main.ts";
+import type { RunOptions } from "../src/server/run-manager.ts";
+
+/**
+ * `RunOptions`(server/run-manager.ts)刻意不收窄,不含 `batchSize`(main.ts 的注释、
+ * 该接口自己的注释都写了同一条理由)——HTTP 层的 `options` 本来就是宽松的
+ * `Record<string, unknown>`,`batchSize` 是 policy-compare 工作流私有的读取约定,不是
+ * `RunOptions` 的一部分。测试里要构造带 `batchSize` 的 `options` 传给工厂,只能在这个边界
+ * 上转型——与 app.ts 的 `body.options as RunOptions | undefined` 同一条纪律,不是权宜之计。
+ */
+function optionsWithBatchSize(batchSize: unknown): RunOptions {
+	return { batchSize } as unknown as RunOptions;
+}
 
 /**
  * Task 12 的核心接线:`spec.workflow === "policy-compare"` 真的让工厂走
@@ -173,5 +186,83 @@ describe("createDefaultRuntimeFactory — policy-compare 工作流的必需 env,
 		for (const key of REQUIRED_ENV_KEYS) {
 			expect((error as Error).message).not.toMatch(new RegExp(key));
 		}
+	});
+});
+
+/**
+ * Task 12 复审 Finding 1/2:`options.batchSize` 是唯一一处有分支逻辑的透传(env / payload /
+ * skillPaths 都是无分支的原样传递),此前完全没有测试走过它的数字分支——评审把它硬编码成
+ * `batchSize: undefined` 跑 `policy-compare-spec` + `policy-compare-dispatch` 两个文件是
+ * 17/17 全绿,证明当时的用例(`invoke()` 一律传 `options: {}`)测不出这条线被切断。
+ *
+ * 用 `vi.spyOn` 直接接管 `createPolicyCompareRuntime`(而不是像上面几条那样靠"哪条错误信息
+ * 先冒出来"这种间接判据)——`main.ts` 与本文件都从同一个相对路径
+ * `src/runtime/policy-compare/runtime.ts` 导入,Vitest 的 ESM 转换让这里的 spy 对 main.ts
+ * 内部已经 import 过的绑定同样生效(与 server-startup.test.ts 对 `sqliteModule` 的用法同一条
+ * 已验证过的机制)。直接断言 spy 收到的 `batchSize` 参数值,不是去猜某条错误信息里有没有提到
+ * 这个数字。
+ */
+describe("createDefaultRuntimeFactory — options.batchSize 到 createPolicyCompareRuntime 的透传(Task 12 复审 Finding 1)", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("options.batchSize 是数字时,原样透传给 createPolicyCompareRuntime", async () => {
+		await writeSpec("pc", pcSpec());
+		const factory = await buildFactory();
+		for (const key of REQUIRED_ENV_KEYS) process.env[key] = "test-value";
+
+		let received: unknown = "createPolicyCompareRuntime 从未被调用";
+		vi.spyOn(policyCompareRuntimeModule, "createPolicyCompareRuntime").mockImplementation(async (opts) => {
+			received = opts.batchSize;
+			return {} as unknown as Awaited<ReturnType<typeof policyCompareRuntimeModule.createPolicyCompareRuntime>>;
+		});
+
+		await factory({
+			specId: "pc",
+			sessionId: "s1",
+			runId: "r1",
+			filters: { corpusTypes: ["internal"] },
+			options: optionsWithBatchSize(3),
+		});
+		expect(received).toBe(3);
+	});
+
+	it("options 不传 batchSize → createPolicyCompareRuntime 收到 undefined(走它自己的 DEFAULT_BATCH_SIZE),这一层不抛错", async () => {
+		await writeSpec("pc", pcSpec());
+		const factory = await buildFactory();
+		for (const key of REQUIRED_ENV_KEYS) process.env[key] = "test-value";
+
+		let received: unknown = "createPolicyCompareRuntime 从未被调用";
+		vi.spyOn(policyCompareRuntimeModule, "createPolicyCompareRuntime").mockImplementation(async (opts) => {
+			received = opts.batchSize;
+			return {} as unknown as Awaited<ReturnType<typeof policyCompareRuntimeModule.createPolicyCompareRuntime>>;
+		});
+
+		await factory({
+			specId: "pc",
+			sessionId: "s1",
+			runId: "r1",
+			filters: { corpusTypes: ["internal"] },
+			options: {},
+		});
+		expect(received).toBeUndefined();
+	});
+
+	it("options.batchSize 不是数字时响亮拒绝,错误信息带上实际收到的值 —— 不悄悄落回默认值", async () => {
+		await writeSpec("pc", pcSpec());
+		const factory = await buildFactory();
+		// parseBatchSizeOption 在 6 个 requireEnv 检查之前就跑(main.ts 里的求值顺序),
+		// 不需要配置任何 env 就能触发——这条本身也顺带证明了它排在最前面。
+		const error = await factory({
+			specId: "pc",
+			sessionId: "s1",
+			runId: "r1",
+			filters: { corpusTypes: ["internal"] },
+			options: optionsWithBatchSize("3"),
+		}).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("options.batchSize");
+		expect((error as Error).message).toContain(JSON.stringify("3"));
 	});
 });

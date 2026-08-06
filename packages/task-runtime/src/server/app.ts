@@ -149,7 +149,17 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 	app.get("/runs/:runId", (c) => {
 		const row = store.findByRunId(c.req.param("runId"));
 		if (!row) return c.json(errorBody("not_found", "run not found"), 404);
-		if (!isTerminal(row.status)) return c.json({ runId: row.runId, status: row.status }, 200);
+		// isTerminal 判定必须先于 progress —— 一个已经落库为终态的行不该再挂 progress 字段
+		// (规格 §7.2:progress 只描述「正在跑」这件事;终态的真相是下面的 RunResult)。
+		if (!isTerminal(row.status)) {
+			const progress = manager.progressOf(row.runId);
+			// 三元而非无条件展开:没有 progress 时响应体里根本不该出现这个键,不是「键在、值
+			// undefined」——两者在 JSON 线上不可区分,但代码语义不该暧昧(见测试里的同款纪律)。
+			return c.json(
+				progress ? { runId: row.runId, status: row.status, progress } : { runId: row.runId, status: row.status },
+				200,
+			);
+		}
 		return c.json(toWireResult(recordToRunResult(row)), 200);
 	});
 

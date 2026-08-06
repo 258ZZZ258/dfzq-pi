@@ -116,6 +116,21 @@ export type SubmitOutcome =
 
 export type CancelOutcome = "accepted" | "not_found" | "already_terminal";
 
+/**
+ * 「制度比对」`compare_stage` 事件的载荷(规格 §7.2)。只服务 `GET /runs/{id}` 的进度展示,
+ * **不落库** —— 长 run 都走 202 + 轮询,进度是「当下」状态,历史进度由 `run_events` 表自己
+ * 承担;`RunManager` 只在内存里记最后一条,run 落终态即清掉(见 `progress` 字段与
+ * `live.delete(runId)` 同处的清理)。`policy-query` 等不发 `compare_stage` 的 taskKind 从不
+ * 写入这张表,`progressOf` 对它们恒返回 `undefined`,零影响。
+ */
+export interface RunProgress {
+	stage: string;
+	percent: number;
+	current: number;
+	total: number;
+	message: string;
+}
+
 export interface RunManagerOptions {
 	store: RunStore;
 	gate: Gate;
@@ -150,6 +165,8 @@ export class RunManager {
 	private readonly now: () => number;
 	private readonly newRunId: () => string;
 	private readonly live = new Map<string, LiveRun>();
+	/** 见 RunProgress 的注释:只对在飞的 run 有意义,清理时机与 live 表同处。 */
+	private readonly progress = new Map<string, RunProgress>();
 
 	constructor(options: RunManagerOptions) {
 		this.store = options.store;
@@ -165,6 +182,13 @@ export class RunManager {
 
 	get queueDepth(): number {
 		return this.gate.queueDepth;
+	}
+
+	/** `GET /runs/{id}` 非终态分支专用(规格 §7.2)。没收到过 compare_stage、或 run 已落
+	 *  终态(见 progress 与 live.delete 同处的清理)时返回 undefined —— 调用方据此决定要不要
+	 *  在响应体里挂 progress 字段。 */
+	progressOf(runId: string): RunProgress | undefined {
+		return this.progress.get(runId);
 	}
 
 	/**
@@ -186,6 +210,12 @@ export class RunManager {
 	 */
 	private subscribeEvents(runId: string, runtime: Runtime): () => void {
 		return runtime.subscribe((event) => {
+			// 进度捕获与落库白名单分开判断:`compare_stage` 不在 shouldRecord 的 RECORDED_TYPES
+			// 里(它是进度展示位,不是要审计的事件),必须在下面的 shouldRecord 短路之前处理,
+			// 否则永远走不到这里。只记最后一条,不落库——RunProgress 的注释已经写清楚原因。
+			if (event.type === "compare_stage") {
+				this.progress.set(runId, event.payload as RunProgress);
+			}
 			if (!shouldRecord(event.type)) return;
 			try {
 				this.store.appendEvents(runId, [toStoredEvent(event)]);
@@ -305,6 +335,9 @@ export class RunManager {
 				);
 			}
 			this.live.delete(runId);
+			// 这一支在 subscribeEvents 建立之前就失败,progress 不可能有这个 runId 的条目——
+			// 与 live.delete 同处删,保持两张表的清理时机一致,不留"万一以后顺序变了"的隐患。
+			this.progress.delete(runId);
 			ticket.release();
 			throw error;
 		}
@@ -350,6 +383,7 @@ export class RunManager {
 				error,
 			);
 			this.live.delete(runId);
+			this.progress.delete(runId);
 			ticket.release();
 			unsubscribeEvents();
 			await runtime.dispose().catch(() => {});
@@ -382,6 +416,7 @@ export class RunManager {
 			throw error;
 		} finally {
 			this.live.delete(runId);
+			this.progress.delete(runId);
 			ticket.release();
 		}
 		return result;
@@ -417,7 +452,13 @@ export class RunManager {
 			// 结果已落盘 → 可立即驱逐 runtime(设计文档 §4.1)。解订阅放在这里(task-18b):
 			// 与 live.delete / ticket.release 同一处收尾,run() 正常返回、抛错两条路径都
 			// 无条件走到这里,确保事件订阅不会在 runtime 被驱逐之后继续悬空。
+			//
+			// progress.delete 同处清理(Task 11):这是「制度比对」在飞的 run 真正会走到的路径
+			// ——compare_stage 只在 runtime.run() 执行期间才可能发出,run 落终态(不管成功/
+			// limit_exceeded/error)后进度就该消失,不然一个已结束 run 的旧进度会被后来的
+			// GET /runs/{id} 查询读到。
 			this.live.delete(runId);
+			this.progress.delete(runId);
 			ticket.release();
 			unsubscribeEvents();
 			await runtime.dispose().catch(() => {});

@@ -770,4 +770,82 @@ describe("run manager", () => {
 			expect(row?.payloadJson).toBeUndefined();
 		});
 	});
+
+	describe("progress(compare_stage 事件位,Task 11)", () => {
+		it("progressOf() 返回最后一条 compare_stage 的 payload,不是第一条", async () => {
+			const stub = createStubRuntime({
+				hang: true,
+				events: [
+					{
+						type: "compare_stage",
+						payload: { stage: "extracting", percent: 10, current: 1, total: 20, message: "first" },
+					},
+					{
+						type: "compare_stage",
+						payload: { stage: "matching", percent: 40, current: 8, total: 20, message: "second" },
+					},
+					{
+						type: "compare_stage",
+						payload: { stage: "judging", percent: 70, current: 14, total: 20, message: "third" },
+					},
+				],
+			});
+			const rm = manager(stub);
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error("expected accepted");
+			// submit() 不等 admitAndDrive 跑完就返回(装配/markRunning/run() 都在后续微任务里)——
+			// run() 内部同步广播 events 发生在这几跳微任务之后。一个 0ms 宏任务 tick 冲刷掉它们,
+			// 同款手法见本文件"dedupe branch reports the current queued state"用例的注释。
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(rm.progressOf(outcome.runId)).toEqual({
+				stage: "judging",
+				percent: 70,
+				current: 14,
+				total: 20,
+				message: "third",
+			});
+
+			stub.resolveNow();
+			await outcome.completion;
+		});
+
+		it("progressOf() 在没有 compare_stage 事件时返回 undefined", async () => {
+			const stub = createStubRuntime({ hang: true });
+			const rm = manager(stub);
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error("expected accepted");
+			// 同上:等 run() 真正被调用(進而挂起在 hang 的内部 promise 上)之后再 resolveNow(),
+			// 否则 resolveNow() 落在 settle 还没被赋值之前,是个空操作,run() 之后再也没人推动它。
+			await new Promise((resolve) => setTimeout(resolve, 0));
+
+			expect(rm.progressOf(outcome.runId)).toBeUndefined();
+
+			stub.resolveNow();
+			await outcome.completion;
+		});
+
+		it("run 落终态后 progressOf() 被清理,不留给后续查询", async () => {
+			const stub = createStubRuntime({
+				hang: true,
+				events: [
+					{
+						type: "compare_stage",
+						payload: { stage: "matching", percent: 55, current: 11, total: 20, message: "正在匹配内部制度条款" },
+					},
+				],
+			});
+			const rm = manager(stub);
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error("expected accepted");
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			// 先确认它确实被记住了,不然下面"清理后 undefined"的断言无法排除"从来没记住过"这个假阳性。
+			expect(rm.progressOf(outcome.runId)).toBeDefined();
+
+			stub.resolveNow();
+			await outcome.completion;
+
+			expect(rm.progressOf(outcome.runId)).toBeUndefined();
+		});
+	});
 });

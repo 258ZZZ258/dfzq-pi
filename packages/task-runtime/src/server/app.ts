@@ -98,6 +98,9 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			// 不为此收窄 schema —— options 是给下游 audit-ai 的透传位,收窄会让将来加一个
 			// 查询层字段变成一次 HTTP 层改动。
 			options: body.options as RunOptions | undefined,
+			// 与 filters 同款:**原样**下传,不补默认值 —— payload_json 是事后审计
+			// 「这个 run 当时拿到的任务输入是什么」的唯一凭证。
+			payload: body.payload,
 		});
 
 		if (outcome.kind === "rejected") {

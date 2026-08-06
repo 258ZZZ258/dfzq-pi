@@ -73,6 +73,8 @@ export type RuntimeFactory = (input: {
 	runId: string;
 	filters: RunFilters;
 	options: RunOptions;
+	/** 结构化任务输入,原样透传(不补默认值),见 SubmitRequest.payload 的注释。 */
+	payload?: Record<string, unknown>;
 }) => Promise<Runtime>;
 
 export interface SubmitRequest {
@@ -88,6 +90,12 @@ export interface SubmitRequest {
 	 */
 	filters: RunFilters;
 	options?: RunOptions;
+	/**
+	 * 结构化任务输入(如「制度比对」的外规 objectKey/uploadId/filename)。**结构化** ——
+	 * stringify 归本类做,与 filters 同一条纪律,理由同上一条注释。可缺省:`policy-query`
+	 * 等不需要结构化输入的 taskKind 不传,存档列随之缺省为 undefined,不补 "{}"。
+	 */
+	payload?: Record<string, unknown>;
 }
 
 export type SubmitOutcome =
@@ -198,6 +206,7 @@ export class RunManager {
 			sessionId: req.sessionId,
 			filtersJson: JSON.stringify(req.filters),
 			optionsJson: req.options ? JSON.stringify(req.options) : undefined,
+			payloadJson: req.payload === undefined ? undefined : JSON.stringify(req.payload),
 			input: req.input,
 			createdAt: this.now(),
 		});
@@ -276,6 +285,9 @@ export class RunManager {
 				filters: req.filters,
 				// 空对象而非 undefined:让下游解构 options.topK 时少一条判空分支。
 				options: req.options ?? {},
+				// 与 filters/options 不同:这里原样传 req.payload(可能是 undefined),不补 {} ——
+				// 装配期的 parseCoveragePayload 等校验要能分清「没传 payload」与「传了空对象」。
+				payload: req.payload,
 			});
 		} catch (error) {
 			// 装配期失败要早、要响亮,且必须还回令牌 —— 否则一次装配失败永久占额。

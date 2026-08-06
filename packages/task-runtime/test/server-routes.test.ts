@@ -165,6 +165,49 @@ describe("POST /runs", () => {
 		expect(JSON.parse(store.findByRunId(runId)?.filtersJson ?? "{}")).toEqual(filters);
 	});
 
+	describe("payload 输入位(规格 §7.1)", () => {
+		it("接受 payload 并原样落库(嵌套结构 + null 值)", async () => {
+			const { hono } = app();
+			const payload = { external: { objectKey: "k", uploadId: "U1", filename: "f", meta: { ocr: null } } };
+			const res = await hono.request(post(submitBody({ payload, waitMs: 5000 })));
+			expect([200, 202]).toContain(res.status);
+			const { runId } = (await res.json()) as { runId: string };
+			expect(JSON.parse(store.findByRunId(runId)?.payloadJson ?? "null")).toEqual(payload);
+		});
+
+		it("不传 payload 时该列为 undefined,不补默认值", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ waitMs: 5000 })));
+			const { runId } = (await res.json()) as { runId: string };
+			expect(store.findByRunId(runId)?.payloadJson).toBeUndefined();
+		});
+
+		it("payload 是字符串 → 422 invalid_body,不误报 missing_authorization_scope", async () => {
+			const { hono, stub } = app();
+			const res = await hono.request(post(submitBody({ payload: "不是对象" })));
+			expect(res.status).toBe(422);
+			const body = (await res.json()) as { error: { code: string } };
+			expect(body.error.code).toBe("invalid_body");
+			expect(body.error.code).not.toBe("missing_authorization_scope");
+			// A7 同款纪律:四档 fail-closed 里任何一档拒绝都不得起 run。
+			expect(stub.runCalls).toBe(0);
+		});
+
+		it("payload 是数组 → 422 invalid_body", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ payload: [1, 2, 3] })));
+			expect(res.status).toBe(422);
+			expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: "invalid_body" } });
+		});
+
+		it("payload 是 null → 422 invalid_body", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ payload: null })));
+			expect(res.status).toBe(422);
+			expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: "invalid_body" } });
+		});
+	});
+
 	describe("corpusTypes 的三档处置(规格 §2.5)", () => {
 		it("rejects audit_project with a code distinct from missing scope", async () => {
 			const { hono } = app();

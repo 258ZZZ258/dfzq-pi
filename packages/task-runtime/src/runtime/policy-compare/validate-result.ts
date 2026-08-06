@@ -47,11 +47,11 @@ export function validateCoverageResult(
 		}
 	}
 
-	// 反幻觉 3:核查条款数必须与阶段 2 的 total 一致
+	// 反幻觉 3:核查条款数必须与阶段 2 的实际处理条数一致
 	if (result.metrics.checked !== ctx.checkedCount) {
 		return {
 			ok: false,
-			detail: `metrics.checked=${result.metrics.checked} 与阶段 2 的 total=${ctx.checkedCount} 不符`,
+			detail: `metrics.checked=${result.metrics.checked} 与阶段 2 实际处理条数=${ctx.checkedCount} 不符`,
 		};
 	}
 

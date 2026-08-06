@@ -80,6 +80,15 @@ export interface Assembled {
 	 * 它只影响 system prompt 里的 `<available_skills>` 摘要)。
 	 */
 	resources: DefaultResourceLoader;
+	/**
+	 * 不经 agent loop 直接调本次装配的工具。与 `PluginContext.callTool` **是同一个函数**
+	 * (assemble() 内部只造一次),合成事件与未知工具名的响亮报错都一致。
+	 *
+	 * 🔴 与 `emitPluginToolEvent` 那条约束的关系:那条说的是「callTool 的结果不得进 C6 的
+	 * clauseIds」,针对的是**插件探针**。确定性工作流不同 —— 代码取回并拼进模型 prompt 的
+	 * 就是模型的证据,所以工作流**必须自己维护证据集合**,只收真正拼进 prompt 的那批。
+	 */
+	callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 	dispose: () => Promise<void>;
 }
 
@@ -267,6 +276,7 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			session,
 			specId: spec.id,
 			resources: resourceLoader,
+			callTool: pluginContext.callTool,
 			dispose: async () => {
 				session.dispose();
 				await disposeToolset();

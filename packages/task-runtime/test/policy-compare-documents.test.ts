@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createDocumentsClient } from "../src/runtime/policy-compare/documents-client.ts";
+import { buildProcessRequestBody, createDocumentsClient } from "../src/runtime/policy-compare/documents-client.ts";
 
 function fakeFetch(handler: (url: string, init: RequestInit) => Response): typeof fetch {
 	return (async (input: string | URL | Request, init?: RequestInit) =>
@@ -129,29 +129,34 @@ describe("createDocumentsClient", () => {
 		expect(seenUrl).toBe("http://ai.local/v1/documents:process");
 	});
 
-	it("corpusHint 缺省时 body 里不出现 corpus_hint 键", async () => {
-		let seenBody: unknown;
-		const client = createDocumentsClient({
-			baseUrl: "http://ai.local",
-			internalToken: "T",
-			fetchImpl: fakeFetch((_url, init) => {
-				seenBody = JSON.parse(String(init.body));
-				return new Response(
-					JSON.stringify({
-						upload_id: "U1",
-						artifact_key: "artifact/U1.json",
-						title: "某办法",
-						page_count: 12,
-						chunk_count: 34,
-						status: "ok",
-					}),
-					{ status: 200, headers: { "content-type": "application/json" } },
-				);
-			}),
+	it("buildProcessRequestBody: corpusHint 缺省时不包含 corpus_hint 键", () => {
+		const body = buildProcessRequestBody({
+			objectKey: "upload/U1/a.pdf",
+			uploadId: "U1",
+			filename: "a.pdf",
 		});
-		await client.process({ objectKey: "upload/U1/a.pdf", uploadId: "U1", filename: "a.pdf" });
-		expect(seenBody).toEqual({ object_key: "upload/U1/a.pdf", upload_id: "U1", filename: "a.pdf" });
-		expect(seenBody).not.toHaveProperty("corpus_hint");
+		expect("corpus_hint" in body).toBe(false);
+		expect(body).toEqual({
+			object_key: "upload/U1/a.pdf",
+			upload_id: "U1",
+			filename: "a.pdf",
+		});
+	});
+
+	it("buildProcessRequestBody: corpusHint 传入时包含 corpus_hint 键", () => {
+		const body = buildProcessRequestBody({
+			objectKey: "upload/U1/a.pdf",
+			uploadId: "U1",
+			filename: "a.pdf",
+			corpusHint: "external",
+		});
+		expect("corpus_hint" in body).toBe(true);
+		expect(body).toEqual({
+			object_key: "upload/U1/a.pdf",
+			upload_id: "U1",
+			filename: "a.pdf",
+			corpus_hint: "external",
+		});
 	});
 
 	it("title 非字符串时返回 null", async () => {
@@ -371,5 +376,14 @@ describe("createDocumentsClient", () => {
 			fetchImpl: fakeFetch(() => new Response("internal server error", { status: 500 })),
 		});
 		await expect(client.process(req)).rejects.toThrow(/500.*internal server error/);
+	});
+
+	it("2xx 但响应体不是合法 JSON 时抛错,message 含响应片段", async () => {
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch(() => new Response("not json{invalid", { status: 200 })),
+		});
+		await expect(client.process(req)).rejects.toThrow(/documents:process 响应不是合法 JSON:not json/);
 	});
 });

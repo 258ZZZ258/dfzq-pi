@@ -701,4 +701,73 @@ describe("run manager", () => {
 			});
 		});
 	});
+
+	describe("payload 透传(规格 §7.1)", () => {
+		it("hands payload to the runtime factory", async () => {
+			const seen: Array<Parameters<RuntimeFactory>[0]> = [];
+			const runtime = createStubRuntime();
+			const rm = new RunManager({
+				store,
+				gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 2 }),
+				runtimeFactory: async (input) => {
+					seen.push(input);
+					return runtime;
+				},
+				now: () => 1000,
+				newRunId: () => "run-1",
+			});
+
+			const payload = { external: { objectKey: "k", uploadId: "U1", filename: "f" } };
+			const outcome = await rm.submit(request({ payload }));
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			await outcome.completion;
+
+			expect(seen).toHaveLength(1);
+			expect(seen[0].payload).toEqual(payload);
+		});
+
+		it("does not default payload to an empty object when the caller omits it", async () => {
+			const seen: Array<Parameters<RuntimeFactory>[0]> = [];
+			const runtime = createStubRuntime();
+			const rm = new RunManager({
+				store,
+				gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 2 }),
+				runtimeFactory: async (input) => {
+					seen.push(input);
+					return runtime;
+				},
+				now: () => 1000,
+				newRunId: () => "run-1",
+			});
+
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			await outcome.completion;
+
+			// 与 options 不同:payload 不该被补成 {} —— 装配期的 parseCoveragePayload 等校验
+			// 要能分清「没传 payload」与「传了空对象」,不套用 options「缺省即空对象」那条纪律。
+			expect(seen[0].payload).toBeUndefined();
+		});
+
+		it("archives payload as JSON verbatim without asking the caller to stringify", async () => {
+			const rm = manager(createStubRuntime());
+			const payload = { external: { objectKey: "k", uploadId: "U1", filename: "f", meta: { ocr: null } } };
+			const outcome = await rm.submit(request({ payload }));
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			await outcome.completion;
+
+			const row = store.findByRunId(outcome.runId);
+			expect(JSON.parse(row?.payloadJson ?? "null")).toEqual(payload);
+		});
+
+		it("leaves payloadJson undefined when the caller omits payload", async () => {
+			const rm = manager(createStubRuntime());
+			const outcome = await rm.submit(request());
+			if (outcome.kind !== "accepted") throw new Error(`expected accepted, got ${outcome.kind}`);
+			await outcome.completion;
+
+			const row = store.findByRunId(outcome.runId);
+			expect(row?.payloadJson).toBeUndefined();
+		});
+	});
 });

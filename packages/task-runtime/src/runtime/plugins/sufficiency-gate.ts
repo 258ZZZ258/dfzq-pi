@@ -1,4 +1,5 @@
 import type { FinalJudge, JudgeContext, JudgeVerdict } from "../final-judge.ts";
+import { extractClauseIds, extractJsonBlock } from "../output-contract.ts";
 import type { PluginContext, PluginDescriptor } from "../plugin-registry.ts";
 
 export const SUFFICIENCY_GATE_PLUGIN_NAME = "sufficiency-gate";
@@ -12,8 +13,11 @@ export interface SufficiencyReport {
 /**
  * C1 的 assess_sufficiency 工具的 TS 侧签名。**由注册方注入**,插件不感知 MCP ——
  * 这样插件可以单测,C1 上线后也只需在 createDefaultPluginRegistry 的调用处接一根线。
+ *
+ * 第一个参数是 `basis[]` 引用的 clause_id(见 `extractBasisClauseIds`),不是本 run
+ * 检索到过的全部 clause_id。
  */
-export type AssessFn = (clauseIds: readonly string[], matters: readonly string[]) => Promise<SufficiencyReport>;
+export type AssessFn = (citedClauseIds: readonly string[], matters: readonly string[]) => Promise<SufficiencyReport>;
 
 export interface SufficiencyGateOptions {
 	maxProbes?: number;
@@ -33,7 +37,9 @@ export function extractMatters(input: string): string[] {
  *
  * ⚠ 字段名跟着 C1 走:那边刻意叫 `hit_count_sufficient` 而不是 `sufficient` ——
  * 底层 `assess()` 只做 `len(candidates) >= min_hits` 的计数,**不做语义判定**。
- * 真正有判定力的是 `unfetched`:检索到了却没取正文就下结论,是这个判官要拦的事。
+ * `unfetched` 的语义没变(检索到了却没取正文的那些);但有判定力的只是它与
+ * `basis` 引用的交集 ——「被引用了、却没取过正文就下结论」才是这个判官要拦的事,
+ * 检索到了却没打算引用的,不算。
  */
 interface AssessToolResult {
 	hit_count_sufficient?: boolean;
@@ -42,20 +48,41 @@ interface AssessToolResult {
 	fetched_count?: number;
 }
 
+/**
+ * 从最终助手文本里取 `basis[].clause_id`。
+ *
+ * C3 判据收窄靠它:旧判据是 `unfetched.length === 0`,要求把**检索到过的每一条**都取完正文
+ * —— `search_policy` 每次回 8 条、`enumerate_clauses` 回最多 50 条,实测不可满足
+ * (规格 §1.4:真 run `5a29d7bf` 连判两次不通过,最后靠 onExhausted:"pass" 放行,白花 42.3s)。
+ *
+ * 收窄后判的是「**被引用了、却没取过正文**」—— 那才是 system.md:12 那条纪律要拦的事
+ * (凭条款标题猜内容)。
+ *
+ * 解析不出 JSON / 没有 basis ⇒ 回 `[]` ⇒ 交集必空 ⇒ C3 放行。**这是有意的**:
+ * 那种输出的病是「不合契约」,在 C6 挂载时(spec 声明了 `outputContract`)归它判,
+ * 不该由 C3 用一个语义不对的理由拦下来。
+ *
+ * ⚠ 上面这段"跳过不合法元素"的抽取本身,与 `output-contract.ts` 的 `checkConditional`
+ * 共用同一份 `extractClauseIds` 实现:改 `extractClauseIds` 会同时影响 C6 与本判官。
+ */
+export function extractBasisClauseIds(assistantText: string): string[] {
+	const extracted = extractJsonBlock(assistantText);
+	if (extracted.kind !== "ok") return [];
+	const basis = (extracted.value as { basis?: unknown }).basis;
+	if (!Array.isArray(basis)) return [];
+	return extractClauseIds(basis);
+}
+
 /** 缺省实现:走 per-run 的 MCP 会话调 C1。注入版保留作测试缝。 */
 function assessViaTool(ctx: PluginContext): AssessFn {
-	return async (_clauseIds, matters) => {
+	return async (citedClauseIds, matters) => {
 		const raw = (await ctx.callTool("assess_sufficiency", { matters: [...matters] })) as AssessToolResult;
-		const fetchedCount = typeof raw?.fetched_count === "number" ? raw.fetched_count : 0;
-		const hitCountSufficient = raw?.hit_count_sufficient === true;
-		return {
-			// 已取到至少一条正文且检索命中达标，就允许模型基于实际引用收束。不能要求把
-			// 每轮宽召回的所有候选都逐一回查：后续检索会持续扩张 unfetched，终局判官会
-			// 反复 reprompt 而永不结束。C6 仍会校验最终 basis 的每个 clause_id 都来自检索。
-			sufficient: hitCountSufficient && fetchedCount > 0,
-			covered: [],
-			missing: Array.isArray(raw?.unfetched) && fetchedCount === 0 ? raw.unfetched : [],
-		};
+		const unfetched = Array.isArray(raw?.unfetched) ? raw.unfetched : [];
+		// 收窄:只留「被 basis 引用了、却在 unfetched 里」的那些。跨仓零改动 ——
+		// C1 的 assess_sufficiency 返回体不变,交集在本层求。
+		const cited = new Set(citedClauseIds);
+		const missing = unfetched.filter((id) => cited.has(id));
+		return { sufficient: missing.length === 0, covered: [], missing };
 	};
 }
 
@@ -80,7 +107,7 @@ export function createSufficiencyGateDescriptor(assess?: AssessFn): PluginDescri
 						options.matters === undefined || options.matters === "auto"
 							? extractMatters(ctx.getRunInput())
 							: options.matters;
-					const report = await runAssess(context.clauseIds, matters);
+					const report = await runAssess(extractBasisClauseIds(context.lastAssistantText), matters);
 					if (report.sufficient) return { ok: true };
 					return {
 						ok: false,

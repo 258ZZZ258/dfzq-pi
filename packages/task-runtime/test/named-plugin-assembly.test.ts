@@ -166,7 +166,16 @@ describe("named plugin assembly (风险 12)", () => {
 		// 下面调用 judge() 并断言 assess 真的被我们传入的函数处理,才是不可伪造的那部分。
 		expect(gate.maxAttempts).toBe(2);
 		expect(gate.onExhausted).toBe("pass");
-		const verdict = await gate.judge({ lastAssistantText: "", clauseIds: ["A-1"] });
+		// C3 判据收窄后,judge() 的第一个参数不再是 context.clauseIds,而是从
+		// lastAssistantText 的 basis[] 里抽出来的 clause_id(extractBasisClauseIds)——
+		// 这里的 lastAssistantText 因此要真的引用 "A-1",不能再是空串。clauseIds 多写一个
+		// "A-2"(basis 没引用它)使其成为 basis 引用集合的真超集:若下面 toHaveBeenCalledWith
+		// 只断言 ["A-1"] 却仍从 context.clauseIds 取值,会收到 ["A-1","A-2"] 而不匹配 ——
+		// 这样这条测试才真的钉住了参数来源换了,不是恰好两边同值蒙混过关。
+		const verdict = await gate.judge({
+			lastAssistantText: '```json\n{"basis":[{"clause_id":"A-1"}]}\n```',
+			clauseIds: ["A-1", "A-2"],
+		});
 		expect(verdict).toEqual({ ok: true });
 		// 装配时传入的 assess 函数被真实调用,且 matters:"auto" 真的从我们的 ctx.getRunInput()
 		// 抽取(而不是某个别的默认输入)——这证明 assemble() 把 fixture 的 options 与我们的

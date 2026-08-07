@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import type { FinalJudge } from "../src/runtime/final-judge.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
-import { createSufficiencyGateDescriptor, extractMatters } from "../src/runtime/plugins/sufficiency-gate.ts";
+import {
+	createSufficiencyGateDescriptor,
+	extractBasisClauseIds,
+	extractMatters,
+} from "../src/runtime/plugins/sufficiency-gate.ts";
 
 function makeContext(judges: FinalJudge[], runInput = "问题正文"): PluginContext {
 	return {
@@ -73,11 +77,20 @@ describe("sufficiency-gate", () => {
 		}
 	});
 
-	it("passes the run's clause ids and the resolved matters to assess", async () => {
+	// C3 判据收窄后,第一个参数不再是 context.clauseIds,而是 basis[] 引用的 clause_id
+	// (见 extractBasisClauseIds)—— 这条钉住调用点确实换了参数来源,不是还在传 clauseIds。
+	// clauseIds 必须是 basis 引用集合的**真超集**(多一个 "A-3"):若调用点退回
+	// context.clauseIds,assess 会收到三个 id,与下面断言的两个不等 ⇒ 翻红。
+	// 用真超集是关键 —— 此前 clauseIds 与 basis 引用的 id 完全相同,两种参数来源产出的
+	// 断言都成立,变异回 context.clauseIds 这条测试照样绿,钉不住调用点。
+	it("passes the basis-cited clause ids and the resolved matters to assess", async () => {
 		const judges: FinalJudge[] = [];
 		const assess = vi.fn(async () => ({ sufficient: true, covered: [], missing: [] }));
 		createSufficiencyGateDescriptor(assess).factory(makeContext(judges), { matters: ["合规性"] });
-		await judges[0]!.judge({ lastAssistantText: "结论", clauseIds: ["A-1", "A-2"] });
+		await judges[0]!.judge({
+			lastAssistantText: '```json\n{"basis":[{"clause_id":"A-1"},{"clause_id":"A-2"}]}\n```',
+			clauseIds: ["A-1", "A-2", "A-3"],
+		});
 		expect(assess).toHaveBeenCalledWith(["A-1", "A-2"], ["合规性"]);
 	});
 
@@ -148,20 +161,29 @@ describe("assessViaTool 的判定依据(C3 改语义后的核心)", () => {
 		return { judge: judges[0], calls };
 	}
 
-	const context = { clauseIds: ["a", "b"], lastText: "", attempt: 0 } as never;
+	// lastAssistantText 里的 basis 引用了 "a" 与 "b" —— C3 判据收窄后,判官只看
+	// citedClauseIds(从这里抽取)与 unfetched 的交集,不再直接看 clauseIds。
+	const context = {
+		clauseIds: ["a", "b"],
+		lastAssistantText: '```json\n{"basis":[{"clause_id":"a"},{"clause_id":"b"}]}\n```',
+	} as never;
 
-	it("passes once at least one retrieved clause has been fetched", async () => {
-		// 宽召回后会不断增加 unfetched；若要求全部取正文，终局重判会把模型推入无止境
-		// 的 search/detail 循环。至少一条真实正文 + C6 的引用白名单足以保证可追溯作答。
-		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2, fetched_count: 1 });
-		const verdict = await judge.judge(context);
-		expect(verdict.ok).toBe(true);
-	});
-
-	it("rejects when no retrieved clause has been fetched", async () => {
-		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2, fetched_count: 0 });
+	it("rejects when a cited clause was retrieved but never fetched, even if the count says sufficient", async () => {
+		// **这条是改语义的全部意义**:C1 的 hit_count_sufficient 只是 len(candidates)>=min_hits
+		// 的计数,底层 assess() 不做任何语义判定。真正有判定力的是 unfetched 与 basis 引用的
+		// 交集 ——「被引用了、却没取过正文就下结论」。拿计数当判据 = 这个判官形同虚设。
+		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2 });
 		const verdict = await judge.judge(context);
 		expect(verdict.ok).toBe(false);
+		// JudgeVerdict 是可辨识联合,ok:true 那支没有 followUp —— 先窄化再读。
+		if (verdict.ok) throw new Error("expected a rejection");
+		expect(verdict.followUp).toContain("a");
+	});
+
+	it("passes when everything retrieved has been fetched", async () => {
+		const { judge } = gateWith({ hit_count_sufficient: false, unfetched: [], retrieved_count: 2 });
+		const verdict = await judge.judge(context);
+		expect(verdict.ok).toBe(true);
 	});
 
 	it("calls C1's assess_sufficiency with the extracted matters", async () => {
@@ -173,8 +195,57 @@ describe("assessViaTool 的判定依据(C3 改语义后的核心)", () => {
 		expect(calls[0]?.args.matters).toEqual(["第一个待查要点", "第二个待查要点"]);
 	});
 
-	it("rejects a missing evidence report rather than treating it as sufficient", async () => {
+	it("treats a missing unfetched field as nothing outstanding rather than crashing", async () => {
 		const { judge } = gateWith({});
-		expect((await judge.judge(context)).ok).toBe(false);
+		expect((await judge.judge(context)).ok).toBe(true);
+	});
+});
+
+describe("extractBasisClauseIds", () => {
+	it("pulls clause_id out of a fenced contract JSON", () => {
+		const text = '```json\n{"conclusion":"x","basis":[{"clause_id":"A-1"},{"clause_id":"A-2"}]}\n```';
+		expect(extractBasisClauseIds(text)).toEqual(["A-1", "A-2"]);
+	});
+
+	it("returns [] when the text has no JSON block", () => {
+		expect(extractBasisClauseIds("就是一段大白话")).toEqual([]);
+	});
+
+	it("returns [] when basis is absent or not an array", () => {
+		expect(extractBasisClauseIds('```json\n{"conclusion":"x"}\n```')).toEqual([]);
+		expect(extractBasisClauseIds('```json\n{"basis":"nope"}\n```')).toEqual([]);
+	});
+
+	it("skips basis items whose clause_id is missing or not a string", () => {
+		const text = '```json\n{"basis":[{"clause_id":"A-1"},{},{"clause_id":7}]}\n```';
+		expect(extractBasisClauseIds(text)).toEqual(["A-1"]);
+	});
+});
+
+describe("sufficiency-gate 判据收窄", () => {
+	it("passes when unfetched ids are NOT cited in basis", async () => {
+		const judges: FinalJudge[] = [];
+		const ctx = makeContext(judges);
+		// C1 回「检索到 8 条、只取了 1 条正文」——旧判据必然判不足
+		ctx.callTool = async () => ({ unfetched: ["B-1", "B-2", "B-3"] });
+		createSufficiencyGateDescriptor().factory(ctx, {});
+		const verdict = await judges[0]!.judge({
+			lastAssistantText: '```json\n{"basis":[{"clause_id":"A-1"}]}\n```',
+			clauseIds: ["A-1", "B-1", "B-2", "B-3"],
+		});
+		expect(verdict.ok).toBe(true);
+	});
+
+	it("fails when an unfetched id IS cited in basis", async () => {
+		const judges: FinalJudge[] = [];
+		const ctx = makeContext(judges);
+		ctx.callTool = async () => ({ unfetched: ["B-1", "B-2"] });
+		createSufficiencyGateDescriptor().factory(ctx, {});
+		const verdict = await judges[0]!.judge({
+			lastAssistantText: '```json\n{"basis":[{"clause_id":"A-1"},{"clause_id":"B-2"}]}\n```',
+			clauseIds: ["A-1", "B-1", "B-2"],
+		});
+		expect(verdict.ok).toBe(false);
+		if (!verdict.ok) expect(verdict.followUp).toContain("B-2");
 	});
 });

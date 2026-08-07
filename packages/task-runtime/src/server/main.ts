@@ -4,6 +4,11 @@ import { type ServerType, serve } from "@hono/node-server";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
+import { createEscalatingRuntime } from "../runtime/escalating-runtime.ts";
+import { createFastPathRuntime } from "../runtime/fast-path-runtime.ts";
+import { createArtifactStore, createMinioObjectGetter } from "../runtime/policy-compare/artifact-store.ts";
+import { createDocumentsClient } from "../runtime/policy-compare/documents-client.ts";
+import { createPolicyCompareRuntime } from "../runtime/policy-compare/runtime.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
@@ -184,33 +189,141 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 
 	// ⚠ run 的 options 必须改名:外层 `options` 是 DefaultFactoryOptions(含 workRoot),
 	// 同名解构会把它遮蔽掉,下面的 join(options.workRoot, ...) 会解析到错的目录。
-	return async ({ specId, sessionId, runId, filters, options: runOptions }) => {
+	return async ({ specId, sessionId, runId, filters, options: runOptions, payload }) => {
 		const spec = specFiles.get(specId);
 		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
 
-		const toolsets = new ToolsetRegistry();
-		toolsets.register(
-			spec.toolset,
-			createMcpToolset(spec.mcpServers ?? [], {
-				runId,
-				// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
-				// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
-				permTags: filters.permTags ?? [],
-				corpusTypes: filters.corpusTypes,
-				options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
-			}),
-		);
+		// 🔴 每次调用都新建一个 ToolsetRegistry。ToolsetRegistry **必须按 run 新建**
+		// (toolsets/registry.ts 的类注释)。两阶段各调一次这个闭包 —— 不共用 MCP 会话正是
+		// 规格 D-5。⚠ 会炸的不是"把同一个 registry 实例传给两个 runtime"本身(`register` 只
+		// 调一次、`assemble()` 只调 `resolve()`,`createMcpToolset` 的 provider 每次
+		// `resolve()` 都重新 spawn 一整套子进程,registry 自己不追踪句柄,复用同一实例反而
+		// 无害);真正会炸的是**这个闭包自己**如果被改成复用同一个 registry 实例、却仍然在
+		// 每次调用里执行 `register(...)`——那样第二次调用会在一个已经登记过 `spec.toolset`
+		// 的实例上再登记一次,直接抛 `Toolset "policy-query" is already registered`。
+		const buildToolsets = (): ToolsetRegistry => {
+			const registry = new ToolsetRegistry();
+			registry.register(
+				spec.toolset,
+				createMcpToolset(spec.mcpServers ?? [], {
+					runId,
+					// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
+					// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
+					permTags: filters.permTags ?? [],
+					corpusTypes: filters.corpusTypes,
+					options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
+				}),
+			);
+			return registry;
+		};
 
 		const workdir = join(options.workRoot, sessionId);
-		return createSessionRuntime({
+
+		// 🔴 分派顺序:`workflow` 排在 `fastPath` 之前。前者整条换掉 Runtime 实现(连
+		// SessionRuntime 都不经过),后者是 SessionRuntime 内部把模型调用压成固定 2 次 ——
+		// 外层的先判。两者同时声明已由 validateSpec 在装配期拒掉,这里不会同时命中。
+		if (spec.workflow === "policy-compare") {
+			// 确定性工作流:模型不编排,工具由代码经 Assembled.callTool 发起。
+			// 三个外部依赖走 env —— 凭证绝不入库,缺任何一个都在这里 fail-closed。
+			// batchSize 不在 RunOptions 类型上(run-manager.ts 的注释:该接口刻意不收窄,
+			// 加字段不该变成一次 HTTP 层改动)—— 与 app.ts 的 `body.options as RunOptions`
+			// 同一条纪律,在读取处窄化,不去反过来给 RunOptions 加一个只有本工作流用得到的字段。
+			// 存在但不是数字 → 响亮拒绝,不是悄悄落回默认值:与本工作流其余每一处 fail-loud
+			// 姿态一致(env 缺失即拒绝启动、未知 workflow 取值即抛、payload.outputTypes 非全选
+			// 即 422)。静默吞掉反而会掩盖 createPolicyCompareRuntime 自己对 batchSize 的
+			// 1..MAX_BATCH_SIZE 整数校验——那道校验只在值到达之后才有意义。
+			const rawBatchSize = parseBatchSizeOption((runOptions as { batchSize?: unknown }).batchSize);
+			const baseUrl = requireEnv("AUDIT_AI_BASE_URL");
+			const internalToken = requireEnv("AUDIT_AI_INTERNAL_TOKEN");
+			const bucket = requireEnv("DFZQ_UPLOADS_BUCKET");
+			return createPolicyCompareRuntime({
+				spec,
+				profile,
+				registry: plugins,
+				// speedup 分支把 toolset 创建重构成了工厂(快路径与升级路径各需一份独立实例,
+				// 见 buildToolsets 上方注释)。本工作流一个 run 只装配一次,调一次即可。
+				toolsets: buildToolsets(),
+				cwd: join(workdir, "workspace"),
+				agentDir: join(workdir, "agent"),
+				outputContractSchema: outputContractSchemas.get(specId),
+				payload,
+				documents: createDocumentsClient({ baseUrl, internalToken }),
+				artifacts: createArtifactStore({
+					bucket,
+					get: createMinioObjectGetter({
+						endPoint: requireEnv("DFZQ_MINIO_ENDPOINT"),
+						port: process.env.DFZQ_MINIO_PORT ? Number(process.env.DFZQ_MINIO_PORT) : undefined,
+						useSSL: process.env.DFZQ_MINIO_USE_SSL === "1",
+						accessKey: requireEnv("DFZQ_MINIO_ACCESS_KEY"),
+						secretKey: requireEnv("DFZQ_MINIO_SECRET_KEY"),
+					}),
+				}),
+				batchSize: rawBatchSize,
+				skillPaths: skillPaths.get(specId),
+			});
+		}
+
+		const buildFull = () =>
+			createSessionRuntime({
+				spec,
+				profile,
+				registry: plugins,
+				toolsets: buildToolsets(),
+				cwd: join(workdir, "workspace"),
+				agentDir: join(workdir, "agent"),
+				outputContractSchema: outputContractSchemas.get(specId),
+				skillPaths: skillPaths.get(specId),
+			});
+
+		if (!spec.fastPath?.enabled) return buildFull();
+
+		const fast = await createFastPathRuntime({
 			spec,
 			profile,
 			registry: plugins,
-			toolsets,
-			cwd: join(workdir, "workspace"),
-			agentDir: join(workdir, "agent"),
+			toolsets: buildToolsets(),
+			cwd: join(workdir, "fast", "workspace"),
+			agentDir: join(workdir, "fast", "agent"),
 			outputContractSchema: outputContractSchemas.get(specId),
-			skillPaths: skillPaths.get(specId),
+			// 🔴 阶段 1 刻意不传 skillPaths(2026-08-04 复审 I-2,协调者裁定):deriveFastSpec
+			// 没摘 spec.skills。pi 的 buildSystemPrompt(coding-agent/src/core/system-prompt.ts)
+			// 只在 selectedTools 包含 "read" 时才会把 additionalSkillPaths 拼成
+			// <available_skills> 常驻进 system prompt(这道闸门的实测复现见
+			// test/policy-query-spec.test.ts 的 "demonstrates the skills→'confidence' leak
+			// mechanism..." 用例)——
+			// policy-query 的 spec.tools 是固定的 5 个领域工具,今天两个阶段都不含 "read",
+			// 所以传不传 skillPaths 眼下不改变阶段 1 装配出的 system prompt。这里仍然不传,
+			// 理由是防御性的,不是在堵一个正在发生的泄漏:阶段 1 执行了
+			// `setActiveToolsByName([])`,模型没有任何工具,skillPaths 对它没有用处;而
+			// evidence-standard.md 的 description 里本身就含 "confidence" 一词,一旦这个
+			// taskKind 的工具白名单将来加入 "read"(或这套两阶段模式被复用到别的、真的会给
+			// "read" 的 spec 上),同一处代码会立刻从"无影响"变成"confidence 真的泄漏进两次
+			// 模型调用共用的 system prompt"——硬约束 5 要求的是输出契约措辞只能待在
+			// answerPrompt 里,不能进两次调用共用的 system prompt。阶段 2(下面的
+			// buildFull)照旧传 skillPaths,行为不变。
 		});
+		// createFull 惰性 —— 不升级就一次都不调,不起第二个 MCP 子进程。
+		return createEscalatingRuntime({ fast, createFull: buildFull });
 	};
+}
+
+/** env 缺失即抛。工作流的外部依赖没有「跑起来再说」的降级路径。 */
+function requireEnv(name: string): string {
+	const value = process.env[name];
+	if (!value) throw new Error(`环境变量 ${name} 未配置 —— 制度比对工作流拒绝启动(fail-closed)`);
+	return value;
+}
+
+/**
+ * `RunOptions.batchSize` 的窄化 + fail-loud 校验。缺省(`undefined`)放行,交给
+ * `createPolicyCompareRuntime` 自己的默认值(`DEFAULT_BATCH_SIZE`);存在但不是数字就在这里
+ * 响亮拒绝,不悄悄落回默认值——静默吞掉会掩盖下游对 batchSize 的 1..MAX_BATCH_SIZE 整数校验,
+ * 那道校验只有在值真的到达之后才有意义。
+ */
+function parseBatchSizeOption(raw: unknown): number | undefined {
+	if (raw === undefined) return undefined;
+	if (typeof raw !== "number") {
+		throw new Error(`options.batchSize 必须是数字(收到:${JSON.stringify(raw)})`);
+	}
+	return raw;
 }

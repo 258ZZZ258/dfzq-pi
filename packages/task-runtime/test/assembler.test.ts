@@ -713,6 +713,23 @@ describe("PluginContext.callTool(C3 接线)", () => {
 		expect(thrown?.message).toMatch(/no-such-tool/);
 		expect(thrown?.message).toMatch(/does not provide/);
 	});
+
+	it("exposes callTool on the assembled result", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const assembled = await assemble({
+			spec: spec(),
+			profile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: toolsets(),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			pluginContext: pluginContext(),
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		cleanups.push(assembled.dispose);
+		await expect(assembled.callTool("echo", { text: "hi" })).resolves.toBeDefined();
+	});
 });
 
 describe("C7:spec 声明的 skill 注入", () => {
@@ -753,5 +770,53 @@ describe("C7:spec 声明的 skill 注入", () => {
 		// 对照组:没有这条,上面那条无法排除「底座本来就在加载磁盘 skill」。
 		const assembled = await assembleWithSkills(undefined);
 		expect(assembled.resources.getSkills().skills).toHaveLength(0);
+	});
+});
+
+describe("Assembled.callTool", () => {
+	it("直接调本次装配的工具,不经 agent loop", async () => {
+		const harness = await createFauxHarness();
+		const registry = new ToolsetRegistry();
+		const calls: Array<Record<string, unknown>> = [];
+		registry.register("t", async () => [
+			{
+				name: "echo",
+				label: "echo",
+				description: "faux",
+				parameters: Type.Object({ v: Type.String() }),
+				execute: async (_id: string, params: Record<string, unknown>) => {
+					calls.push(params);
+					const payload = JSON.stringify({ got: params.v });
+					return { output: payload, content: payload };
+				},
+			} as never,
+		]);
+		const assembled = await assemble({
+			spec: {
+				id: "x",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["echo"],
+				limits: { maxTurns: 1 },
+			},
+			profile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: registry,
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			pluginContext: {
+				getRunId: () => "r1",
+				getSession: () => assembled.session,
+				abort: () => {},
+				limitState: { turns: 0 },
+				registerFinalJudge: () => {},
+				getRunInput: () => "",
+			},
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		await expect(assembled.callTool("echo", { v: "hi" })).resolves.toEqual({ got: "hi" });
+		expect(calls).toEqual([{ v: "hi" }]);
+		await assembled.dispose();
+		await harness.cleanup();
 	});
 });

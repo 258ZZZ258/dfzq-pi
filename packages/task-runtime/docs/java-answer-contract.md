@@ -226,3 +226,67 @@ Java 侧使用建议:可以展示,但不要用它做排序 / 筛选 / 阈值判�
 **不建议 Java 自己解析 `output`。** 需要结构化数据时用 `answer`(`status === "completed"` 时优先读它);
 `output` 的用途是留痕与排障 —— 比如 `status === "error"` 时配合 `errorMessage` 定位 C6 具体因为哪条规则拒绝
 了这次输出。
+
+---
+
+## 8. 快路径与升级(两阶段)
+
+`policy-query` 的 spec 可以声明 `fastPath`(`specs/policy-query.json` 的 `fastPath` 字段)。声明且启用后,
+这个 taskKind 的 run 会先走一条确定性快路径(模型调用固定 2 次,模型看不到工具,检索由代码代为发起);快
+路径产出不达标时,自动升级到既有的 agent 自主编排路径重新跑一遍。"不达标"覆盖:契约校验不过(含反幻觉
+校验 —— `basis[].clause_id` 引用了本次检索未命中过的条款)、`finish_reason` 不是 `"stop"`(即
+`"refused"`)、`confidence` 是 `"low"`、检索没拿到可用结果,或阶段 1 本身超时/撞限额/抛错。
+**正常升级过程对 Java 透明** —— 从 HTTP 契约的角度看不出区别,一个 `runId`、一个终态,响应体形状与 §2
+完全一致;唯一不同的是下表几个字段的取值口径。**取消(`POST /runs/:runId/cancel`)是这条透明性的例外**,
+见下面单独一段。
+
+| 字段 | 未升级(快路径直接收下) | 升级过(快路径 → agent 重跑) |
+|---|---|---|
+| `runId` | 一个 | 同一个,两阶段共用 |
+| `status` / `output` / `answer` | 快路径这一阶段产出的 | agent 重跑那一阶段(阶段 2)产出的。**快路径阶段的输出到此为止,不会出现在 `output` 或 `answer` 里** |
+| `turns` | 快路径的轮次 | **两阶段之和** |
+| `usage` | 快路径这一次的用量 | **两阶段之和**(`input`/`output`/`cacheRead`/`cacheWrite`/`total`/`cost` 逐字段相加) |
+
+⇒ **不要用 `turns` 反推模型调用了几次** —— 升级过的 run 里它是两段相加,不是单一阶段的轮次。`turns`
+与 `usage` 在终态 200 响应体的四条落地路径上(§2 `judgeAttempts` 一节列的同一组四条:`POST /runs`
+的幂等分支、等待窗口超时后查库、`waitMs` 内同步完成、`GET /runs/:runId`)取值一致 —— 它们随
+`RunResult` 一起落库(`usage_json`/`turns` 字段),四条出口读到的是同一份值。
+
+**`durationMs` 不适用上面这条一致性,单独说明**:`RunResult.durationMs` 本身**不落库**。四条出口里
+只有"`waitMs` 内同步完成"这一条直接返回内存里现算的 `RunResult`,这时 `durationMs` 才是升级过的 run
+的两阶段之和;其余三条出口都是从落库行重建,读到的 `durationMs` 是 `finished_at - started_at` 的挂钟
+差值 —— **不是两阶段之和,数值还会更大**(升级发生时,装配阶段 2、含起第二个 MCP 子进程的耗时,落在
+这段挂钟差值里,却不计入两阶段各自内部统计的"之和")。而 §1 已经指出:`policy-query` 的
+`runTimeoutMs` 是 900 秒,远超 `waitMs` 的上限(30 秒),长 run 必然先拿到 202、之后靠轮询
+`GET /runs/:runId` 拿终态 —— 也就是说 `policy-query` 的**主路径**,拿到的正是这个挂钟差值,不是
+"两阶段之和"。**Java 侧不要假设 `durationMs` 精确等于两次模型调用各自耗时相加**,它的准确语义取决于
+这次终态是从哪一条出口拿到的(见 §2)。
+
+**取消:`POST /runs/:runId/cancel`,本文档第一次带到的第三个端点。** 文档开头声明的适用范围只列了
+`POST /runs` 与 `GET /runs/:runId`,§1 的三态表也不包含这个端点——它单独在这里说明,不套用 §1 那张表。
+
+这个端点本身有三种响应(`server/app.ts`):`202`(取消意图已受理;**不是终态**,不代表 run 已经停,真正
+的终态仍然要靠轮询 `GET /runs/:runId` 拿,与 §1 末尾"轮询逻辑"那条一般规则一致)、`409`
+(`errorBody("already_terminal", ...)`,run 已经到达终态,取消没有意义)、`404`
+(`errorBody("not_found", ...)`,通常是 runId 不存在)。下面只讨论 `202` 之后 run 最终会落到什么终态。
+
+若这次 cancel 落在快路径阶段,**且快路径最终没有独立产出一份通过校验的答案**(即 `verdict.accept` 仍是
+`false`——这是最常见的情形,因为 `session.abort()` 打断的正是模型调用或检索本身,含快路径已经判定要
+升级、但阶段 2 还没真正开始跑这段窗口),run 不会再去起 agent 路径重跑一遍 —— 终态 `status` 直接是
+`"aborted"`(`server/run-manager.ts` 的 `finishAsAborted` 与 `runtime/session-runtime.ts` 的
+`classify()` 用的是同一个值代表用户取消;不会是 `"limit_exceeded"` —— 那个值专指限额/超时,两者不
+混用);这种情形下 `turns`/`usage` 只反映快路径这一阶段已经花掉的部分,不会有阶段 2 的贡献(阶段 2
+从未真正跑起来)。
+
+**但这不是无条件的。** 如果 cancel 恰好在快路径已经吐出一份完整、通过校验的答案(`verdict.accept` 为
+`true`)之后才生效——两者可能在极窄的时间窗口内竞速,`session.abort()` 打断时模型②有可能已经把完整
+JSON 吐完了——run 仍然按"收下即止"的既有规则以 `status:"completed"` 收尾、`answer` 照常出现在响应体
+里,**不会**因为外部另有一次 `abort()` 调用就被推翻成 `"aborted"`。
+
+若 cancel 落在阶段 2 已经在跑之后(即已经升级、agent 路径正在执行),`turns`/`usage` 仍是上表说的两阶段
+之和 —— 阶段 2 只是被提前打断,不是没跑过;这种情形的终态 `status` 同样是 `"aborted"`,来自阶段 2 自身
+的落地逻辑(与不带快路径时 cancel 一个正在跑的 run 是同一条路径,不是本节新增的行为)。
+
+现状:出厂 spec(`specs/policy-query.json`)的 `fastPath.enabled` 是 `false`,本节描述的两阶段行为目前不会
+发生。`enabled` 本身也不是响应体的字段、不出现在 Java 收到的任何响应里 —— Java 不需要感知这个开关的状
+态,也不需要区分"这次 run 走没走快路径";§2 的字段清单与本节的取值口径对两种情形都成立。

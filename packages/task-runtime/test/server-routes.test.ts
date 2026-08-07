@@ -165,6 +165,49 @@ describe("POST /runs", () => {
 		expect(JSON.parse(store.findByRunId(runId)?.filtersJson ?? "{}")).toEqual(filters);
 	});
 
+	describe("payload 输入位(规格 §7.1)", () => {
+		it("接受 payload 并原样落库(嵌套结构 + null 值)", async () => {
+			const { hono } = app();
+			const payload = { external: { objectKey: "k", uploadId: "U1", filename: "f", meta: { ocr: null } } };
+			const res = await hono.request(post(submitBody({ payload, waitMs: 5000 })));
+			expect([200, 202]).toContain(res.status);
+			const { runId } = (await res.json()) as { runId: string };
+			expect(JSON.parse(store.findByRunId(runId)?.payloadJson ?? "null")).toEqual(payload);
+		});
+
+		it("不传 payload 时该列为 undefined,不补默认值", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ waitMs: 5000 })));
+			const { runId } = (await res.json()) as { runId: string };
+			expect(store.findByRunId(runId)?.payloadJson).toBeUndefined();
+		});
+
+		it("payload 是字符串 → 422 invalid_body,不误报 missing_authorization_scope", async () => {
+			const { hono, stub } = app();
+			const res = await hono.request(post(submitBody({ payload: "不是对象" })));
+			expect(res.status).toBe(422);
+			const body = (await res.json()) as { error: { code: string } };
+			expect(body.error.code).toBe("invalid_body");
+			expect(body.error.code).not.toBe("missing_authorization_scope");
+			// A7 同款纪律:四档 fail-closed 里任何一档拒绝都不得起 run。
+			expect(stub.runCalls).toBe(0);
+		});
+
+		it("payload 是数组 → 422 invalid_body", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ payload: [1, 2, 3] })));
+			expect(res.status).toBe(422);
+			expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: "invalid_body" } });
+		});
+
+		it("payload 是 null → 422 invalid_body", async () => {
+			const { hono } = app();
+			const res = await hono.request(post(submitBody({ payload: null })));
+			expect(res.status).toBe(422);
+			expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: "invalid_body" } });
+		});
+	});
+
 	describe("corpusTypes 的三档处置(规格 §2.5)", () => {
 		it("rejects audit_project with a code distinct from missing scope", async () => {
 			const { hono } = app();
@@ -245,6 +288,127 @@ describe("GET /runs/{runId}", () => {
 		const { hono } = app();
 		const res = await hono.request(new Request("http://local/runs/nope", { headers: { "x-internal-token": TOKEN } }));
 		expect(res.status).toBe(404);
+	});
+
+	describe("progress 响应位(规格 §7.2,Task 11)", () => {
+		it("returns progress for an in-flight run, taken from the most recent compare_stage event", async () => {
+			const { hono, stub } = app({
+				hang: true,
+				events: [
+					{
+						type: "compare_stage",
+						payload: { stage: "matching", percent: 55, current: 11, total: 20, message: "正在匹配内部制度条款" },
+					},
+				],
+			});
+			const { runId } = (await (await hono.request(post(submitBody({ waitMs: 0 })))).json()) as { runId: string };
+			const res = await hono.request(
+				new Request(`http://local/runs/${runId}`, { headers: { "x-internal-token": TOKEN } }),
+			);
+			const body = (await res.json()) as { status: string; progress?: unknown };
+			expect(body.status).toBe("running");
+			expect(body.progress).toEqual({
+				stage: "matching",
+				percent: 55,
+				current: 11,
+				total: 20,
+				message: "正在匹配内部制度条款",
+			});
+			stub.resolveNow();
+		});
+
+		it("keeps the most recent compare_stage event when several arrive during the same run, not the first", async () => {
+			const { hono, stub } = app({
+				hang: true,
+				events: [
+					{
+						type: "compare_stage",
+						payload: { stage: "extracting", percent: 10, current: 1, total: 20, message: "first" },
+					},
+					{
+						type: "compare_stage",
+						payload: { stage: "matching", percent: 40, current: 8, total: 20, message: "second" },
+					},
+					{
+						type: "compare_stage",
+						payload: { stage: "judging", percent: 70, current: 14, total: 20, message: "third" },
+					},
+				],
+			});
+			const { runId } = (await (await hono.request(post(submitBody({ waitMs: 0 })))).json()) as { runId: string };
+			const res = await hono.request(
+				new Request(`http://local/runs/${runId}`, { headers: { "x-internal-token": TOKEN } }),
+			);
+			const body = (await res.json()) as { progress?: { message: string } };
+			expect(body.progress?.message).toBe("third");
+			stub.resolveNow();
+		});
+
+		it("omits the progress field entirely when no compare_stage event has arrived yet", async () => {
+			const { hono, stub } = app({ hang: true });
+			const { runId } = (await (await hono.request(post(submitBody({ waitMs: 0 })))).json()) as { runId: string };
+			const res = await hono.request(
+				new Request(`http://local/runs/${runId}`, { headers: { "x-internal-token": TOKEN } }),
+			);
+			// 不用 toBeUndefined():那个对"键存在但值为 undefined"也会通过,隔着 res.json() 一样
+			// 测不出差别(同款纪律见本文件"output 不含 JSON 时缺省 answer 而不抛"用例的注释)。
+			expect(await res.json()).not.toHaveProperty("progress");
+			stub.resolveNow();
+		});
+
+		it("does not surface progress on a terminal response, even when the store row flips to terminal while progress is still populated in memory", async () => {
+			// 复刻本文件"出口 2"用例(Java 应答适配 describe 块)的手法:runtimeFactory 里手动
+			// setTimeout 直接 store.finish(),制造"行已终态,但 runtime 本身仍在挂起、RunManager
+			// 自己的 drive() 还没走到 finally 去清理 progress"这个窗口 —— 专门钉住 app.ts
+			// 「isTerminal 判定必须先于 progress 附加」这条顺序。这条不依赖 RunManager 自身的
+			// progress 清理是否正确(清理逻辑由 run-manager.test.ts 的用例独立钉);如果不这样构造,
+			// 单靠"正常完成后再 GET"是测不出这条顺序的 —— 那时 progress 早已被清理,
+			// 一个把 progress 判断错放在 isTerminal 判断之前的实现同样会通过。
+			const runtimeFactory = async ({ runId }: { runId: string }) => {
+				setTimeout(() => {
+					store.finish(
+						runId,
+						{
+							runId,
+							specId: SPEC.id,
+							status: "completed",
+							output: "stub output",
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+							turns: 1,
+							durationMs: 1,
+							judgeAttempts: {},
+						},
+						Date.now(),
+					);
+				}, 10);
+				return createStubRuntime({
+					hang: true,
+					events: [
+						{
+							type: "compare_stage",
+							payload: { stage: "matching", percent: 55, current: 11, total: 20, message: "..." },
+						},
+					],
+				});
+			};
+			const manager = new RunManager({
+				store,
+				gate: new Gate({ maxConcurrent: 2, maxQueueDepth: 1 }),
+				runtimeFactory,
+			});
+			const hono = createApp({ manager, router: new SpecRouter([SPEC]), store, internalToken: TOKEN });
+
+			const { runId } = (await (await hono.request(post(submitBody({ waitMs: 0 })))).json()) as { runId: string };
+			// 等外部 store.finish() 真正落定(10ms 定时器)。
+			await new Promise((resolve) => setTimeout(resolve, 30));
+
+			const res = await hono.request(
+				new Request(`http://local/runs/${runId}`, { headers: { "x-internal-token": TOKEN } }),
+			);
+			const body = await res.json();
+			expect(body).toMatchObject({ runId, status: "completed" });
+			expect(body).not.toHaveProperty("progress");
+		});
 	});
 });
 

@@ -392,6 +392,40 @@ describe("createArtifactStore", () => {
 		});
 		await expect(store.fetch("artifact/U1.json")).rejects.toThrow(/条款/);
 	});
+
+	/**
+	 * 终审 I5:`PolicyCompareRuntime` 的 `runTimeoutMs` 定时器触发时只调 `session.abort()`,
+	 * 打断不了对象存储读取;而 MinIO 的 `getObject` 与读流两步都没有自带超时。挂住时 `run()` 的
+	 * promise 永不 settle,`RunManager` 的并发令牌被**永久**扣掉一个 —— 一次挂死不会自愈。
+	 */
+	it("ObjectGetter 挂住时按 timeoutMs 响亮失败,不让调用方永久 pending", async () => {
+		const store = createArtifactStore({
+			bucket: "uploads",
+			// 永不 settle:模拟 MinIO 读取挂死
+			get: () => new Promise<string>(() => {}),
+			timeoutMs: 20,
+		});
+		await expect(store.fetch("artifact/U1.json")).rejects.toThrow(/读取 artifact 超时/);
+	});
+
+	it("超时信息带上 bucket 与 key(值班的人要知道是哪个对象挂了)", async () => {
+		const store = createArtifactStore({
+			bucket: "uploads",
+			get: () => new Promise<string>(() => {}),
+			timeoutMs: 20,
+		});
+		await expect(store.fetch("artifact/U1.json")).rejects.toThrow(/uploads\/artifact\/U1\.json/);
+	});
+
+	it("正常返回的读取不受超时影响(定时器要被清掉,不能把成功路径拖慢或悬着)", async () => {
+		const store = createArtifactStore({
+			bucket: "uploads",
+			get: async () => JSON.stringify(artifact),
+			timeoutMs: 20,
+		});
+		const got = await store.fetch("artifact/U1.json");
+		expect(got.clauses).toHaveLength(2);
+	});
 });
 
 describe("createMinioObjectGetter", () => {

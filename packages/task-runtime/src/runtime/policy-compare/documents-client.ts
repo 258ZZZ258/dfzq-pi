@@ -23,11 +23,23 @@ export interface ProcessDocumentResponse {
 	status: string;
 }
 
+/** `documents:process` 的默认超时。该端点同步解析 PDF,给得比常规 HTTP 调用宽。 */
+export const DEFAULT_PROCESS_TIMEOUT_MS = 600_000;
+
 export interface DocumentsClientOptions {
 	baseUrl: string;
 	/** `X-Internal-Token`。**空串即拒绝构造** —— 与边界契约的 fail-closed 同款。 */
 	internalToken: string;
 	fetchImpl?: typeof fetch;
+	/**
+	 * 单次 `process()` 的挂钟上限,缺省 `DEFAULT_PROCESS_TIMEOUT_MS`。
+	 *
+	 * 🔴 这不是可选的加固,是 `PolicyCompareRuntime` 那条 `runTimeoutMs` 定时器兜不住的洞:
+	 * 那个定时器触发时只调 `session.abort()`,打断得了在飞的 `session.prompt()`,打断不了这里的
+	 * `fetch`。不传 `signal` 时挂住的 `fetch` 会让 `run()` 的 promise 永不 settle,`RunManager`
+	 * 的并发令牌被永久扣掉一个 —— 一次挂死就少一个并发额度,且不会自愈。
+	 */
+	timeoutMs?: number;
 }
 
 export interface DocumentsClient {
@@ -54,40 +66,60 @@ export function createDocumentsClient(options: DocumentsClientOptions): Document
 	}
 	const doFetch = options.fetchImpl ?? fetch;
 	const url = `${options.baseUrl.replace(/\/+$/, "")}/v1/documents:process`;
+	const timeoutMs = options.timeoutMs ?? DEFAULT_PROCESS_TIMEOUT_MS;
 
 	return {
 		async process(req) {
 			const body = buildProcessRequestBody(req);
 
-			const res = await doFetch(url, {
-				method: "POST",
-				headers: { "content-type": "application/json", "X-Internal-Token": options.internalToken },
-				body: JSON.stringify(body),
-			});
-			if (!res.ok) {
-				const text = await res.text().catch(() => "");
-				throw new Error(`documents:process 返回 ${res.status}:${text.slice(0, 500)}`);
-			}
-			const text = await res.text().catch(() => "");
-			let raw: Record<string, unknown>;
+			// 自己造 AbortController 而不是用 `AbortSignal.timeout()`:超时后要能区分「是我们主动
+			// 掐的」与「对面主动断的」,前者给一条带 timeoutMs 的诊断信息。定时器覆盖到**读完响应体**
+			// 为止 —— `fetch` 在响应头到达时就 resolve 了,body 流照样可以随后挂住。
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), timeoutMs);
+			const timedOut = () => new Error(`documents:process 超时(${timeoutMs}ms)—— 已中断请求,不再无限等待挂住的上游`);
 			try {
-				raw = JSON.parse(text) as Record<string, unknown>;
-			} catch {
-				throw new Error(`documents:process 响应不是合法 JSON:${text.slice(0, 500)}`);
+				let res: Response;
+				try {
+					res = await doFetch(url, {
+						method: "POST",
+						headers: { "content-type": "application/json", "X-Internal-Token": options.internalToken },
+						body: JSON.stringify(body),
+						signal: controller.signal,
+					});
+				} catch (cause) {
+					throw controller.signal.aborted ? timedOut() : cause;
+				}
+				if (!res.ok) {
+					const text = await res.text().catch(() => "");
+					throw new Error(`documents:process 返回 ${res.status}:${text.slice(0, 500)}`);
+				}
+				const text = await res.text().catch(() => "");
+				// 读 body 期间被掐时 `.catch(() => "")` 会把它变成空串,再往下会误报成「响应不是合法
+				// JSON」—— 超时要如实说成超时。
+				if (controller.signal.aborted) throw timedOut();
+				let raw: Record<string, unknown>;
+				try {
+					raw = JSON.parse(text) as Record<string, unknown>;
+				} catch {
+					throw new Error(`documents:process 响应不是合法 JSON:${text.slice(0, 500)}`);
+				}
+				// artifact_key 是下一步取产物的唯一凭据,缺了就没法继续 —— 响亮报错,
+				// 不返回一个 artifactKey 为 undefined 的半截结果让阶段 1 后面才炸。
+				if (typeof raw.artifact_key !== "string" || raw.artifact_key === "") {
+					throw new Error(`documents:process 响应缺少 artifact_key:${JSON.stringify(raw).slice(0, 500)}`);
+				}
+				return {
+					uploadId: String(raw.upload_id ?? req.uploadId),
+					artifactKey: raw.artifact_key,
+					title: typeof raw.title === "string" ? raw.title : null,
+					pageCount: typeof raw.page_count === "number" ? raw.page_count : null,
+					chunkCount: typeof raw.chunk_count === "number" ? raw.chunk_count : 0,
+					status: String(raw.status ?? ""),
+				};
+			} finally {
+				clearTimeout(timer);
 			}
-			// artifact_key 是下一步取产物的唯一凭据,缺了就没法继续 —— 响亮报错,
-			// 不返回一个 artifactKey 为 undefined 的半截结果让阶段 1 后面才炸。
-			if (typeof raw.artifact_key !== "string" || raw.artifact_key === "") {
-				throw new Error(`documents:process 响应缺少 artifact_key:${JSON.stringify(raw).slice(0, 500)}`);
-			}
-			return {
-				uploadId: String(raw.upload_id ?? req.uploadId),
-				artifactKey: raw.artifact_key,
-				title: typeof raw.title === "string" ? raw.title : null,
-				pageCount: typeof raw.page_count === "number" ? raw.page_count : null,
-				chunkCount: typeof raw.chunk_count === "number" ? raw.chunk_count : 0,
-				status: String(raw.status ?? ""),
-			};
 		},
 	};
 }

@@ -51,6 +51,10 @@ export function parseArtifact(json: string): ExternalDocument {
 	return {
 		uploadId: String(raw.upload_id ?? ""),
 		title: typeof doc.title === "string" ? doc.title : "",
+		// 🔴 恒 `undefined`:`UploadArtifact` 的 `doc` 里没有发文字号这一项,解析链不产它。
+		// 后果不在本文件而在 `align.ts`:规格 §3.3 的第 1 级(doc_no 精确)与 `matchKind: "exact"`
+		// 因此在真实链路上不可达,文档一侧的对齐只剩标题归一相等一条腿。见该文件 `alignClauses`
+		// 的说明。**不要**改成拿内规的字号来填 —— 那是把另一部文档的标识冒充成上传件的。
 		docNo: undefined,
 		clauses,
 	};
@@ -60,10 +64,36 @@ export interface ArtifactStore {
 	fetch(artifactKey: string): Promise<ExternalDocument>;
 }
 
-export function createArtifactStore(opts: { bucket: string; get: ObjectGetter }): ArtifactStore {
+/** 取 artifact 的默认挂钟上限。读的是一份 JSON 产物,不该比一次常规对象存储读取更久。 */
+export const DEFAULT_ARTIFACT_TIMEOUT_MS = 120_000;
+
+/**
+ * @param opts.timeoutMs 单次 `fetch()` 的挂钟上限,缺省 `DEFAULT_ARTIFACT_TIMEOUT_MS`。
+ *
+ * 🔴 超时必须落在这一层。`PolicyCompareRuntime` 的 `runTimeoutMs` 定时器触发时只调
+ * `session.abort()`,打断不了对象存储读取;而 MinIO 的 `getObject` 与读流两步都没有自带超时。
+ * 挂住时 `run()` 的 promise 永不 settle,`RunManager` 的并发令牌被永久扣掉一个。
+ *
+ * ⚠ 如实说明这道超时的强度:它是 `Promise.race`,**不取消**底层读取(MinIO SDK 的
+ * `getObject` 不收 `AbortSignal`)。挂住的那次读取仍在后台耗着 socket,但 `fetch()` 会响亮
+ * 失败、`run()` 得以终结、并发令牌得以释放 —— 这才是它要解决的那件事。
+ */
+export function createArtifactStore(opts: { bucket: string; get: ObjectGetter; timeoutMs?: number }): ArtifactStore {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_ARTIFACT_TIMEOUT_MS;
 	return {
 		async fetch(artifactKey) {
-			return parseArtifact(await opts.get(opts.bucket, artifactKey));
+			let timer: NodeJS.Timeout | undefined;
+			const guard = new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`读取 artifact 超时(${timeoutMs}ms):${opts.bucket}/${artifactKey}`)),
+					timeoutMs,
+				);
+			});
+			try {
+				return parseArtifact(await Promise.race([opts.get(opts.bucket, artifactKey), guard]));
+			} finally {
+				clearTimeout(timer);
+			}
 		},
 	};
 }
@@ -92,9 +122,13 @@ export interface MinioConfig {
  * 真 MinIO 后端。凭证走 env,**绝不入库**(与 audit-ai 的 `object_store.py` 同款纪律)。
  *
  * ⚠️ **懒导入与安全不变量的测试覆盖**:
- * - `minio` SDK 懒导入(第 89 行的 `import("minio")`)—— 只有真正用 MinIO 的部署路径才需要它可用。
- *   懒导入本身**没有测试守护**,改动时需要人工留意是否仍然保持懒加载特性。
- * - 凭证 fail-closed(第 84-86 行)——  accessKey/secretKey 为空时立即抛错,有测试守护。
+ * - `minio` SDK 懒导入(本函数内 `client()` 里的 `import("minio")`)—— 只有真正用 MinIO 的部署
+ *   路径才需要它可用。懒导入本身**没有测试守护**,改动时需要人工留意是否仍然保持懒加载特性。
+ * - 凭证 fail-closed(本函数开头对 `cfg.accessKey` / `cfg.secretKey` 的判空)—— 为空时立即
+ *   抛错,有测试守护。
+ *
+ * ⚠ 本函数**不自带超时**:`getObject` 与读流都没有可传的 `AbortSignal`。挂钟上限由
+ * `createArtifactStore` 那一层的 `timeoutMs` 兜(见该函数的说明)。
  */
 export function createMinioObjectGetter(cfg: MinioConfig): ObjectGetter {
 	if (!cfg.accessKey || !cfg.secretKey) {

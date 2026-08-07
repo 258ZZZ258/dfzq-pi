@@ -387,3 +387,63 @@ describe("createDocumentsClient", () => {
 		await expect(client.process(req)).rejects.toThrow(/documents:process 响应不是合法 JSON:not json/);
 	});
 });
+
+/**
+ * 终审 I5:`documents:process` 是同步解析 PDF 的端点,此前这里的 `fetch` **不传 signal、无超时**,
+ * 只有 undici 默认的 300s headers timeout 兜着。而 `PolicyCompareRuntime` 的 `runTimeoutMs` 定时器
+ * 触发时只调 `session.abort()`,打断不了这个 `fetch` —— 挂住时 `run()` 的 promise 永不 settle,
+ * `RunManager` 的并发令牌被永久扣掉一个。
+ */
+describe("createDocumentsClient · 超时(终审 I5)", () => {
+	/** 一个永不返回、只在收到 abort 时才 reject 的 fetch —— 模拟对面挂死。 */
+	const hangingFetch = (): typeof fetch =>
+		((_input: string | URL | Request, init?: RequestInit) =>
+			new Promise((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(new Error("The operation was aborted")));
+			})) as unknown as typeof fetch;
+
+	it("请求带 AbortSignal —— 没有它,定时器再准也掐不断这次 fetch", async () => {
+		let seenSignal: unknown;
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch((_url, init) => {
+				seenSignal = init.signal;
+				return new Response(JSON.stringify({ artifact_key: "artifact/U1.json" }), { status: 200 });
+			}),
+		});
+		await client.process(req);
+		expect(seenSignal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("对面挂住时按 timeoutMs 中断并响亮报错(不无限等待)", async () => {
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			timeoutMs: 20,
+			fetchImpl: hangingFetch(),
+		});
+		const error = await client.process(req).then(
+			() => new Error("不该成功"),
+			(e: unknown) => e as Error,
+		);
+		// 断言超时值本身也在信息里 —— 值班的人要能一眼看出是哪一道超时掐的
+		expect(error.message).toContain("documents:process 超时");
+		expect(error.message).toContain("20ms");
+	});
+
+	it("超时被如实报成超时,不退化成「响应不是合法 JSON」那类误导性信息", async () => {
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			timeoutMs: 20,
+			fetchImpl: hangingFetch(),
+		});
+		const error = await client.process(req).then(
+			() => new Error("不该成功"),
+			(e: unknown) => e as Error,
+		);
+		expect(error.message).toContain("超时");
+		expect(error.message).not.toContain("不是合法 JSON");
+	});
+});

@@ -33,7 +33,10 @@ export const profile: ProviderProfile = {
 	},
 };
 
-export const ARTIFACT = {
+// 不导出:只有 buildRuntime 自己用来喂默认的 documents/artifacts 桩。两个消费方(runtime 测试、
+// 验收测试)需要的是「外规条款正文是什么」这个事实,用字面量断言(比对 buildRuntime 产出的行表)
+// 比 import 这个 fixture 对象再拆字段更直接——留着 export 会变成没人用的死导出。
+const ARTIFACT = {
 	upload_id: "U1",
 	doc: { title: "基准外规", page_count: 1, chunk_count: 2 },
 	chunks: [

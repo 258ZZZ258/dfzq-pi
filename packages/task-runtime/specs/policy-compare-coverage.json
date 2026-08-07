@@ -8,7 +8,7 @@
   "toolset": "policy-compare",
   "tools": ["list_internal_obligations", "resolve_source_law"],
   "systemPrompt": "policy-compare/system.md",
-  "$comment2": "🔴 maxTurns 必须**严格大于** ceil(阶段2义务条款数 / batchSize) —— 撞到 maxTurns 时 PolicyCompareRuntime 返回 status:\"limit_exceeded\" 且**不返回 output**(fail-closed),所以一个模型工作全做完、只是批数恰好等于 maxTurns 的 run 会被整个丢弃。最坏情况是 MAX_OBLIGATIONS=500 配 batchSize=1(下界允许 1),即 500 批。600 是它加余量。⚠ 调低这个值、或调高 MAX_OBLIGATIONS 之前,先算这条不等式(Task 9 复审发现)。",
+  "$comment2": "🔴 maxTurns 必须**严格大于** ceil(阶段4产出的 pairs.length / batchSize) —— 撞到 maxTurns 时 PolicyCompareRuntime 返回 status:\"limit_exceeded\" 且**不返回 output**(fail-closed),所以一个模型工作全做完、只是批数恰好等于 maxTurns 的 run 会被整个丢弃。⚠ 分母上的量是 **pairs 数,不是义务条款数**:align.ts 的 doc_level 降级(规格 §5.2)让一条内规与上传件全部条款成对,pairs 是乘积而不是条数。约束住它的是 MAX_PAIRS=500 那道护栏(runtime.ts,规格 §3.5),不是 MAX_OBLIGATIONS。最坏情况因此是 MAX_PAIRS=500 配 batchSize=1(下界允许 1),即 500 批;600 是它加余量。⚠ 调低这个值、或调高 MAX_PAIRS 之前,先算这条不等式(Task 9 复审发现;分母口径由终审 I1 更正)。",
   "limits": {
     "maxTurns": 600,
     "runTimeoutMs": 1800000,

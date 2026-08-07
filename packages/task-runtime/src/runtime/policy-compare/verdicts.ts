@@ -40,6 +40,21 @@ function splitUntilFits(batch: ClausePair[], maxChars: number, out: ClausePair[]
 	splitUntilFits(batch.slice(mid), maxChars, out);
 }
 
+/** 一批判定允许出现的 `pairIndex` 区间(左闭右开),即这一批在**全局** pairs 数组里的下标范围。 */
+export interface PairIndexRange {
+	/** 本批第一对在全局 pairs 数组里的下标。 */
+	start: number;
+	/** 本批最后一对的下标 + 1。 */
+	endExclusive: number;
+}
+
+export interface ParsedVerdicts {
+	/** 形状合法**且** `pairIndex` 落在本批区间内的判定。 */
+	verdicts: Verdict[];
+	/** 形状合法但 `pairIndex` 越界的原值。**不静默丢** —— 调用方必须把它们写进 `gaps`。 */
+	outOfRange: number[];
+}
+
 /**
  * 组装一批的 user 消息。`baseIndex` 是这一批第一对在**全局** pairs 数组里的下标 ——
  * 模型回的 `pairIndex` 因此是全局的,阶段 6 直接按它回填,不必再做批内→全局的换算。
@@ -61,25 +76,40 @@ export function renderBatchPrompt(batch: readonly ClausePair[], baseIndex: numbe
  * 解析模型回复。**只收四个字段**(规格 §6.3-2)——模型若多写了 `externalClause` 之类的
  * 正文字段,这里原地丢弃,不让它有机会进最终行表。
  *
- * 解析失败 / 形状不对 → 返回空数组,**不抛**:一批解析不出来由调用方按「该批全部
- * unresolved」处置,比让整个 run 炸掉更可诊断。
+ * 🔴 `allowedRange` 是**必填**的,不是可选加固:阶段 6 按 `pairIndex` 建
+ * `Map` 回填判定,后写覆盖先写。多批场景下模型只要按批内序号从 0 重新编号(system.md 的
+ * 示例一度就是这么诱导的),第 2 批的判定就会盖掉第 1 批同下标那几对的判定 —— 而两侧正文由
+ * 代码从 pair 自己的原始数据填,四条反幻觉校验与 schema **全部照过**,输出是一张看起来完全
+ * 合规、判定却张冠李戴的表。对合规审计产品,这比整个 run 失败严重得多。参数做成必填,调用方
+ * 就没有"忘了传区间"这条路。
+ *
+ * 越界的判定**不采纳也不静默丢**:原值进 `outOfRange`,由调用方写进 `gaps`。
+ *
+ * 解析失败 / 形状不对 → 两个数组都为空,**不抛**:一批解析不出来由调用方按「该批全部
+ * 未获判定」处置,比让整个 run 炸掉更可诊断。
  */
-export function parseVerdicts(text: string): Verdict[] {
+export function parseVerdicts(text: string, allowedRange: PairIndexRange): ParsedVerdicts {
 	const extracted = extractJsonBlock(text);
-	if (extracted.kind !== "ok") return [];
+	if (extracted.kind !== "ok") return { verdicts: [], outOfRange: [] };
 	const raw = (extracted.value as { verdicts?: unknown }).verdicts;
-	if (!Array.isArray(raw)) return [];
+	if (!Array.isArray(raw)) return { verdicts: [], outOfRange: [] };
 	const out: Verdict[] = [];
+	const outOfRange: number[] = [];
 	for (const item of raw) {
 		if (typeof item !== "object" || item === null) continue;
 		const row = item as Record<string, unknown>;
 		if (!Number.isInteger(row.pairIndex)) continue;
 		if (typeof row.state !== "string" || !VALID_STATES.has(row.state as Verdict["state"])) continue;
-		const verdict: Verdict = { pairIndex: row.pairIndex as number, state: row.state as Verdict["state"] };
+		const pairIndex = row.pairIndex as number;
+		if (pairIndex < allowedRange.start || pairIndex >= allowedRange.endExclusive) {
+			outOfRange.push(pairIndex);
+			continue;
+		}
+		const verdict: Verdict = { pairIndex, state: row.state as Verdict["state"] };
 		if (typeof row.gap === "string" && row.gap !== "") verdict.gap = row.gap;
 		if (typeof row.suggestion === "string" && row.suggestion !== "") verdict.suggestion = row.suggestion;
 		if (typeof row.conflictType === "string" && row.conflictType !== "") verdict.conflictType = row.conflictType;
 		out.push(verdict);
 	}
-	return out;
+	return { verdicts: out, outOfRange };
 }

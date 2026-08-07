@@ -66,31 +66,38 @@ describe("renderBatchPrompt", () => {
 	});
 });
 
+/** 覆盖全部用例里出现过的 pairIndex 的宽区间 —— 这些用例测的是「形状」这一层,
+ *  区间过滤单独在下面那个 describe 里测。 */
+const ANY_RANGE = { start: 0, endExclusive: 1000 };
+
+/** 只取判定数组的薄封装:上面每条用例关心的都是「收下了哪些」,不是越界明细。 */
+const parsed = (text: string) => parseVerdicts(text, ANY_RANGE).verdicts;
+
 describe("parseVerdicts", () => {
 	it("读围栏包裹的 verdicts 数组", () => {
 		const text = '```json\n{"verdicts":[{"pairIndex":0,"state":"covered"}]}\n```';
-		expect(parseVerdicts(text)).toEqual([{ pairIndex: 0, state: "covered" }]);
+		expect(parsed(text)).toEqual([{ pairIndex: 0, state: "covered" }]);
 	});
 
 	it("读裸 JSON 对象", () => {
-		const got = parseVerdicts('{"verdicts":[{"pairIndex":1,"state":"missing","gap":"缺期限","suggestion":"补"}]}');
+		const got = parsed('{"verdicts":[{"pairIndex":1,"state":"missing","gap":"缺期限","suggestion":"补"}]}');
 		expect(got).toEqual([{ pairIndex: 1, state: "missing", gap: "缺期限", suggestion: "补" }]);
 	});
 
 	it("丢掉 state 非法的条目", () => {
-		expect(parseVerdicts('{"verdicts":[{"pairIndex":0,"state":"maybe"}]}')).toEqual([]);
+		expect(parsed('{"verdicts":[{"pairIndex":0,"state":"maybe"}]}')).toEqual([]);
 	});
 
 	it("丢掉 pairIndex 不是整数的条目", () => {
-		expect(parseVerdicts('{"verdicts":[{"pairIndex":"0","state":"covered"}]}')).toEqual([]);
+		expect(parsed('{"verdicts":[{"pairIndex":"0","state":"covered"}]}')).toEqual([]);
 	});
 
 	it("解析不出来回空数组,不抛", () => {
-		expect(parseVerdicts("我觉得都覆盖了")).toEqual([]);
+		expect(parsed("我觉得都覆盖了")).toEqual([]);
 	});
 
 	it("忽略模型多写的字段(只收四个)", () => {
-		const got = parseVerdicts(
+		const got = parsed(
 			'{"verdicts":[{"pairIndex":0,"state":"conflict","conflictType":"口径冲突","externalClause":"模型编的正文"}]}',
 		);
 		expect(got).toEqual([{ pairIndex: 0, state: "conflict", conflictType: "口径冲突" }]);
@@ -99,18 +106,18 @@ describe("parseVerdicts", () => {
 	// 额外覆盖测试 — 补充分支覆盖
 
 	it("丢掉非对象的 verdicts 数组元素", () => {
-		expect(parseVerdicts('{"verdicts":["string",null,123,true]}')).toEqual([]);
+		expect(parsed('{"verdicts":["string",null,123,true]}')).toEqual([]);
 	});
 
 	it("丢掉空字符串的可选字段", () => {
-		const got = parseVerdicts(
+		const got = parsed(
 			'{"verdicts":[{"pairIndex":0,"state":"missing","gap":"","suggestion":"补","conflictType":""}]}',
 		);
 		expect(got).toEqual([{ pairIndex: 0, state: "missing", suggestion: "补" }]);
 	});
 
 	it("保留非空的所有可选字段", () => {
-		const got = parseVerdicts(
+		const got = parsed(
 			'{"verdicts":[{"pairIndex":0,"state":"conflict","gap":"缺条款","suggestion":"加条款","conflictType":"口径冲突"}]}',
 		);
 		expect(got).toEqual([
@@ -119,11 +126,11 @@ describe("parseVerdicts", () => {
 	});
 
 	it("丢掉 pairIndex 不是整数类型的条目(浮点数)", () => {
-		expect(parseVerdicts('{"verdicts":[{"pairIndex":0.5,"state":"covered"}]}')).toEqual([]);
+		expect(parsed('{"verdicts":[{"pairIndex":0.5,"state":"covered"}]}')).toEqual([]);
 	});
 
 	it("处理混合数组(有效+无效条目)", () => {
-		const got = parseVerdicts(
+		const got = parsed(
 			'{"verdicts":[{"pairIndex":0,"state":"covered"},{"pairIndex":"bad","state":"missing"},{"pairIndex":1,"state":"invalid"},{"pairIndex":2,"state":"partial"}]}',
 		);
 		expect(got).toEqual([
@@ -133,14 +140,51 @@ describe("parseVerdicts", () => {
 	});
 
 	it("verdicts 不是数组时返回空数组", () => {
-		expect(parseVerdicts('{"verdicts":"not an array"}')).toEqual([]);
-		expect(parseVerdicts('{"verdicts":null}')).toEqual([]);
-		expect(parseVerdicts('{"verdicts":{}}')).toEqual([]);
+		expect(parsed('{"verdicts":"not an array"}')).toEqual([]);
+		expect(parsed('{"verdicts":null}')).toEqual([]);
+		expect(parsed('{"verdicts":{}}')).toEqual([]);
 	});
 
 	it("使用无标签围栏提取 JSON", () => {
 		const text = '```\n{"verdicts":[{"pairIndex":0,"state":"covered"}]}\n```';
-		expect(parseVerdicts(text)).toEqual([{ pairIndex: 0, state: "covered" }]);
+		expect(parsed(text)).toEqual([{ pairIndex: 0, state: "covered" }]);
+	});
+});
+
+describe("parseVerdicts · allowedRange(终审 C1:跨批 pairIndex 覆盖)", () => {
+	const batch2 = { start: 8, endExclusive: 16 };
+
+	it("模型按批内序号从 0 重新编号 → 一条都不采纳,原值进 outOfRange", () => {
+		const got = parseVerdicts(
+			'{"verdicts":[{"pairIndex":0,"state":"conflict","conflictType":"口径冲突"},{"pairIndex":1,"state":"missing","gap":"缺","suggestion":"补"}]}',
+			batch2,
+		);
+		expect(got.verdicts).toEqual([]);
+		expect(got.outOfRange).toEqual([0, 1]);
+	});
+
+	it("区间是左闭右开:start 收下,endExclusive 越界", () => {
+		const got = parseVerdicts(
+			'{"verdicts":[{"pairIndex":8,"state":"covered"},{"pairIndex":15,"state":"covered"},{"pairIndex":16,"state":"covered"}]}',
+			batch2,
+		);
+		expect(got.verdicts.map((v) => v.pairIndex)).toEqual([8, 15]);
+		expect(got.outOfRange).toEqual([16]);
+	});
+
+	it("负数 pairIndex 也算越界(不是被 Number.isInteger 拦下的那一档)", () => {
+		const got = parseVerdicts('{"verdicts":[{"pairIndex":-1,"state":"covered"}]}', batch2);
+		expect(got.verdicts).toEqual([]);
+		expect(got.outOfRange).toEqual([-1]);
+	});
+
+	it("形状非法的条目不进 outOfRange(它压根不是一条判定,不该报成「越界」)", () => {
+		const got = parseVerdicts(
+			'{"verdicts":[{"pairIndex":0,"state":"maybe"},{"pairIndex":"0","state":"covered"}]}',
+			batch2,
+		);
+		expect(got.verdicts).toEqual([]);
+		expect(got.outOfRange).toEqual([]);
 	});
 });
 

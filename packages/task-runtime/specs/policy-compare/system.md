@@ -14,10 +14,12 @@
 
 ```json
 {"verdicts": [
-  {"pairIndex": 0, "state": "partial", "gap": "未覆盖三个月的凭证提交期限", "suggestion": "在第八条补充期限要求"},
-  {"pairIndex": 1, "state": "covered"}
+  {"pairIndex": 24, "state": "partial", "gap": "未覆盖三个月的凭证提交期限", "suggestion": "在第八条补充期限要求"},
+  {"pairIndex": 25, "state": "covered"}
 ]}
 ```
+
+上例的 24 / 25 只是示意:`pairIndex` 是**这一批实际收到的那些编号**,不是 0、1。
 
 规则:
 
@@ -25,3 +27,5 @@
 2. `state` 是 `conflict` 时,`conflictType` 必填(如「口径冲突」「期限冲突」「表述冲突」)。
 3. **绝不复述条款正文** —— 正文由系统填入,你写的任何正文都会被丢弃。
 4. 每个收到的 `pairIndex` 都要给一个判定,不要漏。
+5. **必须原样使用收到的 `pairIndex`,不要从 0 重新编号、不要按批内顺序另编一套。**
+   编号是判定挂到哪一对条款上的唯一依据;不在本批编号范围内的判定会被整条丢弃。

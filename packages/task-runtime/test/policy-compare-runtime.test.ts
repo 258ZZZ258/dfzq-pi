@@ -7,6 +7,7 @@ import {
 	createPolicyCompareRuntime,
 	DEFAULT_BATCH_SIZE,
 	MAX_OBLIGATIONS,
+	MAX_PAIRS,
 	type PolicyCompareRuntimeOptions,
 	parseCoveragePayload,
 } from "../src/runtime/policy-compare/runtime.ts";
@@ -48,6 +49,67 @@ describe("parseCoveragePayload", () => {
 
 	it("payload 不是对象 → 抛错", () => {
 		expect(() => parseCoveragePayload("x")).toThrow(/payload/);
+	});
+
+	/**
+	 * 终审 I4:三个收窄参数此前用 `Array.isArray(x) ? x : undefined` —— 形状不对就**静默降级**
+	 * 成「不限」。Java 传 `bizDomains: "费用报销"`(单值忘了包数组,常见的上游 bug)会被整个
+	 * 丢掉,M1 收到空数组 = 不限,比对范围悄悄放大到全部内规。与紧邻的 `organizations` 那句
+	 * 「静默忽略一个范围收窄参数等于越权返回」自相矛盾,现统一成形状不对即抛。
+	 */
+	describe("scope 收窄参数 fail-closed(终审 I4)", () => {
+		const withScope = (scope: Record<string, unknown>) => () => parseCoveragePayload({ ...ok, scope });
+
+		it("bizDomains 是单个字符串(没包数组)→ 抛错,不静默降级成「不限」", () => {
+			expect(withScope({ organizations: [], bizDomains: "费用报销" })).toThrow(/bizDomains/);
+		});
+
+		it("chapters 是单个字符串 → 抛错", () => {
+			expect(withScope({ organizations: [], chapters: "第二章" })).toThrow(/chapters/);
+		});
+
+		it("数组元素不是字符串(如 [123])→ 抛错,不原样下传给 M1", () => {
+			expect(withScope({ organizations: [], bizDomains: [123] })).toThrow(/bizDomains/);
+		});
+
+		it("数组元素是空串 → 抛错(空串收窄不了任何东西,是上游拼串出了问题)", () => {
+			expect(withScope({ organizations: [], chapters: [""] })).toThrow(/chapters/);
+		});
+
+		it("effectiveDateRange 不是两元组 → 抛错", () => {
+			expect(withScope({ organizations: [], effectiveDateRange: ["2024-01-01"] })).toThrow(/effectiveDateRange/);
+			expect(withScope({ organizations: [], effectiveDateRange: "2024-01-01" })).toThrow(/effectiveDateRange/);
+			expect(withScope({ organizations: [], effectiveDateRange: [2024, 2026] })).toThrow(/effectiveDateRange/);
+		});
+
+		it("organizations 是非数组 → 也抛错(此前 Array.isArray 判假就放行,同一条原则漏了自己)", () => {
+			expect(withScope({ organizations: "东方证券" })).toThrow(/organizations/);
+		});
+
+		it("null 与缺席同义:按「不限」处理,不抛", () => {
+			const got = parseCoveragePayload({
+				...ok,
+				scope: { organizations: [], bizDomains: null, chapters: null, effectiveDateRange: null },
+			});
+			expect(got.scope.bizDomains).toBeUndefined();
+			expect(got.scope.chapters).toBeUndefined();
+			expect(got.scope.effectiveDateRange).toBeUndefined();
+		});
+
+		it("合法值原样带出(不是被上面几条顺带满足的恒真断言)", () => {
+			const got = parseCoveragePayload({
+				...ok,
+				scope: {
+					organizations: [],
+					bizDomains: ["费用报销"],
+					chapters: ["第二章"],
+					effectiveDateRange: ["2024-01-01", "2026-12-31"],
+				},
+			});
+			expect(got.scope.bizDomains).toEqual(["费用报销"]);
+			expect(got.scope.chapters).toEqual(["第二章"]);
+			expect(got.scope.effectiveDateRange).toEqual(["2024-01-01", "2026-12-31"]);
+		});
 	});
 });
 
@@ -247,6 +309,51 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		expect(obligationsArgs[0]?.limit).toBe(MAX_OBLIGATIONS);
 	});
 
+	/**
+	 * 终审 I4:`scope` 的三个收窄参数整条透传链此前**零测试** —— 把 runtime.ts 里下传它们的那
+	 * 四行整个删掉,当时没有任何测试会红。收窄参数丢一个,M1 就按「不限」处理,比对范围会从
+	 * 「费用报销这一个域」悄悄放大到全部内规,而调用方看到的是一次正常完成的 run。
+	 */
+	it("阶段 2 请求参数:scope 的三个收窄参数逐字下传给 M1(biz_domains/chapters/effective_from/effective_to)", async () => {
+		const { runtime, obligationsArgs } = await buildRuntime({
+			payloadOverride: {
+				scope: {
+					bizDomains: ["费用报销", "差旅费用报销"],
+					chapters: ["第二章 报销原则", "第三章 审批规则"],
+					effectiveDateRange: ["2024-01-01", "2026-12-31"],
+				},
+			},
+			modelReplies: [
+				verdictReply([
+					{ pairIndex: 0, state: "covered" },
+					{ pairIndex: 1, state: "covered" },
+				]),
+			],
+		});
+		const result = await runtime.run("比对");
+		expect(result.status).toBe("completed");
+		expect(obligationsArgs[0]?.biz_domains).toEqual(["费用报销", "差旅费用报销"]);
+		expect(obligationsArgs[0]?.chapters).toEqual(["第二章 报销原则", "第三章 审批规则"]);
+		expect(obligationsArgs[0]?.effective_from).toBe("2024-01-01");
+		expect(obligationsArgs[0]?.effective_to).toBe("2026-12-31");
+	});
+
+	it("阶段 2 请求参数:scope 全缺省时下传空数组(= 不限),日期两端不传键", async () => {
+		const { runtime, obligationsArgs } = await buildRuntime({
+			modelReplies: [
+				verdictReply([
+					{ pairIndex: 0, state: "covered" },
+					{ pairIndex: 1, state: "covered" },
+				]),
+			],
+		});
+		await runtime.run("比对");
+		expect(obligationsArgs[0]?.biz_domains).toEqual([]);
+		expect(obligationsArgs[0]?.chapters).toEqual([]);
+		expect(obligationsArgs[0]?.effective_from).toBeUndefined();
+		expect(obligationsArgs[0]?.effective_to).toBeUndefined();
+	});
+
 	it("模型不产正文:即使模型回了 externalClause,行表里也是原文", async () => {
 		const { runtime } = await buildRuntime({
 			modelReplies: [
@@ -416,6 +523,94 @@ describe("PolicyCompareRuntime fail-closed(各条路径都不产出结果,不只
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
 		expect(result.errorMessage).toContain("800");
+	});
+
+	/**
+	 * 终审 I2:上面那道只信 E0 自报的 `chunk_count`,而 `documents-client.ts` 对非数字落 `0` ——
+	 * E0 少回一个字段时它**恒不触发**,一份 5000 条款的产物长驱直入。本条锁的是本地复核那道:
+	 * documents 桩仍回 `chunkCount: 2`(自报护栏因此必然不触发),超限的是实际解析出的条款数。
+	 */
+	it("终审 I2:E0 自报 chunk_count 正常但实际解析出 801 条条款 → 不产出结果(本地复核,不只信上游自报)", async () => {
+		const clauses = Array.from({ length: 801 }, (_, i) => ({
+			seq: i,
+			clausePath: `第${i}条`,
+			text: `外规第${i}条正文`,
+		}));
+		const { runtime } = await buildRuntime({
+			modelReplies: [verdictReply([])],
+			artifacts: { fetch: async () => ({ uploadId: "U1", title: "基准外规", docNo: undefined, clauses }) },
+		});
+		const result = await runtime.run("比对");
+		expect(result.status).toBe("error");
+		expect(result.output).toBeUndefined();
+		expect(result.errorMessage).toContain("801");
+		// 判别力:错误必须来自本地复核那条,不是上面那条自报护栏(它这次拿到的是 chunkCount=2)
+		expect(result.errorMessage).toContain("以实际解析条数为准");
+	});
+
+	/**
+	 * 终审 I1:阶段 5 的批数是 `ceil(pairs.length / batchSize)`,而 `doc_level` 降级让一条内规与
+	 * 上传件全部条款成对 —— pairs 是乘积,阶段 2 那道 500 条上限完全管不住它。没有 MAX_PAIRS 时
+	 * 这个 run 会一路跑到撞 maxTurns/maxCostUsd,两者都是 fail-closed 丢弃整个 output:钱烧完、
+	 * 零产出。
+	 */
+	it("终审 I1:doc_level 扇出超过 MAX_PAIRS → 不产出结果,且一次模型调用都没发出", async () => {
+		// 251 条内规 × 上传件 2 条条款 = 502 对 > MAX_PAIRS(500)。
+		// 251 本身没超 MAX_OBLIGATIONS(500)—— 确保这条不是被阶段 2 那道护栏抢先拦下的。
+		const n = 251;
+		const { runtime } = await buildRuntime({
+			obligationCount: n,
+			modelReplies: [verdictReply([])],
+			resolutionsRawOverride: {
+				items: Array.from({ length: n }, (_, i) => ({
+					chunk_id: `C-${i}`,
+					// clause_path 为 null = M2 的映射粒度是文档级(规格 §5.2 的降级形态)
+					source_laws: [{ doc_no: null, doc_title: "基准外规", clause_path: null, source_code: "X" }],
+				})),
+				rejected: [],
+				unresolved: [],
+			},
+		});
+		const result = await runtime.run("比对");
+		expect(result.status).toBe("error");
+		expect(result.output).toBeUndefined();
+		expect(result.errorMessage).toContain("502");
+		expect(result.errorMessage).toContain(`超过上限 ${MAX_PAIRS}`);
+		// message 要指明病因是 doc_level 扇出,否则值班的人会去查阶段 2 的条数上限
+		expect(result.errorMessage).toContain("doc_level");
+		// 护栏在阶段 5 之前停下 —— 一次模型调用都没发生(这才是「不烧预算」那半边)
+		expect(result.turns).toBe(0);
+	});
+
+	/**
+	 * 终审 I3:`checkedCount` 取 `items.length`(按行数),而 metrics 按 `chunkId` 分组累加
+	 * (按去重后的条数)—— 重复 chunk_id 会让守恒判负,而那条信息的文档写着「判负 = 代码 bug」,
+	 * 值班的人会去查 TS 组装代码,病因却在 M1 的 JOIN。
+	 */
+	it("终审 I3:M1 返回重复 chunk_id → 点名 M1,不让它退化成一条误导性的「metrics 不自洽」", async () => {
+		const row = (deonticType: string) => ({
+			chunk_id: "C-0",
+			clause_path: "内第0条",
+			doc_title: "内规",
+			doc_no: "内〔2026〕1号",
+			deontic_type: deonticType,
+			evidence: "应当",
+			text: "内规第0条正文",
+			source_code: "SC-0",
+		});
+		const { runtime } = await buildRuntime({
+			modelReplies: [verdictReply([])],
+			// 同一 chunk 挂了两条 is_obligation 标签(不同 deontic_type)—— 规格 §5.1 的 M1 SQL
+			// 是 chunks JOIN clause_tags,这种情况会出重复行
+			obligationsRawOverride: { items: [row("obligation"), row("prohibition")], total: 2, truncated: false },
+		});
+		const result = await runtime.run("比对");
+		expect(result.status).toBe("error");
+		expect(result.output).toBeUndefined();
+		expect(result.errorMessage).toContain("list_internal_obligations 返回了重复 chunk_id");
+		expect(result.errorMessage).toContain("C-0");
+		// 🔴 判别力就在这条:病因指向 M1,不是笼统的守恒判负
+		expect(result.errorMessage).not.toContain("metrics 不自洽");
 	});
 
 	it("list_internal_obligations 返回形状不对(缺 items 数组)→ 不产出结果", async () => {
@@ -756,5 +951,65 @@ describe("PolicyCompareRuntime · Minor(重入保护 / 终态 compare_stage 事�
 		expect(last.percent).toBe(100);
 		expect(last.current).toBe(last.total);
 		expect(last.message).toBe(result.errorMessage);
+	});
+});
+
+describe("PolicyCompareRuntime · 终审 C1(跨批 pairIndex 覆盖:判定挂到错误的条款对上)", () => {
+	/**
+	 * 🔴 本轮最严重那条的回归锁。
+	 *
+	 * 场景:4 对条款、batchSize=2 ⇒ 2 批。fake 模型**每批都从 0 编号**(system.md 的示例一度
+	 * 就是这么诱导的)。没有区间过滤时,第 2 批回的 0/1 会盖掉第 1 批那两对的判定,而两侧正文
+	 * 由代码从各自的 pair 填 —— schema、四条反幻觉全部照过,输出是一张看起来完全合规、判定却
+	 * 张冠李戴的表。
+	 *
+	 * 三组断言分别锁住修复的三个面:①判定没挂错 ②越界的进 gaps 不静默丢 ③没拿到判定的计 unmatched。
+	 */
+	it("模型每批都从 0 编号:判定不挂到别的 pair 上,越界进 gaps,未获判定的计 unmatched", async () => {
+		const { runtime } = await buildRuntime({
+			obligationCount: 4,
+			batchSize: 2,
+			modelReplies: [
+				// 第 1 批(全局 pairIndex 0、1):编号正确
+				verdictReply([
+					{ pairIndex: 0, state: "missing", gap: "第一批的缺口", suggestion: "第一批的建议" },
+					{ pairIndex: 1, state: "covered" },
+				]),
+				// 第 2 批(全局 pairIndex 2、3):模型照示例从 0 重新编号
+				verdictReply([
+					{ pairIndex: 0, state: "conflict", conflictType: "第二批的冲突", gap: "x", suggestion: "y" },
+					{ pairIndex: 1, state: "conflict", conflictType: "第二批的冲突", gap: "x", suggestion: "y" },
+				]),
+			],
+		});
+		const result = await runtime.run("比对");
+		expect(result.status).toBe("completed");
+		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, "")) as {
+			rows: Array<{ conflictType: string; judgement: string; basis: { internalChunkId: string } }>;
+			metrics: Record<string, number>;
+			gaps: string[];
+		};
+
+		// ① 第 2 批的判定一条都没落到 pair 0/1 上。rows 只能有 C-0 那条 missing;
+		//    没修之前这里是两行 conflict(「第二批的冲突」),挂在 C-0 / C-1 上。
+		expect(body.rows.map((r) => r.basis.internalChunkId)).toEqual(["C-0"]);
+		expect(body.rows[0].judgement).toBe("缺失要求");
+		expect(body.rows.some((r) => r.conflictType === "第二批的冲突")).toBe(false);
+		expect(body.metrics.conflict).toBe(0);
+
+		// ② 越界判定进 gaps,并带上实际收到的值与本批合法区间
+		const discarded = body.gaps.filter((g) => g.includes("本批之外的 pairIndex"));
+		expect(discarded).toHaveLength(2);
+		expect(discarded.join("\n")).toContain("收到 0");
+		expect(discarded.join("\n")).toContain("收到 1");
+		expect(discarded.join("\n")).toContain("[2, 4)");
+
+		// ③ 第 2 批那两对因此没有判定 → 计入 unmatched,并各自写一条 gap
+		expect(body.metrics.unmatched).toBe(2);
+		expect(body.gaps.join("\n")).toContain("C-2 未获模型判定");
+		expect(body.gaps.join("\n")).toContain("C-3 未获模型判定");
+		// 守恒仍然成立(阶段 6 的校验独立再判一次):1 missing + 0 conflict + 1 covered + 2 unmatched = 4
+		expect(body.metrics.checked).toBe(4);
+		expect(body.metrics.missing + body.metrics.conflict + body.metrics.covered + body.metrics.unmatched).toBe(4);
 	});
 });

@@ -18,8 +18,48 @@ export const MAX_BATCH_SIZE = 20;
 export const DEFAULT_BATCH_SIZE = 8;
 export const MAX_OBLIGATIONS = 500;
 export const MAX_EXTERNAL_CHUNKS = 800;
+/**
+ * 阶段 4 产出的待判定条款对上限(规格 §3.5)。
+ *
+ * 🔴 决定阶段 5 扇出的是 `pairs.length`,**不是**义务条款数:`align.ts` 的 `doc_level` 分支
+ * (M2 映射粒度为文档级时的降级形态,规格 §5.2)让**一条**内规与上传件的**全部**条款成对,
+ * 上界因此是 `MAX_OBLIGATIONS × MAX_EXTERNAL_CHUNKS`,不是 `MAX_OBLIGATIONS`。没有这道护栏时,
+ * 50 条内规 × 100 条外规条款 = 5000 对 → 625 批,先撞 `maxCostUsd` 或 `maxTurns`,两者都是
+ * fail-closed 丢弃整个 output —— 烧完预算、零产出。
+ *
+ * 定值 500:非 `doc_level` 路径下一条内规最多产 1 对,所以 500 恰好放行 `MAX_OBLIGATIONS`
+ * 的全量;同时 `ceil(500 / batchSize 下界 1) = 500 < maxTurns=600`,spec 那条不等式仍成立。
+ */
+export const MAX_PAIRS = 500;
 
 const ALL_OUTPUT_TYPES = ["summary_diff", "missing_items", "partial_items", "conflict_items"];
+
+/**
+ * 范围收窄参数的形状校验。**形状不对即抛**,不静默降级成 `undefined`。
+ *
+ * 静默忽略一个范围收窄参数 = 越权返回:M1 收到空数组按「不限」处理,比对范围会从
+ * 「费用报销这一个域」悄悄放大到全部内规,而调用方看到的是一次正常完成的 run。
+ * Java 侧把单值写成 `bizDomains: "费用报销"`(没包数组)是常见的上游 bug,元素类型
+ * 也一并校验 —— `[123]` 原样下传只会在 M1 的 SQL 里变成一次匹配不上的静默收窄。
+ */
+function parseScopeStringArray(value: unknown, path: string): string[] | undefined {
+	// null 与缺席同义:JSON 侧「这一项没设」的惯用写法,按「不限」处理
+	if (value === undefined || value === null) return undefined;
+	if (!Array.isArray(value) || value.some((v) => typeof v !== "string" || v === "")) {
+		throw new Error(`${path} 必须是非空字符串数组(收到:${JSON.stringify(value)})—— 范围收窄参数不接受静默降级`);
+	}
+	return value as string[];
+}
+
+function parseScopeDateRange(value: unknown, path: string): [string, string] | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (!Array.isArray(value) || value.length !== 2 || value.some((v) => typeof v !== "string" || v === "")) {
+		throw new Error(
+			`${path} 必须是 [开始日期, 结束日期] 两个非空字符串(收到:${JSON.stringify(value)})—— 范围收窄参数不接受静默降级`,
+		);
+	}
+	return [value[0] as string, value[1] as string];
+}
 
 /**
  * `POST /runs` 的 `payload` 形状校验。**装配期就跑**,不拖到阶段 5(规格 §7.1)。
@@ -27,6 +67,9 @@ const ALL_OUTPUT_TYPES = ["summary_diff", "missing_items", "partial_items", "con
  * 两个字段本轮不生效但必须显式拒绝(规格 §3.1):
  * - `scope.organizations` —— PG 无对应列,静默忽略一个范围收窄参数等于越权返回
  * - `outputTypes` —— 协议 §3.4 规定它恒为全选;收到别的值说明上游理解有偏差,要炸出来
+ *
+ * 其余三个收窄参数(`bizDomains` / `chapters` / `effectiveDateRange`)同姿态:形状不对即抛,
+ * 见 `parseScopeStringArray`。
  */
 export function parseCoveragePayload(raw: unknown): CoveragePayload {
 	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -40,8 +83,9 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 		}
 	}
 	const scope = (p.scope ?? {}) as Record<string, unknown>;
-	const orgs = scope.organizations;
-	if (Array.isArray(orgs) && orgs.length > 0) {
+	// 非数组也要拒绝:`organizations: "东方证券"` 走 Array.isArray 判假就被放行,
+	// 与「静默忽略一个范围收窄参数 = 越权返回」这条原则自相矛盾
+	if (parseScopeStringArray(scope.organizations, "payload.scope.organizations")?.length) {
 		throw new Error("payload.scope.organizations 非空 —— 「适用组织」维度本轮无可用数据列,未实现(不静默忽略)");
 	}
 	const outputTypes = p.outputTypes;
@@ -62,11 +106,9 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 		},
 		scope: {
 			organizations: [],
-			bizDomains: Array.isArray(scope.bizDomains) ? (scope.bizDomains as string[]) : undefined,
-			chapters: Array.isArray(scope.chapters) ? (scope.chapters as string[]) : undefined,
-			effectiveDateRange: Array.isArray(scope.effectiveDateRange)
-				? (scope.effectiveDateRange as [string, string])
-				: undefined,
+			bizDomains: parseScopeStringArray(scope.bizDomains, "payload.scope.bizDomains"),
+			chapters: parseScopeStringArray(scope.chapters, "payload.scope.chapters"),
+			effectiveDateRange: parseScopeDateRange(scope.effectiveDateRange, "payload.scope.effectiveDateRange"),
 		},
 		outputTypes: ALL_OUTPUT_TYPES,
 	};
@@ -110,6 +152,27 @@ function toObligations(raw: unknown): { items: InternalObligation[]; total: numb
 			sourceCode: typeof row.source_code === "string" ? row.source_code : null,
 		} satisfies InternalObligation;
 	});
+	// 🔴 chunk_id 必须唯一,否则守恒会以一条**指错病因**的信息判负:`checkedCount` 取
+	// `items.length`(按行数),而 `buildCoverageResult` 的 metrics 按 `chunkId` 分组累加
+	// (按去重后的条数),两者只在唯一时相等。规格 §5.1 的 M1 SQL 是
+	// `chunks JOIN clause_tags ... AND deontic_type IN (:deontic_types)` —— 同一 chunk 挂了多条
+	// `is_obligation` 标签(不同 `deontic_type`)就会出重复行,E1 富集里并非不可能。
+	// 届时 `validate-result.ts` 会报「metrics 不自洽」,而那条信息的文档写着「判负 = 代码 bug」,
+	// 值班的人会去查 TS 组装代码,病因却在 M1 的 JOIN。
+	// **抛错而不是去重**:去重会把 `checkedCount` 的语义从「M1 返回了几条」悄悄改成
+	// 「去重后几条」,是另一个更难发现的口径漂移。
+	const seen = new Set<string>();
+	const duplicated = new Set<string>();
+	for (const it of items) {
+		if (seen.has(it.chunkId)) duplicated.add(it.chunkId);
+		seen.add(it.chunkId);
+	}
+	if (duplicated.size > 0) {
+		throw new Error(
+			`list_internal_obligations 返回了重复 chunk_id(${[...duplicated].join("、")})—— ` +
+				"同一 chunk 挂多条 is_obligation 标签会让 M1 的 JOIN 出重复行;请在 M1 侧按 chunk_id 去重后再返回",
+		);
+	}
 	return {
 		items,
 		total: typeof r.total === "number" ? r.total : items.length,
@@ -153,8 +216,9 @@ function toResolutions(raw: unknown): {
 /** `limitState.tripped` 的人可读描述。照 `fast-path-runtime.ts` 的 `describeTripped`:
  *  `maxTurns` 对本 runtime 这种"模型调用次数结构上可算"的管线其实意义不大(阶段 5 的批数
  *  由 `batchPairs` 定死,不会失控增长),但仍然接上这条路而不是特判掉它 —— 因为 `runTimeoutMs`
- *  确实有意义(`documents.process()`/`callTool()` 挂住时唯一能兜底的就是它),两者共用同一套
- *  `LimitState`/`limits` 插件基础设施,拆开反而多一份要维护的分支。 */
+ *  确实有意义(它是"整个 run 跑太久"的唯一兜底;单次外部调用挂死另有各自的超时,见 run() 里
+ *  那条定时器的说明),两者共用同一套 `LimitState`/`limits` 插件基础设施,拆开反而多一份要
+ *  维护的分支。 */
 function describeTripped(kind: LimitKind, limits: RuntimeLimits): string {
 	if (kind === "runTimeout") return `run 整体超时(runTimeoutMs=${limits.runTimeoutMs}ms)`;
 	if (kind === "maxTurns") return `模型调用次数撞到上限(maxTurns=${limits.maxTurns})`;
@@ -328,10 +392,23 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 			filename: payload.external.filename,
 			corpusHint: "external",
 		});
+		// 这一道只信 E0 自报的 `chunk_count`,作用是在下载整份 artifact **之前**就挡住明显超规模的
+		// 产物;它拦不住「E0 少回了这个字段」——`documents-client.ts` 对非数字落 `0`,恒不触发。
 		if (processed.chunkCount > MAX_EXTERNAL_CHUNKS) {
-			throw new Error(`上传外规切块数 ${processed.chunkCount} 超过上限 ${MAX_EXTERNAL_CHUNKS}`);
+			throw new Error(`上传外规切块数 ${processed.chunkCount} 超过上限 ${MAX_EXTERNAL_CHUNKS}(E0 自报 chunk_count)`);
 		}
 		const doc = await options.artifacts.fetch(processed.artifactKey);
+		// 🔴 本地复核,与阶段 2 对 M1 的 `items.length > MAX_OBLIGATIONS` 是同一姿态:上游自报的数字
+		// 只是提示,真正决定阶段 5 扇出规模的是**这里实际拿到的条款数**。少了这一道,E0 漏回
+		// `chunk_count` 时一份 5000 条款的产物会长驱直入。
+		// 注意两个数不同义:`chunk_count` 是全部切块,这里是过滤掉表格/目录之后的条款块 ——
+		// 后者才是与 `MAX_EXTERNAL_CHUNKS` 同量纲的那个量(它给阶段 4/5 定扇出上界)。
+		if (doc.clauses.length > MAX_EXTERNAL_CHUNKS) {
+			throw new Error(
+				`上传外规解析出 ${doc.clauses.length} 条条款,超过上限 ${MAX_EXTERNAL_CHUNKS}` +
+					`(E0 自报 chunk_count=${processed.chunkCount},以实际解析条数为准)`,
+			);
+		}
 		stage("extracting", 20, 1, 1, `已抽取外规条款 ${doc.clauses.length} 条`);
 
 		// ── 阶段 2:圈定内规义务条款 ──────────────────────────
@@ -374,18 +451,46 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		// ── 阶段 4:正文对齐(纯代码)────────────────────────
 		checkPreempted();
 		const alignment = alignClauses(doc, obligations.items, resolutions.items);
+		// 🔴 扇出护栏(规格 §3.5)。批数是 `ceil(pairs.length / batchSize)`,而 `doc_level` 降级下
+		// pairs 是「内规条款数 × 上传件条款数」的乘积 —— 阶段 2 的 500 条上限完全管不住它。
+		// 超限就在这里响亮停下:继续跑只会撞 maxTurns/maxCostUsd,那两条都是 fail-closed 丢弃整个
+		// output,钱花完、一行结果也拿不到。
+		if (alignment.pairs.length > MAX_PAIRS) {
+			const docLevel = alignment.pairs.filter((p) => p.matchKind === "doc_level").length;
+			throw new Error(
+				`阶段 4 产出 ${alignment.pairs.length} 对待判定条款,超过上限 ${MAX_PAIRS}` +
+					`(内规义务 ${obligations.items.length} 条 × 上传外规 ${doc.clauses.length} 条条款;` +
+					`其中 doc_level 扇出 ${docLevel} 对 —— M2 映射粒度为文档级时一条内规与整篇外规全部条款成对,` +
+					"见规格 §5.2 的降级说明。请收窄 scope 或等条款级映射到位)",
+			);
+		}
 		stage("matching", 55, alignment.pairs.length, obligations.items.length, "正在匹配内部制度条款");
 
 		// ── 阶段 5:模型判定 ─────────────────────────────────
 		const batches = batchPairs(alignment.pairs, batchSize);
 		const verdicts: Verdict[] = [];
+		/** 越界判定的明细。**不静默丢** —— 阶段 6 一并写进 gaps。 */
+		const discardedVerdicts: string[] = [];
 		for (const [i, batch] of batches.entries()) {
 			checkPreempted();
 			const baseIndex = batches.slice(0, i).reduce((n, b) => n + b.length, 0);
 			modelCalls += 1;
 			await session.prompt(renderBatchPrompt(batch, baseIndex));
 			lastActiveAt = Date.now();
-			verdicts.push(...parseVerdicts(session.getLastAssistantText() ?? ""));
+			// 🔴 只采纳落在**本批** pairIndex 区间内的判定。模型若按批内序号从 0 重新编号,它回的
+			// 下标会落到前面批次那几对上,而阶段 6 是「后写覆盖先写」—— 判定会静默挂到错误的条款对
+			// 上,两侧正文却仍是各自的原文,schema 与四条反幻觉全都照过。
+			const parsed = parseVerdicts(session.getLastAssistantText() ?? "", {
+				start: baseIndex,
+				endExclusive: baseIndex + batch.length,
+			});
+			verdicts.push(...parsed.verdicts);
+			for (const received of parsed.outOfRange) {
+				discardedVerdicts.push(
+					`模型回了本批之外的 pairIndex,已丢弃:收到 ${received},` +
+						`本批合法区间 [${baseIndex}, ${baseIndex + batch.length})`,
+				);
+			}
 			stage("judging", 55 + Math.round((35 * (i + 1)) / batches.length), i + 1, batches.length, "正在生成差异判断");
 		}
 
@@ -395,6 +500,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		const extraGaps = [
 			...resolutions.rejected.map((cid) => `resolve_source_law 拒绝了本 run 结果集外的 chunk_id:${cid}`),
 			...resolutions.unresolved.map((cid) => `内规条款 ${cid} 在源库中没有外规映射`),
+			...discardedVerdicts,
 		];
 		const result = buildCoverageResult({
 			alignment,
@@ -477,10 +583,19 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 			const startedAt = Date.now();
 
 			// 挂钟硬顶(评审 Finding 1)。limits 插件只在 `turn_end`(即每次 `session.prompt()`
-			// 完成一轮之后)才有机会检查,看不见"某一次 `documents.process()`/`callTool()` 调用
-			// 本身就挂住了"这种轮内卡死——runTimeoutMs 因此必须由这里另开一个独立定时器兜底,
-			// 与 limits 插件共写同一个 `limitState.tripped`(单一事实来源)。照
-			// fast-path-runtime.ts 的同名定时器。
+			// 完成一轮之后)才有机会检查,看不见"整个 run 已经跑了太久"这件事——runTimeoutMs 因此
+			// 由这里另开一个独立定时器兜底,与 limits 插件共写同一个 `limitState.tripped`(单一事实
+			// 来源)。照 fast-path-runtime.ts 的同名定时器。
+			//
+			// ⚠ 这条定时器**能**做什么、**不能**做什么,如实写清楚(终审 I5):触发时它置
+			// `tripped` 并调 `abortFn()`,而 `abortFn()` 只是 `session.abort()` —— 它打断得了在飞的
+			// `session.prompt()`,打断不了阶段 1/2/3 那三个 await。那三处各自有**自己的**超时,
+			// 不靠这条定时器:
+			//   · `documents.process()` —— `createDocumentsClient` 的 `timeoutMs`,走 AbortController
+			//   · `artifacts.fetch()`   —— `createArtifactStore` 的 `timeoutMs`(Promise.race,不取消底层读)
+			//   · `callTool()`          —— MCP 客户端的 `requestTimeoutMs`(默认 30s)
+			// 少了那三道,一次挂住的调用会让 run() 的 promise 永不 settle,RunManager 的并发令牌被
+			// 永久扣掉一个;这条定时器改不了那个结局,因为它 abort 不了它们。
 			const limits = options.spec.limits;
 			let timer: NodeJS.Timeout | undefined;
 			if (limits.runTimeoutMs !== undefined) {

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { MAX_PAIRS } from "../src/runtime/policy-compare/runtime.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
 import { validateSpec } from "../src/spec/validate.ts";
 
@@ -40,13 +41,15 @@ describe("policy-compare-coverage.json", () => {
 		expect(spec.limits.maxCostUsd).toBe(2.0);
 	});
 
-	// maxTurns 必须严格大于 ceil(MAX_OBLIGATIONS / 最小 batchSize)。最坏情况
-	// MAX_OBLIGATIONS=500、batchSize 下界 1 ⇒ 500 批。撞到 maxTurns 时 PolicyCompareRuntime
-	// fail-closed(status: "limit_exceeded",不返回 output)—— 断言具体数值,防止后人随手把
-	// 600 调小到刚好等于甚至小于 500 而不知道后果。
-	it("maxTurns=600,严格大于最坏情况下的 500 批(MAX_OBLIGATIONS=500 / batchSize 下界 1)", () => {
+	// maxTurns 必须严格大于 ceil(pairs.length / 最小 batchSize)。
+	// ⚠ 分母是**阶段 4 产出的 pairs 数**,不是义务条款数(终审 I1):doc_level 降级下一条内规与
+	// 上传件全部条款成对,pairs 是乘积。约束住 pairs 的是 MAX_PAIRS,所以最坏情况
+	// = ceil(MAX_PAIRS / batchSize 下界 1) = MAX_PAIRS 批。撞到 maxTurns 时 PolicyCompareRuntime
+	// fail-closed(status: "limit_exceeded",不返回 output)—— 从常量算出期望值而不是写死 500,
+	// 这样改动 MAX_PAIRS 而忘了改 maxTurns 时这条会红。
+	it("maxTurns 严格大于最坏情况批数 ceil(MAX_PAIRS / batchSize 下界 1)", () => {
 		expect(spec.limits.maxTurns).toBe(600);
-		expect(spec.limits.maxTurns as number).toBeGreaterThan(500);
+		expect(spec.limits.maxTurns as number).toBeGreaterThan(Math.ceil(MAX_PAIRS / 1));
 	});
 
 	it("不声明 stopPolicy / resultPolicy(两者在本 runtime 上不成立)", () => {

@@ -40,6 +40,19 @@ export function buildCoverageResult(input: BuildInput): CoverageResult {
 	const rows: CoverageRow[] = [];
 	const gaps: string[] = [...(input.extraGaps ?? [])];
 
+	// 🔴 全军覆没:一对都没对上,而全部内规都进了 unmatched。这时输出是一张空表 + N 条一模一样的
+	// `external_clause_not_in_uploaded_document`,读起来像「内规全都没接住外规」,实则多半是**对齐
+	// 本身失效**了 —— 见 align.ts 的说明:doc_no 侧今天恒缺失,对齐实际只剩「标题归一相等」一条腿,
+	// 上传件标题与达梦 doc_title 差一个「(2026年修订)」或一对书名号就会整体落空。
+	// 单独报一条醒目的,排在最前面;N 条明细仍然保留(不静默丢,审计人员要能顺着 chunk_id 回查)。
+	if (alignment.pairs.length === 0 && checkedCount > 0 && alignment.unmatched.length === checkedCount) {
+		gaps.push(
+			`🔴 全部 ${checkedCount} 条内规义务条款都没能对齐到上传外规,零条款对进入判定 —— ` +
+				"这更像对齐失效而不是「内规全都没接住」:阶段 4 今天只有「上传件标题归一后逐字等于映射侧 doc_title」" +
+				"这一条可用判据,请先核对两侧文档标题是否一致,再看下面逐条明细。",
+		);
+	}
+
 	// 记录对齐失败的内规
 	for (const item of alignment.unmatched) {
 		gaps.push(`内规条款 ${item.internalChunkId} 未对齐到上传外规:${item.reason}`);
@@ -135,6 +148,10 @@ export function buildCoverageResult(input: BuildInput): CoverageResult {
 
 	return {
 		compareType: "external_to_internal",
+		// `linked` 恒 0、`linkedDetail` 不产出,是**本轮刻意不做**,不是漏了(规格 §6.1 / §11)。
+		// schema 里留着这两个位是为了对齐 `Java对接协议` §9.3 的 `LinkedDetailPayload`,但本规格
+		// 从未定义谁来填它们 —— 前端的「关联明细」面板本轮因此恒空。要填,得先定「关联」的口径
+		// (关联到审计规则?检查点?),那是另一轮的事。
 		metrics: { checked: checkedCount, missing, conflict, covered, unmatched, linked: 0 },
 		rows,
 		gaps,

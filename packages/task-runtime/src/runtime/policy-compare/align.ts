@@ -84,6 +84,16 @@ function pairOf(
  *   都不中 → unmatched
  *
  * 一条内规可能衍生自多条外规,取**第一条对得上的**;全都对不上才判 unmatched。
+ *
+ * 🔴 **今天第 1 级在真实链路上不可达,`matchKind: "exact"` 也不可达。** `doc.docNo` 由
+ * `artifact-store.ts` 的 `parseArtifact` 填,而它恒填 `undefined`(上传件解析产物里没有发文
+ * 字号这一项)⇒ 下面的 `docNoKey` 恒为空串 ⇒ `refDocNo !== "" && refDocNo === docNoKey` 恒假,
+ * `exactDoc` 同理恒假。**文档一侧的对齐因此只剩「标题归一后逐字相等」这一条腿。**
+ *
+ * 这个脆弱点很实在:上传 PDF 解析出的标题多一个「(2026年修订)」、或映射侧标题带书名号,
+ * 全部内规就会一条不落地进 `unmatched`,输出是一张空表 + 一堆 gaps。`assemble.ts` 对
+ * 「零 pair 且 unmatched == checked」这种全军覆没单独报一条醒目的 gap,就是为了让这种失效
+ * 不被读成「内规全都没接住外规」。要真正修它,得让上传件解析产出 `doc_no`(那在 audit-ai 侧)。
  */
 export function alignClauses(
 	doc: ExternalDocument,

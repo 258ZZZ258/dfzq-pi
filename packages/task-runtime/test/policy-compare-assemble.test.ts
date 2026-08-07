@@ -740,3 +740,55 @@ describe("buildCoverageResult", () => {
 		expect(got.rows).toHaveLength(2);
 	});
 });
+
+/**
+ * 终审 I7:`align.ts` 的对齐今天只剩「上传件标题归一后逐字等于映射侧 doc_title」一条腿
+ * (`doc.docNo` 恒 `undefined` ⇒ 规格 §3.3 第 1 级与 `matchKind: "exact"` 不可达)。
+ * 标题差一个「(2026年修订)」就会全军覆没,而输出是一张空表 + N 条一模一样的
+ * `external_clause_not_in_uploaded_document` —— 读起来像「内规全都没接住外规」。
+ */
+describe("buildCoverageResult · 全军覆没的醒目 gap(终审 I7)", () => {
+	it("零 pair 且 unmatched == checked → 单独报一条,排在 gaps 最前面", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([], ["C-0", "C-1", "C-2"]),
+			verdicts: [],
+			checkedCount: 3,
+			truncated: false,
+		});
+		expect(got.gaps?.[0]).toContain("都没能对齐到上传外规");
+		// 要点明「先去核对标题」——这才是它比 N 条明细多出来的那点信息量
+		expect(got.gaps?.[0]).toContain("标题");
+	});
+
+	it("N 条逐条明细仍然保留(不静默丢:审计人员要能顺着 chunk_id 回查)", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([], ["C-0", "C-1", "C-2"]),
+			verdicts: [],
+			checkedCount: 3,
+			truncated: false,
+		});
+		for (const id of ["C-0", "C-1", "C-2"]) {
+			expect(got.gaps?.join("\n")).toContain(`内规条款 ${id} 未对齐到上传外规`);
+		}
+	});
+
+	it("只是部分没对上 → 不报这条(否则它会变成一条恒真的噪音)", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([pair(0)], ["C-9"]),
+			verdicts: [{ pairIndex: 0, state: "covered" }],
+			checkedCount: 2,
+			truncated: false,
+		});
+		expect(got.gaps?.some((g) => g.includes("都没能对齐到上传外规"))).toBe(false);
+	});
+
+	it("阶段 2 一条义务都没圈到(checked=0)→ 也不报这条(那不是对齐失效)", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([]),
+			verdicts: [],
+			checkedCount: 0,
+			truncated: false,
+		});
+		expect(got.gaps?.some((g) => g.includes("都没能对齐到上传外规"))).toBe(false);
+	});
+});

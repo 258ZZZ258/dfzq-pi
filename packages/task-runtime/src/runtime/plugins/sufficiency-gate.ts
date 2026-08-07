@@ -46,12 +46,15 @@ interface AssessToolResult {
 function assessViaTool(ctx: PluginContext): AssessFn {
 	return async (_clauseIds, matters) => {
 		const raw = (await ctx.callTool("assess_sufficiency", { matters: [...matters] })) as AssessToolResult;
-		const unfetched = Array.isArray(raw?.unfetched) ? raw.unfetched : [];
+		const fetchedCount = typeof raw?.fetched_count === "number" ? raw.fetched_count : 0;
+		const hitCountSufficient = raw?.hit_count_sufficient === true;
 		return {
-			// 判定依据是**取证完整性**,不是 hit_count_sufficient —— 后者只是计数。
-			sufficient: unfetched.length === 0,
+			// 已取到至少一条正文且检索命中达标，就允许模型基于实际引用收束。不能要求把
+			// 每轮宽召回的所有候选都逐一回查：后续检索会持续扩张 unfetched，终局判官会
+			// 反复 reprompt 而永不结束。C6 仍会校验最终 basis 的每个 clause_id 都来自检索。
+			sufficient: hitCountSufficient && fetchedCount > 0,
 			covered: [],
-			missing: unfetched,
+			missing: Array.isArray(raw?.unfetched) && fetchedCount === 0 ? raw.unfetched : [],
 		};
 	};
 }

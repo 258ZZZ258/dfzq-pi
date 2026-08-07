@@ -1,0 +1,32 @@
+{
+  "id": "policy-clause-detail",
+  "description": "受已检索条款定位约束的正文详情回查",
+  "model": { "role": "main" },
+  "thinkingLevel": "low",
+  "toolset": "policy-query",
+  "tools": ["search_policy", "get_clause_detail"],
+  "systemPrompt": "policy-clause-detail/system.md",
+  "appendSystemPrompt": ["policy-clause-detail/output-format.md"],
+  "limits": { "maxTurns": 4, "runTimeoutMs": 90000, "maxTotalTokens": 120000, "maxCostUsd": 0.05 },
+  "resultPolicy": {
+    "name": "result-budget",
+    "options": { "maxHits": { "search_policy": 5 }, "maxChars": { "get_clause_detail": 7700, "default": 3000 } }
+  },
+  "outputContract": { "schema": "policy-clause-detail/output-contract.schema.json", "maxRepairAttempts": 1 },
+  "observability": { "contextSnapshot": "hash" },
+  "mcpServers": [
+    {
+      "id": "policy-query",
+      "command": "${DFZQ_AUDIT_AI_PYTHON}",
+      "args": ["-m", "query.mcp.server"],
+      "cwd": "${DFZQ_AUDIT_AI_ROOT}",
+      "env": {
+        "PIPELINE_CONFIG_DIR": "${PIPELINE_CONFIG_DIR}",
+        "POLICY_MCP_AUDIT_LOG": "${POLICY_MCP_AUDIT_LOG}",
+        "PIPELINE_SPARSE_BACKEND": "${PIPELINE_SPARSE_BACKEND}",
+        "HF_HUB_OFFLINE": "1",
+        "PATH": "${PATH}"
+      }
+    }
+  ]
+}

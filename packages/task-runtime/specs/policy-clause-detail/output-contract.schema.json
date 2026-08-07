@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["clause_id", "found"],
+      "additionalProperties": false,
+      "properties": {
+        "clause_id": { "type": "string", "minLength": 1 },
+        "found": { "const": false }
+      }
+    },
+    {
+      "type": "object",
+      "required": ["clause_id", "found", "doc_title", "clause_path", "text", "status", "source_code", "source_doc_id", "corpus_type"],
+      "additionalProperties": false,
+      "properties": {
+        "clause_id": { "type": "string", "minLength": 1 },
+        "found": { "const": true },
+        "doc_title": { "type": ["string", "null"] },
+        "clause_path": { "type": ["string", "null"] },
+        "text": { "type": ["string", "null"] },
+        "status": { "enum": ["effective", "superseded", "abolished"] },
+        "source_code": { "type": ["string", "null"] },
+        "source_doc_id": { "type": ["string", "null"] },
+        "corpus_type": { "enum": ["internal", "external", "qa", "case"] }
+      }
+    }
+  ]
+}

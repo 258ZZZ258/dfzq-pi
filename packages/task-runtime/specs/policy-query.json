@@ -4,7 +4,7 @@
   "model": {
     "role": "main"
   },
-  "thinkingLevel": "medium",
+  "thinkingLevel": "low",
   "toolset": "policy-query",
   "tools": [
     "search_policy",
@@ -73,6 +73,7 @@
       "env": {
         "PIPELINE_CONFIG_DIR": "${PIPELINE_CONFIG_DIR}",
         "POLICY_MCP_AUDIT_LOG": "${POLICY_MCP_AUDIT_LOG}",
+        "PIPELINE_SPARSE_BACKEND": "${PIPELINE_SPARSE_BACKEND}",
         "HF_HUB_OFFLINE": "1",
         "PATH": "${PATH}"
       }

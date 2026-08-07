@@ -9,7 +9,7 @@
 {
   "conclusion": "结论正文,写给人看的完整回答",
   "basis": [
-    { "clause_id": "…", "score": 0.91, "doc_title": "…", "clause_path": "…", "status": "effective",
+    { "clause_id": "…", "score": 0.91, "doc_title": "…", "clause_path": "…", "text": "…", "status": "effective",
       "source_code": "…", "source_doc_id": "…", "corpus_type": "external" }
   ],
   "reasoning": "推理过程(可选)",
@@ -20,14 +20,13 @@
 }
 ```
 
-**`basis[]` 的元素只能有上面列出的这八个键,一个都不能多。**
+**`basis[]` 的元素只能有上面列出的这九个键,一个都不能多。**
 
 `score` 抄自 `search_policy` 返回里**该条 hit 自己的 `score` 字段**,原样填,不要四舍五入、
 不要自己估。这条 `clause_id` 是从 `enumerate_clauses` 或别处来的、拿不到 score 时,**填 `null`** ——
 编一个数比留空更糟。
 
-尤其**不要**在 `basis[]` 里放 `text` / 原文 / 摘要 —— 条款正文由下游按 `source_code`
-回查权威库装配。你把原文抄进去,输出会被判为不合格并退回。
+`text` 必须逐字填写本次 `get_clause_detail` 返回的条款正文；该字段为 `null` 时填 `null`，不得自行编写、改写或摘要。
 
 条款的具体内容要说给用户听,就写在 `conclusion` 里(用你自己的话概括,或明确标注为引述)。
 

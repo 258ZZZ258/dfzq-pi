@@ -150,22 +150,18 @@ describe("assessViaTool 的判定依据(C3 改语义后的核心)", () => {
 
 	const context = { clauseIds: ["a", "b"], lastText: "", attempt: 0 } as never;
 
-	it("rejects when some retrieved clauses were never fetched, even if the count says sufficient", async () => {
-		// **这条是改语义的全部意义**:C1 的 hit_count_sufficient 只是 len(candidates)>=min_hits
-		// 的计数,底层 assess() 不做任何语义判定。真正有判定力的是 unfetched ——
-		// 「检索到了却没取正文就下结论」。拿计数当判据 = 这个判官形同虚设。
-		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2 });
-		const verdict = await judge.judge(context);
-		expect(verdict.ok).toBe(false);
-		// JudgeVerdict 是可辨识联合,ok:true 那支没有 followUp —— 先窄化再读。
-		if (verdict.ok) throw new Error("expected a rejection");
-		expect(verdict.followUp).toContain("a");
-	});
-
-	it("passes when everything retrieved has been fetched", async () => {
-		const { judge } = gateWith({ hit_count_sufficient: false, unfetched: [], retrieved_count: 2 });
+	it("passes once at least one retrieved clause has been fetched", async () => {
+		// 宽召回后会不断增加 unfetched；若要求全部取正文，终局重判会把模型推入无止境
+		// 的 search/detail 循环。至少一条真实正文 + C6 的引用白名单足以保证可追溯作答。
+		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2, fetched_count: 1 });
 		const verdict = await judge.judge(context);
 		expect(verdict.ok).toBe(true);
+	});
+
+	it("rejects when no retrieved clause has been fetched", async () => {
+		const { judge } = gateWith({ hit_count_sufficient: true, unfetched: ["a"], retrieved_count: 2, fetched_count: 0 });
+		const verdict = await judge.judge(context);
+		expect(verdict.ok).toBe(false);
 	});
 
 	it("calls C1's assess_sufficiency with the extracted matters", async () => {
@@ -177,8 +173,8 @@ describe("assessViaTool 的判定依据(C3 改语义后的核心)", () => {
 		expect(calls[0]?.args.matters).toEqual(["第一个待查要点", "第二个待查要点"]);
 	});
 
-	it("treats a missing unfetched field as nothing outstanding rather than crashing", async () => {
+	it("rejects a missing evidence report rather than treating it as sufficient", async () => {
 		const { judge } = gateWith({});
-		expect((await judge.judge(context)).ok).toBe(true);
+		expect((await judge.judge(context)).ok).toBe(false);
 	});
 });

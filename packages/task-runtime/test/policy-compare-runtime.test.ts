@@ -86,6 +86,14 @@ describe("parseCoveragePayload", () => {
 			expect(withScope({ organizations: "东方证券" })).toThrow(/organizations/);
 		});
 
+		// 复审 Minor 3:非数组的 organizations 此前先撞「必须是非空字符串数组」的形状错误,暗示
+		// 改成数组就能过;改成 `["东方证券"]` 重试后才真正撞见「未实现」——两轮才诊断得清。现在
+		// 不管形状对不对,一次性说清「未实现」,不再先诱导去修形状。
+		it("organizations 非数组时,错误信息一次说清「未实现」,不先诱导按数组格式重传(Minor 3)", () => {
+			expect(withScope({ organizations: "东方证券" })).toThrow(/未实现/);
+			expect(withScope({ organizations: "东方证券" })).not.toThrow(/必须是非空字符串数组/);
+		});
+
 		it("null 与缺席同义:按「不限」处理,不抛", () => {
 			const got = parseCoveragePayload({
 				...ok,

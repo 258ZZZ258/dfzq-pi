@@ -36,8 +36,11 @@ export interface DocumentsClientOptions {
 	 *
 	 * 🔴 这不是可选的加固,是 `PolicyCompareRuntime` 那条 `runTimeoutMs` 定时器兜不住的洞:
 	 * 那个定时器触发时只调 `session.abort()`,打断得了在飞的 `session.prompt()`,打断不了这里的
-	 * `fetch`。不传 `signal` 时挂住的 `fetch` 会让 `run()` 的 promise 永不 settle,`RunManager`
-	 * 的并发令牌被永久扣掉一个 —— 一次挂死就少一个并发额度,且不会自愈。
+	 * `fetch`。生产路径不传 `fetchImpl` 时用的是 Node 内置 `fetch`(undici),挂住不是真的永不
+	 * settle —— undici 默认的 headersTimeout/bodyTimeout(各 300s)会兜底,但 300s 足以把 `run()`
+	 * 的 promise 拖到远超 `runTimeoutMs` 之后才 settle;如果注入的是别的 `fetchImpl`(比如测试里的
+	 * 假实现),这层 undici 保底也不存在,那就真的可能永不 settle。这里的 `timeoutMs` 才是唯一能
+	 * 保证「不超过这个数」的那道闸 —— 挂住超时后 `RunManager` 的并发令牌会被扣掉一个,且不会自愈。
 	 */
 	timeoutMs?: number;
 }

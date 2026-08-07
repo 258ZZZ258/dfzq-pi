@@ -83,10 +83,21 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 		}
 	}
 	const scope = (p.scope ?? {}) as Record<string, unknown>;
-	// 非数组也要拒绝:`organizations: "东方证券"` 走 Array.isArray 判假就被放行,
-	// 与「静默忽略一个范围收窄参数 = 越权返回」这条原则自相矛盾
-	if (parseScopeStringArray(scope.organizations, "payload.scope.organizations")?.length) {
-		throw new Error("payload.scope.organizations 非空 —— 「适用组织」维度本轮无可用数据列,未实现(不静默忽略)");
+	// `organizations` 本轮压根没实现(PG 无对应列)—— 这个判断跟值的形状对不对无关,所以要在
+	// 形状校验**之前**做。此前借道 `parseScopeStringArray` 校验形状:非数组值(如
+	// `organizations: "东方证券"`,没包数组的常见上游 bug)会先撞上那条「必须是非空字符串数组」的
+	// 消息,暗示「改成数组就能过」;调用方改成 `["东方证券"]` 重试后才真正撞见「未实现」——两轮
+	// 报错才诊断得清。这里直接判「有没有传东西」,不管形状对不对,一次说清。
+	const rawOrganizations = scope.organizations;
+	const organizationsGiven =
+		rawOrganizations !== undefined &&
+		rawOrganizations !== null &&
+		!(Array.isArray(rawOrganizations) && rawOrganizations.length === 0);
+	if (organizationsGiven) {
+		throw new Error(
+			`payload.scope.organizations 非空 —— 「适用组织」维度本轮无可用数据列,未实现(不静默忽略,` +
+				`不论传的是什么形状都一样拒;收到:${JSON.stringify(rawOrganizations)})`,
+		);
 	}
 	const outputTypes = p.outputTypes;
 	if (outputTypes !== undefined) {
@@ -594,8 +605,16 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 			//   · `documents.process()` —— `createDocumentsClient` 的 `timeoutMs`,走 AbortController
 			//   · `artifacts.fetch()`   —— `createArtifactStore` 的 `timeoutMs`(Promise.race,不取消底层读)
 			//   · `callTool()`          —— MCP 客户端的 `requestTimeoutMs`(默认 30s)
-			// 少了那三道,一次挂住的调用会让 run() 的 promise 永不 settle,RunManager 的并发令牌被
-			// 永久扣掉一个;这条定时器改不了那个结局,因为它 abort 不了它们。
+			// 这条定时器 abort 不了它们,这点三条腿共通;但「少了各自那道会怎样」并不是同一句话能
+			// 概括的,三条腿差得远:
+			//   · `artifacts.fetch()` 背后的 MinIO `getObject` 与读流两步都没有自带超时,拿掉
+			//     `timeoutMs` 这层 `Promise.race` 后是真的可能永不 settle。
+			//   · `documents.process()` 背后是 undici 的 `fetch`,拿掉 `timeoutMs`/`AbortController`
+			//     后还有 undici 默认的 headersTimeout/bodyTimeout(各 300s)兜底 —— 会拖得远超
+			//     `runTimeoutMs`,但不是永不(见 `documents-client.ts` 的说明)。
+			//   · `callTool()` 本来就有 MCP 客户端默认 30s 的 `requestTimeoutMs` 兜着 —— 这道边界
+			//     内建在通用 MCP 客户端里,不是 `PolicyCompareRuntime` 这层配的,也不会因为这里
+			//     漏配什么而消失。
 			const limits = options.spec.limits;
 			let timer: NodeJS.Timeout | undefined;
 			if (limits.runTimeoutMs !== undefined) {

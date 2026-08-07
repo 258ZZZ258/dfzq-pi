@@ -791,4 +791,20 @@ describe("buildCoverageResult · 全军覆没的醒目 gap(终审 I7)", () => {
 		});
 		expect(got.gaps?.some((g) => g.includes("都没能对齐到上传外规"))).toBe(false);
 	});
+
+	// 复审发现:`gaps` 用 `[...extraGaps]` 初始化,这条醒目 gap 此前是 `push` 进去的 —— extraGaps
+	// 非空时(M2 的 rejected/unresolved、C1 的越界判定明细)它恒排在醒目 gap 前面,与注释「排在最
+	// 前面」不符。改成 `unshift` 后补这条测试锁住顺序:extraGaps 非空也不能盖过它。
+	it("extraGaps 非空时,醒目 gap 仍然顶到 gaps[0](unshift,不被 extraGaps 盖过)", () => {
+		const got = buildCoverageResult({
+			alignment: alignment([], ["C-0", "C-1", "C-2"]),
+			verdicts: [],
+			checkedCount: 3,
+			truncated: false,
+			extraGaps: ["resolve_source_law 拒绝了本 run 结果集外的 chunk_id:C-9"],
+		});
+		expect(got.gaps?.[0]).toContain("都没能对齐到上传外规");
+		// extraGaps 没有被顶掉,仍然在数组里(只是不再是第一条)
+		expect(got.gaps?.join("\n")).toContain("C-9");
+	});
 });

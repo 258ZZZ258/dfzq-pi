@@ -1,12 +1,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import type { RuntimeEvent } from "../src/runtime/contract.ts";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
-import type { ArtifactStore } from "../src/runtime/policy-compare/artifact-store.ts";
-import type { DocumentsClient } from "../src/runtime/policy-compare/documents-client.ts";
 import {
 	createPolicyCompareRuntime,
 	DEFAULT_BATCH_SIZE,
@@ -14,9 +10,9 @@ import {
 	type PolicyCompareRuntimeOptions,
 	parseCoveragePayload,
 } from "../src/runtime/policy-compare/runtime.ts";
-import type { RuntimeLimits } from "../src/spec/types.ts";
 import { ToolsetRegistry } from "../src/toolsets/registry.ts";
-import { createFauxHarness, fauxAssistantMessage } from "./helpers/faux.ts";
+import { fauxAssistantMessage } from "./helpers/faux.ts";
+import { buildRuntime, cleanupPolicyCompareHarnesses, profile, verdictReply } from "./helpers/policy-compare.ts";
 
 const ok = {
 	external: { objectKey: "upload/U1/a.pdf", uploadId: "U1", filename: "a.pdf" },
@@ -59,187 +55,9 @@ const schema = JSON.parse(
 	readFileSync(fileURLToPath(new URL("../specs/policy-compare/coverage.schema.json", import.meta.url)), "utf8"),
 );
 
-const profile: ProviderProfile = {
-	id: "test",
-	baseUrl: "http://localhost/v1",
-	apiKeyEnv: "TEST_KEY",
-	api: "openai-completions",
-	roles: {
-		main: {
-			provider: "faux",
-			modelId: "faux",
-			contextWindow: 8192,
-			maxTokens: 1024,
-			reasoning: false,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		},
-	},
-};
-
-let cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
-	for (const fn of cleanups.reverse()) await fn();
-	cleanups = [];
+	await cleanupPolicyCompareHarnesses();
 });
-
-const ARTIFACT = {
-	upload_id: "U1",
-	doc: { title: "基准外规", page_count: 1, chunk_count: 2 },
-	chunks: [
-		{ seq: 0, clause_path: "第五条", chunk_type: "clause", text: "外规第五条正文", is_table: false },
-		{ seq: 1, clause_path: "第十条", chunk_type: "clause", text: "外规第十条正文", is_table: false },
-	],
-	markdown: "",
-};
-
-interface HarnessOpts {
-	modelReplies: string[];
-	obligationCount?: number;
-	unresolvedIds?: string[];
-	batchSize?: number;
-	/** M2 的 rejected 明细(与 unresolved 是两个不同的字段,都要进 extraGaps)。 */
-	rejectedIds?: string[];
-	/** 阶段 2 命中的库内真实总条数;缺省与 obligationCount 相同(未截断)。 */
-	libraryTotal?: number;
-	/** 阶段 2 是否撞到 limit 被截断。 */
-	truncated?: boolean;
-	/** 覆盖 documents.process 的默认实现 —— 用于触发切块数超上限等失败路径。 */
-	documents?: DocumentsClient;
-	/** 覆盖 artifacts.fetch 的默认实现 —— 用于触发外规解析失败路径。 */
-	artifacts?: ArtifactStore;
-	/** 让 list_internal_obligations 直接回这个形状(绕开正常生成),测 toObligations 的 fail-closed。 */
-	obligationsRawOverride?: unknown;
-	/** 让 resolve_source_law 直接回这个形状,测 toResolutions 的 fail-closed。 */
-	resolutionsRawOverride?: unknown;
-	/** 覆盖 outputContractSchema —— 用于让阶段 6 校验必然判负。 */
-	outputContractSchemaOverride?: unknown;
-	/** 覆盖 spec.limits —— 用于测 maxTurns/runTimeoutMs 触顶。缺省是宽松值(不会触发)。 */
-	limits?: RuntimeLimits;
-	/** list_internal_obligations 的 execute() 在返回前先 await 这个 —— 用来在阶段 2 的工具
-	 *  调用悬而未决时人为制造一个可控窗口,测「阶段 2→3 边界」的 checkPreempted()。 */
-	gateObligations?: Promise<void>;
-	/** 同上,卡在 resolve_source_law 的 execute() 返回前 —— 测「阶段 3→4 边界」。 */
-	gateResolutions?: Promise<void>;
-	/** 绕开 `modelReplies` 到 `fauxAssistantMessage` 的直接映射,直接把 FauxResponseStep[] 传给
-	 *  `faux.setResponses`——某几项可以是返回 Promise 的工厂函数,用来卡住某一批的
-	 *  `session.prompt()`,测「阶段 5 循环内」与「阶段 5→6 边界」这两个 checkPreempted()。 */
-	rawModelResponses?: unknown[];
-}
-
-async function buildRuntime(o: HarnessOpts) {
-	const harness = await createFauxHarness();
-	cleanups.push(harness.cleanup);
-	harness.faux.setResponses((o.rawModelResponses ?? o.modelReplies.map((r) => fauxAssistantMessage(r))) as never);
-
-	const n = o.obligationCount ?? 2;
-	const paths = ["第五条", "第十条"];
-	const toolCalls: string[] = [];
-	const obligationsArgs: Record<string, unknown>[] = [];
-	const resolutionsArgs: Record<string, unknown>[] = [];
-	const registry = new ToolsetRegistry();
-	registry.register("pc", async () => [
-		{
-			name: "list_internal_obligations",
-			label: "list_internal_obligations",
-			description: "faux",
-			parameters: Type.Object({ limit: Type.Optional(Type.Number()) }),
-			execute: async (_id: string, params: Record<string, unknown>) => {
-				toolCalls.push("list_internal_obligations");
-				obligationsArgs.push(params);
-				if (o.gateObligations) await o.gateObligations;
-				if (o.obligationsRawOverride !== undefined) {
-					const body = JSON.stringify(o.obligationsRawOverride);
-					return { output: body, content: body };
-				}
-				const items = Array.from({ length: n }, (_, i) => ({
-					chunk_id: `C-${i}`,
-					clause_path: `内第${i}条`,
-					doc_title: "内规",
-					doc_no: "内〔2026〕1号",
-					deontic_type: "obligation",
-					evidence: "应当",
-					text: `内规第${i}条正文`,
-					source_code: `SC-${i}`,
-				}));
-				const body = JSON.stringify({
-					items,
-					total: o.libraryTotal ?? n,
-					truncated: o.truncated ?? false,
-				});
-				return { output: body, content: body };
-			},
-		} as never,
-		{
-			name: "resolve_source_law",
-			label: "resolve_source_law",
-			description: "faux",
-			parameters: Type.Object({ chunk_ids: Type.Array(Type.String()) }),
-			execute: async (_id: string, params: Record<string, unknown>) => {
-				toolCalls.push("resolve_source_law");
-				resolutionsArgs.push(params);
-				if (o.gateResolutions) await o.gateResolutions;
-				if (o.resolutionsRawOverride !== undefined) {
-					const body = JSON.stringify(o.resolutionsRawOverride);
-					return { output: body, content: body };
-				}
-				const ids = params.chunk_ids as string[];
-				const unresolved = new Set(o.unresolvedIds ?? []);
-				const items = ids
-					.filter((cid) => !unresolved.has(cid))
-					.map((cid, i) => ({
-						chunk_id: cid,
-						source_laws: [
-							{ doc_no: null, doc_title: "基准外规", clause_path: paths[i % paths.length], source_code: "X" },
-						],
-					}));
-				const body = JSON.stringify({ items, rejected: o.rejectedIds ?? [], unresolved: [...unresolved] });
-				return { output: body, content: body };
-			},
-		} as never,
-	]);
-
-	const runtime = await createPolicyCompareRuntime({
-		spec: {
-			id: "policy-compare-coverage",
-			model: { role: "main" },
-			toolset: "pc",
-			tools: ["list_internal_obligations", "resolve_source_law"],
-			limits: o.limits ?? { maxTurns: 100, runTimeoutMs: 1_800_000 },
-		},
-		profile,
-		registry: createDefaultPluginRegistry(),
-		toolsets: registry,
-		cwd: harness.cwd,
-		agentDir: harness.agentDir,
-		// ⚠ 用 `!== undefined` 而不是 `??`:`??` 对 `null` 也会回退,而其中一条测试故意传
-		// `outputContractSchemaOverride: null` 去逼 `Value.Check` 抛错 —— 用 `??` 会让那个
-		// `null` 静默被换回真 schema,测试名不副实。
-		outputContractSchema: o.outputContractSchemaOverride !== undefined ? o.outputContractSchemaOverride : schema,
-		payload: { external: { objectKey: "upload/U1/a.pdf", uploadId: "U1", filename: "a.pdf" }, scope: {} },
-		documents: o.documents ?? {
-			process: async () => ({
-				uploadId: "U1",
-				artifactKey: "artifact/U1.json",
-				title: "基准外规",
-				pageCount: 1,
-				chunkCount: 2,
-				status: "ok",
-			}),
-		},
-		artifacts: o.artifacts ?? {
-			fetch: async () => {
-				const { parseArtifact } = await import("../src/runtime/policy-compare/artifact-store.ts");
-				return parseArtifact(JSON.stringify(ARTIFACT));
-			},
-		},
-		batchSize: o.batchSize,
-		modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
-	});
-	cleanups.push(() => runtime.dispose());
-	return { runtime, toolCalls, obligationsArgs, resolutionsArgs, faux: harness.faux };
-}
-
-const verdictReply = (items: unknown[]) => "```json\n" + JSON.stringify({ verdicts: items }) + "\n```";
 
 /** Polls `predicate` until it's true. 与 fast-path-runtime.test.ts 的同名 helper 同一手法
  *  (照抄,未合并进共享 helpers/):等一个异步中间态出现,再继续断言。 */

@@ -122,8 +122,51 @@ export interface RuntimeSpec {
 	/**
 	 * 非空时,本 spec 由**确定性工作流** runtime 驱动,而不是 SessionRuntime。
 	 * 取值即工作流名,由 server/main.ts 的工厂分派。缺省 = SessionRuntime(agent 自主编排)。
+	 *
+	 * 与下面的 `fastPath` 是**两条不同的路**,不要混:`fastPath` 仍然走 SessionRuntime 的
+	 * 那套装配(只是把模型调用压成固定 2 次、不达标就升级回 agent 自主编排);`workflow`
+	 * 则整条换成另一个 `Runtime` 实现,连 SessionRuntime 都不经过。两者同时声明没有意义,
+	 * 校验见 `validate.ts`。
 	 */
 	workflow?: "policy-compare";
+
+	/** 缺省不填 = 不启用,既有 spec 行为不变。 */
+	fastPath?: FastPathSpec;
+}
+
+/**
+ * 快路径:模型调用次数固定为 2 次(先改写检索词,再对代码检索好的正文一次作答)。
+ * 缺省不填 = 不启用,既有 spec 行为不变。产出不达标时升级回既有的 agent 自主编排路径 ——
+ * 升级判定与两次模型调用的编排由后续任务实现,本接口这里只声明配置,不做调度。
+ *
+ * **不另起 spec 文件**:`src/router/router.ts` 的 `SpecRouter` 构造函数(12-19 行)保证
+ * taskKind → spec 1:1(重复 id 装配期抛);`loadSpecRouter`(40-52 行)按目录下每个 `.json`
+ * 文件各自 parse 出一个 spec,一个文件对应一个 taskKind。另起文件会凭空多出一个 Java 不会调的
+ * taskKind。
+ */
+export interface FastPathSpec {
+	enabled: boolean;
+	/**
+	 * 快路径的 system prompt,**文件路径**(与 `RuntimeSpec.systemPrompt` 同一套语义:
+	 * 无条件当路径处理,构造期读成正文,读不到直接抛)。
+	 *
+	 * ⚠ 必须**中性**:两次模型调用共用同一个 AgentSession ⇒ 共用同一份 system prompt。
+	 * 把输出契约写进这里,模型①(改写检索词那次)会直接吐 JSON 而不是改写词。
+	 * 输出契约放 `answerPrompt`。
+	 */
+	systemPrompt: string;
+	/** 模型① 的 user 消息模板,文件路径,同 `systemPrompt` 的路径语义。 */
+	rewritePrompt: string;
+	/** 模型② 的 user 消息模板(含输出契约正文),文件路径,同 `systemPrompt` 的路径语义。 */
+	answerPrompt: string;
+	/** 取正文的 clause_id 条数上限。 */
+	maxClauses: number;
+	/** 快路径自己的限额。`maxTurns` 不适用(结构固定 2 次模型调用)。 */
+	limits: RuntimeLimits;
+	/** 缺省沿用 `RuntimeSpec.thinkingLevel`。 */
+	thinkingLevel?: ThinkingLevel;
+	/** 覆盖 C4 result-budget 的 `maxChars`。 */
+	maxChars?: Record<string, number>;
 }
 
 export function pluginName(ref: PluginRef): string {

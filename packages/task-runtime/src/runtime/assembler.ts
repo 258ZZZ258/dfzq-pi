@@ -82,11 +82,15 @@ export interface Assembled {
 	resources: DefaultResourceLoader;
 	/**
 	 * 不经 agent loop 直接调本次装配的工具。与 `PluginContext.callTool` **是同一个函数**
-	 * (assemble() 内部只造一次),合成事件与未知工具名的响亮报错都一致。
+	 * (assemble() 内部只造一次),所以合成事件、未知工具名的响亮报错都一致。
 	 *
-	 * 🔴 与 `emitPluginToolEvent` 那条约束的关系:那条说的是「callTool 的结果不得进 C6 的
-	 * clauseIds」,针对的是**插件探针**。确定性工作流不同 —— 代码取回并拼进模型 prompt 的
-	 * 就是模型的证据,所以工作流**必须自己维护证据集合**,只收真正拼进 prompt 的那批。
+	 * 两个消费方,都是「模型看不见工具、检索由代码发起」的形态:`FastPathRuntime`(阶段 1
+	 * 的检索)与 `PolicyCompareRuntime`(阶段 2/3 的 M1/M2 调用)。
+	 *
+	 * 🔴 与 `emitPluginToolEvent` 那条硬性约束的关系:那条说的是「callTool 的结果不得进
+	 * C6 的 clauseIds」,针对的是**插件探针**(探针取回的东西不是模型的证据)。上面两个
+	 * 消费方不同 —— 代码取回并拼进模型 prompt 的**就是**模型的证据,所以它们**各自维护
+	 * 自己的证据集合**,只收真正拼进 prompt 的那批。那条约束本身不动。
 	 */
 	callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
 	dispose: () => Promise<void>;

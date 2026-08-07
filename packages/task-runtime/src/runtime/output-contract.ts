@@ -119,6 +119,23 @@ function describeKeyDiff(diff: KeyDiff): string {
 }
 
 /**
+ * 从 basis[] 数组的元素里取字符串 clause_id;元素不是对象、没有这个键、或值不是字符串,
+ * 都直接跳过(不计入返回值,也不报错)。
+ *
+ * `checkConditional` 的反幻觉判据与 `sufficiency-gate.ts` 的 `extractBasisClauseIds`
+ * 共用这一份 —— Task 2 引入 `extractBasisClauseIds` 时与此处逐字重复,本任务合并。
+ * basis 是否为空、整段 JSON 能否解析,分别由各自调用方在调用前后处理,这个函数只认
+ * "给定一个数组,从里面挑得出字符串 clause_id 的元素"。
+ */
+export function extractClauseIds(basis: readonly unknown[]): string[] {
+	return basis
+		.map((item) =>
+			typeof item === "object" && item !== null ? (item as { clause_id?: unknown }).clause_id : undefined,
+		)
+		.filter((id): id is string => typeof id === "string");
+}
+
+/**
  * §4.2 的条件约束 + 反幻觉。返回错误说明,通过时返回 undefined。
  *
  * **⚠ 反幻觉这一段的有效性寄生在 schema 上,这里不强制、也强制不了(2026-07-31 全分支
@@ -148,12 +165,7 @@ function checkConditional(json: ContractShape, clauseIds: readonly string[]): st
 	}
 	// 反幻觉:引用的条款必须是本 run 真检索到过的。
 	const retrieved = new Set(clauseIds);
-	const invented = basis
-		.map((item) =>
-			typeof item === "object" && item !== null ? (item as { clause_id?: unknown }).clause_id : undefined,
-		)
-		.filter((id): id is string => typeof id === "string")
-		.filter((id) => !retrieved.has(id));
+	const invented = extractClauseIds(basis).filter((id) => !retrieved.has(id));
 	if (invented.length > 0) {
 		const detail = `basis 里的 clause_id 未出现在本次检索结果中:${invented.join("、")}`;
 		// retrieved 全空是这个兜底最容易被误读的情形:文案读起来像"模型编造了引用",但真实
@@ -169,6 +181,65 @@ function checkConditional(json: ContractShape, clauseIds: readonly string[]): st
 	return undefined;
 }
 
+export type ContractCheck = { ok: true; value: unknown } | { ok: false; detail: string; followUp: string };
+
+/**
+ * 输出契约校验的**唯一实现**。C6 判官(`createOutputContractJudge`)调它;快路径的
+ * `judgeFastPathOutput`(`fast-path-runtime.ts`)也调它 —— 两处各写一套必然漂移,而这一份
+ * 正是反幻觉兜底(风险 10)的唯一落点。
+ */
+export function validateOutputContract(text: string, schema: unknown, clauseIds: readonly string[]): ContractCheck {
+	const extracted = extractJsonBlock(text);
+	if (extracted.kind === "absent") {
+		return {
+			ok: false,
+			detail: "未找到 JSON 块",
+			followUp: "输出不符合契约:未找到 JSON 块。请仅输出符合 schema 的 JSON,不要夹带其他文字。",
+		};
+	}
+	if (extracted.kind === "unparsable") {
+		const detail = `JSON 解析失败:${extracted.error}`;
+		return {
+			ok: false,
+			detail,
+			followUp:
+				`输出不符合契约:${detail}\n出错位置附近的原文:\n${extracted.snippet}\n` +
+				`请修正这处语法错误后重新输出完整 JSON。`,
+		};
+	}
+	const json = extracted.value;
+
+	// typebox 的 Value.Check 直接吃 draft-07 裸 schema(enum / additionalProperties /
+	// type:["string","null"] 均正确),不必再引第二个校验库。错误对象的路径字段是
+	// instancePath,不是 path。
+	if (!Value.Check(schema as never, json)) {
+		const first = [...Value.Errors(schema as never, json)][0];
+		const instancePath = first?.instancePath ?? "";
+		const where = instancePath === "" ? "(root)" : instancePath;
+		const detail = `${where} ${first?.message ?? "schema 校验失败"}`;
+		// 差集按**第一条错误所指的那一层**算,不是恒取顶层:第 5 次真 run 的错误在
+		// /basis/0,恒取顶层会给出一份与病因无关的差集,把模型引向没错的字段。
+		const diff = keyDiffAt(schema, json, instancePath);
+		const diffText = diff ? `。该层键差异:${describeKeyDiff(diff)}` : "";
+		return {
+			ok: false,
+			detail,
+			followUp: `输出不符合契约:${detail}${diffText}。请仅输出符合 schema 的 JSON。`,
+		};
+	}
+
+	const conditional = checkConditional(json as ContractShape, clauseIds);
+	if (conditional !== undefined) {
+		return {
+			ok: false,
+			detail: conditional,
+			followUp: `输出不符合契约:${conditional}。clause_id 必须来自本次检索结果,不得臆造;补齐后重新输出 JSON。`,
+		};
+	}
+
+	return { ok: true, value: json };
+}
+
 export function createOutputContractJudge(options: { schema: unknown; maxRepairAttempts: number }): FinalJudge {
 	return {
 		name: "output-contract",
@@ -176,55 +247,8 @@ export function createOutputContractJudge(options: { schema: unknown; maxRepairA
 		// 输出不合契约是硬失败:Java 拿不到能解析的结果,不能假装成功。
 		onExhausted: "error",
 		judge: async (context: JudgeContext): Promise<JudgeVerdict> => {
-			const extracted = extractJsonBlock(context.lastAssistantText);
-			if (extracted.kind === "absent") {
-				return {
-					ok: false,
-					detail: "未找到 JSON 块",
-					followUp: "输出不符合契约:未找到 JSON 块。请仅输出符合 schema 的 JSON,不要夹带其他文字。",
-				};
-			}
-			if (extracted.kind === "unparsable") {
-				const detail = `JSON 解析失败:${extracted.error}`;
-				return {
-					ok: false,
-					detail,
-					followUp:
-						`输出不符合契约:${detail}\n出错位置附近的原文:\n${extracted.snippet}\n` +
-						`请修正这处语法错误后重新输出完整 JSON。`,
-				};
-			}
-			const json = extracted.value;
-
-			// typebox 的 Value.Check 直接吃 draft-07 裸 schema(enum / additionalProperties /
-			// type:["string","null"] 均正确),不必再引第二个校验库。错误对象的路径字段是
-			// instancePath,不是 path。
-			if (!Value.Check(options.schema as never, json)) {
-				const first = [...Value.Errors(options.schema as never, json)][0];
-				const instancePath = first?.instancePath ?? "";
-				const where = instancePath === "" ? "(root)" : instancePath;
-				const detail = `${where} ${first?.message ?? "schema 校验失败"}`;
-				// 差集按**第一条错误所指的那一层**算,不是恒取顶层:第 5 次真 run 的错误在
-				// /basis/0,恒取顶层会给出一份与病因无关的差集,把模型引向没错的字段。
-				const diff = keyDiffAt(options.schema, json, instancePath);
-				const diffText = diff ? `。该层键差异:${describeKeyDiff(diff)}` : "";
-				return {
-					ok: false,
-					detail,
-					followUp: `输出不符合契约:${detail}${diffText}。请仅输出符合 schema 的 JSON。`,
-				};
-			}
-
-			const conditional = checkConditional(json as ContractShape, context.clauseIds);
-			if (conditional !== undefined) {
-				return {
-					ok: false,
-					detail: conditional,
-					followUp: `输出不符合契约:${conditional}。clause_id 必须来自本次检索结果,不得臆造;补齐后重新输出 JSON。`,
-				};
-			}
-
-			return { ok: true };
+			const checked = validateOutputContract(context.lastAssistantText, options.schema, context.clauseIds);
+			return checked.ok ? { ok: true } : { ok: false, detail: checked.detail, followUp: checked.followUp };
 		},
 	};
 }

@@ -84,6 +84,72 @@ describe("cli", () => {
 		).rejects.toMatchObject({ stderr: expect.stringContaining("DFZQ_ABSENT_KEY") });
 	});
 
+	// 复审必修2:cli/main.ts 从不检查 spec.fastPath,fastPath.enabled:true 的 spec 经这条 CLI 路径
+	// 跑会静默走 agent 路径,无任何提示 —— 这里锁的是 cli/main.ts 新加的那句 console.error 告警
+	// 真的会打出来,不是锁 CLI 支持了快路径(它没有,也不要求它支持)。复用上面同一条"缺 API
+	// key"失败路径,顺带证明告警不吞掉、也不改变原有的失败原因。
+	it(
+		"warns to stderr when spec.fastPath.enabled is true, then still fails the run on the missing api key as before",
+		{ timeout: CASE_TIMEOUT_MS },
+		async () => {
+			root = await mkdtemp(join(tmpdir(), "cli-fastpath-warn-"));
+			const specPath = join(root, "spec.json");
+			const profilePath = join(root, "profile.json");
+			await writeFile(join(root, "fast-system.md"), "快路径 system prompt 正文\n");
+			await writeFile(join(root, "fast-rewrite.md"), "快路径改写 prompt 正文\n");
+			await writeFile(join(root, "fast-answer.md"), "快路径回答 prompt 正文\n");
+			await writeFile(
+				specPath,
+				JSON.stringify({
+					id: "demo",
+					model: { role: "main" },
+					toolset: "mcp",
+					tools: ["echo"],
+					limits: { maxTurns: 3 },
+					mcpServers: [{ id: "echo", command: process.execPath, args: [SERVER], env: {} }],
+					fastPath: {
+						enabled: true,
+						systemPrompt: "fast-system.md",
+						rewritePrompt: "fast-rewrite.md",
+						answerPrompt: "fast-answer.md",
+						maxClauses: 5,
+						limits: { runTimeoutMs: 1000 },
+					},
+				}),
+			);
+			await writeFile(
+				profilePath,
+				JSON.stringify({
+					id: "test",
+					baseUrl: "http://localhost/v1",
+					apiKeyEnv: "DFZQ_ABSENT_KEY",
+					api: "openai-completions",
+					roles: {
+						main: {
+							provider: "p",
+							modelId: "m",
+							contextWindow: 8192,
+							maxTokens: 1024,
+							reasoning: false,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						},
+					},
+				}),
+			);
+			const error = (await run(
+				process.execPath,
+				[CLI, "run", "--spec", specPath, "--profile", profilePath, "--workdir", root, "--input", "hi"],
+				{ timeout: EXEC_TIMEOUT_MS },
+			).catch((e: unknown) => e)) as { code?: number; stderr?: string };
+
+			expect(error.code).toBe(1);
+			expect(error.stderr).toContain("fastPath.enabled=true");
+			expect(error.stderr).toContain("does not support the fast path");
+			// 告警之后仍然照常在缺 API key 上失败 —— 不是把原有失败原因吞掉或换掉。
+			expect(error.stderr).toContain("DFZQ_ABSENT_KEY");
+		},
+	);
+
 	// Task 15d 复审 Critical-2 的 CLI 半边回归锁:resolveSpecPromptPaths(现在是
 	// src/spec/resolve-prompt-paths.ts,cli/main.ts 与 server/main.ts 共用同一份实现)在
 	// cli/main.ts 里的调用点(main.ts 里紧跟在 outputContractSchema 之后那一行)此前**零覆盖**

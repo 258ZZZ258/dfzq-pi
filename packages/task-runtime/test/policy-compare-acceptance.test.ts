@@ -11,13 +11,17 @@ import { buildRuntime, cleanupPolicyCompareHarnesses, verdictReply } from "./hel
  * 给出可以直接跳转核实的落点。真正补的是 A1(此前只有 schema 单测,没有端到端产出过一份
  * 真结果去过 schema)与 A7(此前没有一处把 `PolicyCompareRuntime` 自己管线上的五个
  * fail-closed 闸门集中列在同一份"档 1 全部判据都能逐条指认"的文件里)。A7-1/A7-3 此前确实
- * 没有任何测试;A7-2/A7-5 与 `policy-compare-runtime.test.ts` 已有的单测覆盖同一道闸,这里
- * 是经完整 runtime 装配的集成级复查;A7-4 也有一条同名结论的既存测试,但那条是手写一个
- * `artifacts.fetch` 直接 `throw` 固定文案(伪造的错),这里的 `artifactNoClauses` 走真实
- * `parseArtifact` 去解析一份 `chunks: []` 的产物——两者不是一回事:后者才真的验证了
- * `parseArtifact` 自己那道零条款块校验存在且接到了这条装配路径上(下面「两次变异测试」的
- * 第一条就是删掉 `parseArtifact` 里那道真校验,确认 A7-4 会红——如果 A7-4 也是伪造的
- * throw,这个变异测试根本测不出任何东西)。
+ * 没有任何测试。A7-2/A7-4/A7-5 与 `policy-compare-runtime.test.ts` 已有的用例结论重叠,但
+ * 重叠的方式各不相同,**不是一句"集成级复查"能一概而论的**——具体差别见各条用例上方的
+ * 行内注释:A7-2 与既有那条其实都经完整 runtime 装配(两者都调 `buildRuntime()`/
+ * `runtime.run()`),差别只在喂入畸形 M1 响应的入口(`obligationsRawOverride` vs 本任务新加
+ * 的 `obligationsMalformed`),不存在"纯函数级 vs 集成级"的层次差;A7-5 与既有那条才是真的
+ * 有层次差(既有那条直接调导出的 `parseCoveragePayload()`,不经过 runtime 装配);A7-4 与
+ * 既有那条的差别在于喂入的 `artifacts.fetch` 实现——既有那条手写 `throw` 固定文案(伪造的
+ * 错),这条的 `artifactNoClauses` 走真实 `parseArtifact` 解析一份 `chunks: []` 的产物,
+ * 真的验证了 `parseArtifact` 自己那道零条款块校验存在且接到了这条装配路径上(下面「两次
+ * 变异测试」的第一条就是删掉 `parseArtifact` 里那道真校验,确认 A7-4 会红——如果 A7-4 也是
+ * 伪造的 throw,这个变异测试根本测不出任何东西)。
  *
  * ┌────┬──────────────────────────────────┬──────────────────────────────────────────────┐
  * │ 判据 │ 规格 §8.1 定义                      │ 落点(档 1)                                      │
@@ -136,10 +140,13 @@ describe("制度比对 · 档 1 验收(无语料,fixture + fake MCP)", () => {
 	});
 
 	// ⚠ 与 policy-compare-runtime.test.ts 的"list_internal_obligations 返回形状不对(缺 items
-	// 数组)→ 不产出结果"几乎是同一件事,那条测的是 toObligations() 这个纯函数级别的分支;这里
-	// 用 buildRuntime 走完整 createPolicyCompareRuntime 装配再验一遍,是**合法的集成级复查**
-	// (确认 fail-closed 不会在装配/接线的某处被悄悄吞掉),不是重复造轮子,但也不是"此前缺失"
-	// ——只是在这份验收文件里再确认一次「档 1 逐条可指认」这条要求。
+	// 数组)→ 不产出结果"几乎是同一件事,**两条都**经 buildRuntime()/runtime.run() 走完整
+	// createPolicyCompareRuntime 装配——不存在"那条是纯函数级、这条是集成级"的层次差
+	// (toObligations 本身是 runtime.ts 里模块私有、未导出的函数,没有任何测试直接调它)。
+	// 两条真正的差别只在喂入畸形 M1 响应的入口不同:既有那条用 `obligationsRawOverride:
+	// { notItems: true }`,这条用本任务新加的 `obligationsMalformed: true` 便捷开关(回一个
+	// 更贴近真实 M1 故障形状的 `{"total":0}`,见 HarnessOpts 里的注释)。这里复述一遍是为了让
+	// 这份验收文件能自足地逐条指认 A7,不用跳去另一个文件才能确认 A7-2 这道闸测过。
 	it("A7-2 fail-closed:M1 返回形状不对 ⇒ error,不当成零义务", async () => {
 		const { runtime } = await buildRuntime({ modelReplies: [verdictReply([])], obligationsMalformed: true });
 		const result = await runtime.run("比对");

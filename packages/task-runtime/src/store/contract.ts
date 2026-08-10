@@ -17,6 +17,12 @@ export interface RunRecord {
 	/** ★ Java jCasbin 预计算的授权位,原样存档,不解析后再存(设计文档 §5.7)。 */
 	filtersJson: string;
 	optionsJson?: string;
+	/**
+	 * 结构化任务输入(如「制度比对」的外规 objectKey/uploadId/filename),原样存档。
+	 * 与 filtersJson 同款纪律:不补默认值 —— 是事后审计「这个 run 当时拿到的任务输入是
+	 * 什么」的唯一凭证。可缺省:`policy-query` 等不需要结构化输入的 taskKind 不传。
+	 */
+	payloadJson?: string;
 	status: StoredRunStatus;
 	input: string;
 	output?: string;

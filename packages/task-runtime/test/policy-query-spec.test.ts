@@ -1,10 +1,13 @@
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
 import { assemble } from "../src/runtime/assembler.ts";
 import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
+import { deriveFastSpec } from "../src/runtime/fast-path-runtime.ts";
 import type { PluginContext } from "../src/runtime/plugin-registry.ts";
 import { resolveSpecPromptPaths } from "../src/spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../src/spec/types.ts";
@@ -73,6 +76,53 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(Object.keys(schema.properties.basis.items.properties).sort()).toEqual([...BASIS_KEYS].sort());
 	});
 
+	// 2026-08-04 复审 必修1:fast-answer.md 是本分支新增的第二份契约正文(policy-query 提速
+	// 规格的两阶段快路径专用,与 output-format.md 共用同一份 output-contract.schema.json)。
+	// 上面那条八键联动用例只读 output-format.md —— fast-answer.md 此前唯一的断言是下面
+	// "keeps the fast answer prompt carrying the output contract..." 那条的
+	// toContain("finish_reason"),八个 basis 键里其余七个(尤其 source_code —— 缺了它
+	// 下游按 source_code 回查权威库装配条款正文的那一步会断)完全没人守。这里把同一个
+	// BASIS_KEYS 循环也跑一遍 fast-answer.md —— 今天全中,是纯加固,不改变现状。
+	it("keeps the eight basis keys present in fast-answer.md's contract text too", () => {
+		const contract = readFileSync(`${specDir}policy-query/fast-answer.md`, "utf8");
+		for (const key of BASIS_KEYS) {
+			expect(contract).toContain(key);
+		}
+	});
+
+	// 2026-08-04 定点修复(第二刀):真 run 判负实锤之一是模型在 reasoning 这个自由文本字段里
+	// 写了未转义的双引号,JSON 语法断裂。reasoning 不在 schema 的 required 里、类型是
+	// string——不输出它完全合法,顺带还少一段自由文本输出。fast-answer.md 因此不该再用一行
+	// JSON 示例邀请模型去填它。
+	//
+	// ⚠ 这里只断言 JSON 示例里不再出现 `"reasoning"` 这个**带双引号的键形态**(它才是诱使模型
+	// 抄写出该字段的直接原因),不是断言全文任何地方都不出现"reasoning"这个词 —— 下面那道
+	// 显式禁令必须点名这个字段(用反引号 `reasoning` 而非 JSON 双引号)才有意义,两者不是同一
+	// 种出现形态,不冲突。全文字面零命中"reasoning"这个约束与"必须写一句明确点名它的禁令"
+	// 本身互斥,这里取的是两条要求背后真正要防的事(schema 挡不住的自由文本字段)。
+	it("drops the JSON-example reasoning key from fast-answer.md and explicitly tells the model not to emit it", () => {
+		const contract = readFileSync(`${specDir}policy-query/fast-answer.md`, "utf8");
+		expect(contract).not.toContain('"reasoning"');
+		expect(contract).toContain("不要输出 `reasoning` 字段");
+	});
+
+	// 2026-08-05 定点修复(第三刀):去掉 reasoning 字段没有根治转义问题 —— 真 run 判负实锤
+	// 显示模型在 basis[] 之外、schema 里*必填*的 conclusion 这个自由文本字段里也会写英文直引号
+	// (两例:「独立董事最多可以在几家上市公司兼任」在 conclusion 附近断裂于 position 545;
+	// 「投顾荐股违规怎么认定」模型用直引号包住了"违规行为"、断裂于 position 112)。conclusion
+	// 不能像 reasoning 那样直接从契约里去掉 —— 它是必填字段,唯一能做的是引导模型换一种引用词句
+	// 的写法。
+	//
+	// ⚠ 这条断言只锁"指令文本还在 fast-answer.md 里"这一件事 —— 挡的是有人以后重构/精简这份
+	// 契约时把这句顺手删掉。它不能也不试图证明模型会遵守这条指令:提示词指令对模型只是软约束,
+	// 13% 基线的转义错误率是否下降,只能靠真实 runFast() 调用观测方向性信号,不是靠这条纯文本
+	// 存在性断言。toContain 的字符串特意取到"不要用英文直引号"为止,不含后面解释"为什么"的分句
+	// (避免断言过脆 —— 解释句可以改写而不影响这条指令的可执行部分)。
+	it("tells the model to use Chinese quotation marks instead of straight double quotes inside string fields", () => {
+		const contract = readFileSync(`${specDir}policy-query/fast-answer.md`, "utf8");
+		expect(contract).toContain("请用中文引号「」,不要用英文直引号");
+	});
+
 	// output-contract.ts:42-59 那条寄生前提的静态半边:schema 少了这个 required,
 	// 反幻觉兜底会静默消失而所有测试照常通过。动态半边是 Task 18 的 A8。
 	it("requires clause_id on every basis element — the anti-hallucination carrier", () => {
@@ -106,6 +156,37 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(options.maxChars.get_clause_detail).toBe(7700);
 		expect(options.maxChars.enumerate_clauses).toBe(14900);
 		expect(options.maxChars.default).toBe(3000);
+	});
+
+	it("ships fastPath disabled by default", () => {
+		const fastPath = spec.fastPath as { enabled?: boolean } | undefined;
+		expect(fastPath?.enabled).toBe(false);
+	});
+
+	it("points fastPath at three prompt files that exist", async () => {
+		const fastPath = spec.fastPath as Record<"systemPrompt" | "rewritePrompt" | "answerPrompt", string>;
+		for (const key of ["systemPrompt", "rewritePrompt", "answerPrompt"] as const) {
+			await expect(readFile(resolve(specDir, fastPath[key]), "utf8")).resolves.toBeTruthy();
+		}
+	});
+
+	// deriveFastSpec 的注释(fast-path-runtime.ts)与 M-1 的裁定:`result-budget` 挂在 pi 的
+	// `tool_result` hook 上做截断,而阶段 1 的检索全部经 `Assembled.callTool` 直打
+	// `tool.execute()`,绕过 agent loop,该 hook 不会触发。`fastPath.maxChars` 因此是一份配了
+	// 也不生效的配置——出厂 spec 不设它,防止未来有人照着 `resultPolicy.options.maxChars` 的
+	// 样子给 fastPath 也填一份、造出一句看着在生效实则空转的谎。阶段 1 证据块大小唯一生效的
+	// 护栏是 `maxClauses`。
+	it("does not configure fastPath.maxChars — the result-budget hook never fires on the fast path's direct tool.execute() retrieval, so the key would be dead config", () => {
+		const fastPath = spec.fastPath as { maxChars?: unknown } | undefined;
+		expect(fastPath?.maxChars).toBeUndefined();
+	});
+
+	it("keeps the fast answer prompt carrying the output contract, not the system prompt", async () => {
+		const fastPath = spec.fastPath as Record<"systemPrompt" | "answerPrompt", string>;
+		const sys = await readFile(resolve(specDir, fastPath.systemPrompt), "utf8");
+		const ans = await readFile(resolve(specDir, fastPath.answerPrompt), "utf8");
+		expect(sys).not.toContain("finish_reason");
+		expect(ans).toContain("finish_reason");
 	});
 });
 
@@ -241,6 +322,91 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 			expect(assembled.session.systemPrompt).not.toContain("policy-query/output-format.md");
 		} finally {
 			await cleanup();
+		}
+	});
+});
+
+// 2026-08-04 复审 I-2:文件级断言(下面 "keeps the fast answer prompt carrying the output
+// contract..." 那条)只读 fast-system.md 的**文件内容**,断不到 skillPaths 传/不传对装配后的
+// system prompt 有什么影响。这里直接调用 deriveFastSpec(生产代码本体,不是重新实现一遍派生
+// 逻辑)+ assemble(),把断言下沉到**装配后**的 assembled.session.systemPrompt 上,锁的是
+// "skillPaths 传/不传如何影响 assemble() 的产出"这条机制本身。
+//
+// **这条 describe 不锁什么**:两条用例都直接调 deriveFastSpec + assemble(),不经过
+// createDefaultRuntimeFactory 里 buildFast()/createFastPathRuntime 那次真实调用(server/main.ts
+// 232-256 行)——main.ts 那个调用点到底有没有真的省略 skillPaths,不在这条 describe 的覆盖范围
+// 内:下面第一条用例"刻意不传 skillPaths"是测试自己选定的输入,不是从 main.ts 读出来的实际调用
+// 参数;main.ts 那个调用点即便被人改成也传 skillPaths,这两条用例都不会跟着翻红。
+//
+// ⚠ 实测记录,不是凭空推断:第一条用例本想用"传 skillPaths vs 不传"做对照来证明断言有区分力,
+// 但实测发现 pi 的 buildSystemPrompt(packages/coding-agent/src/core/system-prompt.ts:64-66)
+// 有一道 assembler.ts 注释没提到的额外闸门 —— customPrompt 分支下,只有 selectedTools 包含
+// "read" 时才会把 additionalSkillPaths 拼进 <available_skills>。policy-query 的 spec.tools
+// 是固定的 5 个领域工具,两个阶段都从未包含 "read",于是"传不传 skillPaths"在出厂 spec 原样的
+// tools 下**结果相同**——今天的系统提示里本来就不会出现 <available_skills>,不是靠不传
+// skillPaths 才躲开的。第一条用例只断言"不传 skillPaths 时确实没有",不再声称这个断言有实测
+// 区分力;第二条用例改用人为加了 "read" 的 tools 列表,实测复现"传 skillPaths 确实会把
+// evidence-standard.md 描述里的 confidence 一词带进 system prompt"这个机制是真实存在的,以此
+// 说明 main.ts 为什么仍然刻意不给阶段 1 传 skillPaths(阶段 1 本来就没有任何工具,传
+// skillPaths 对它没有用处;而工具白名单一旦将来变化到包含 "read",同一处代码会从"无影响"
+// 变成"真的泄漏")——不是假装这个症状在今天的出厂 spec 上就能观察到。
+describe("阶段 1 装配后的 system prompt 不该带 skills 摘要(2026-08-04 复审 I-2)", () => {
+	it("omitting skillPaths keeps the skills digest out of the assembled prompt", async () => {
+		const runtimeSpec = freshRuntimeSpec();
+		await resolveSpecPromptPaths(runtimeSpec, specDir);
+		const derived = deriveFastSpec(runtimeSpec);
+
+		const harness = await createFauxHarness();
+		const assembled = await assemble({
+			pluginContext: fauxPluginContext(),
+			spec: derived,
+			profile: fauxProfile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: policyQueryToolsets(derived.tools),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			// 刻意不传 skillPaths —— main.ts 现在装配阶段 1 时也是这么做的(I-2)。
+		});
+		try {
+			expect(assembled.session.systemPrompt).not.toContain("<available_skills>");
+			expect(assembled.session.systemPrompt).not.toContain("confidence");
+		} finally {
+			await assembled.dispose();
+			await harness.cleanup();
+		}
+	});
+
+	it("demonstrates the skills→'confidence' leak mechanism with a synthetic 'read'-inclusive tool list — the reason stage 1 deliberately omits skillPaths, even though today's real whitelist never triggers it", async () => {
+		const runtimeSpec = freshRuntimeSpec();
+		await resolveSpecPromptPaths(runtimeSpec, specDir);
+		const derived = deriveFastSpec(runtimeSpec);
+		// 与 createDefaultRuntimeFactory 构造期算 skillPaths 的方式一致(server/main.ts):
+		// spec.skills 相对 specsDir 解析成绝对路径。
+		const resolvedSkillPaths = (runtimeSpec.skills ?? []).map((rel) => resolve(specDir, rel));
+		expect(resolvedSkillPaths.length).toBeGreaterThan(0); // 前提:出厂 spec 真的声明了 skills
+		// 人为加 "read"——policy-query 出厂 spec 今天不会这么配,这里只是撬开
+		// customPromptHasRead 那道闸门,复现机制本身。
+		const withReadTool = { ...derived, tools: [...derived.tools, "read"] };
+
+		const harness = await createFauxHarness();
+		const assembled = await assemble({
+			pluginContext: fauxPluginContext(),
+			spec: withReadTool,
+			profile: fauxProfile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: policyQueryToolsets(withReadTool.tools),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+			skillPaths: resolvedSkillPaths, // 复现"仍然传 skillPaths"的写法
+		});
+		try {
+			expect(assembled.session.systemPrompt).toContain("<available_skills>");
+			expect(assembled.session.systemPrompt).toContain("confidence"); // evidence-standard.md 的 description
+		} finally {
+			await assembled.dispose();
+			await harness.cleanup();
 		}
 	});
 });

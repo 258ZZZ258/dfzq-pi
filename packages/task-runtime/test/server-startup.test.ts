@@ -2,10 +2,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Runtime } from "../src/runtime/contract.ts";
 import { createDefaultRuntimeFactory, startServer } from "../src/server/main.ts";
 import * as sqliteModule from "../src/store/sqlite.ts";
 import { createSqliteRunStore } from "../src/store/sqlite.ts";
+import { startMockOpenAiServer } from "./fixtures/mock-openai-server.mjs";
 import { createStubRuntime, type StubRuntime } from "./helpers/stub-runtime.ts";
 
 /** 构造期不会真的拨号验证 provider——这里只要是能被 JSON.parse 成 ProviderProfile 形状的
@@ -388,6 +391,246 @@ describe("createDefaultRuntimeFactory - systemPrompt / appendSystemPrompt resolu
 		const factory = await createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir });
 		expect(typeof factory).toBe("function");
 	});
+});
+
+// Task 4 复审 I-1 的回归锁:resolve-prompt-paths.ts 里 fastPath 三个 prompt 字段的解析分支,
+// 在这条用例补上之前**零覆盖**——test/spec.test.ts 的 fastPath 用例全部直接调 validateSpec,
+// 不经过 resolveSpecPromptPaths;把 resolve-prompt-paths.ts 里 fastPath 那段解析代码整段删掉,
+// npm test --workspace=@dfzq/task-runtime 一条都不会红(与上面 Critical-2 那条回归锁守的是同一
+// 类型的坑,只是换了 spec.systemPrompt / spec.fastPath 两个不同字段)。这里照上面
+// "①坏 systemPrompt" 那条用例的同一范式补上,断在生产调用点(server/main.ts:163 的
+// resolveSpecPromptPaths),不是直接调 resolveSpecPromptPaths 函数本身。
+describe("createDefaultRuntimeFactory - fastPath prompt resolution (Task 4 复审 I-1)", () => {
+	it("fails at construction time when fastPath.answerPrompt cannot be read, not on the first run", async () => {
+		const specsDir = join(root, "specs");
+		// systemPrompt / rewritePrompt 都指向真实存在的文件——只让 answerPrompt 触发失败,
+		// 这样断言的 /fastPath\.answerPrompt/ 才是精确定位到那一个字段,不是三选一撞上的。
+		await writeFile(join(specsDir, "fp-system.md"), "快路径 system prompt 正文\n");
+		await writeFile(join(specsDir, "fp-rewrite.md"), "快路径改写 prompt 正文\n");
+		await writeFile(
+			join(specsDir, "bad-fastpath-answer-prompt.json"),
+			JSON.stringify({
+				id: "bad-fastpath-answer-prompt",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				fastPath: {
+					enabled: true,
+					systemPrompt: "fp-system.md",
+					rewritePrompt: "fp-rewrite.md",
+					answerPrompt: "missing-fp-answer.md",
+					maxClauses: 12,
+					limits: { runTimeoutMs: 5000 },
+				},
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		await expect(
+			createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir }),
+		).rejects.toThrow(/fastPath\.answerPrompt/);
+	});
+});
+
+// Task 10 变异检验的回归锁:main.ts 的 runtimeFactory 尾部有一条 `if (!spec.fastPath?.enabled)
+// return buildFull();` 分支,决定一个 run 是直接走既有的 agent 路径,还是先经
+// createFastPathRuntime + createEscalatingRuntime 走快路径。这条分支只在「真的存在一个
+// fastPath.enabled:true 的 spec 被真的调用」时才会被走到——出厂 spec 缺省 enabled:false,
+// 所有既有测试都只经过 buildFull() 那半边,这条分支本身此前**零覆盖**。实测:把它改成
+// `if (true) return buildFull();`(即无论 enabled 是什么都直接走 agent 路径),
+// `npm test --workspace=@dfzq/task-runtime` 在补这条用例之前一条都不红。
+//
+// 探针选择:createFastPathRuntime 装配期第一件事就是校验 outputContractSchema 存在,不存在
+// 直接抛"requires outputContractSchema"(fast-path-runtime.ts),且这一步在它自己调用
+// assemble() 之前——这是它区别于 agent 路径(createSessionRuntime)最早暴露的行为:agent
+// 路径缺省不挂 C6,压根不要求这个参数。用一个不声明 outputContract 的 fastPath spec 当探针:
+// 真的被路由进 createFastPathRuntime 才会看到这句报错;被 buildFull() 接住的话,minimalProfile()
+// 用的 apiKeyEnv 指向一个不存在的环境变量 "X",assemble() 会先撞上 provider-profile.ts 那句
+// "Environment variable X is not set"——变异检验实测(下面把判据分支改成 `if (true)
+// return buildFull();`)看到的正是这条,不是本条注释最初设想的工具白名单校验(那一步排在
+// apiKeyEnv 解析之后,轮不到它报错)。两条路径给出的错误互不相同就够用,不依赖真实 MCP 子进程
+// 或真实模型调用,构造和断言都很轻量。
+describe("createDefaultRuntimeFactory - fastPath wiring is actually taken when enabled (Task 10 变异检验)", () => {
+	it("routes an enabled fastPath spec through createFastPathRuntime, not straight into the agent path", async () => {
+		const specsDir = join(root, "specs");
+		await writeFile(join(specsDir, "wired-fp-system.md"), "快路径 system prompt 正文\n");
+		await writeFile(join(specsDir, "wired-fp-rewrite.md"), "快路径改写 prompt 正文\n");
+		await writeFile(join(specsDir, "wired-fp-answer.md"), "快路径回答 prompt 正文\n");
+		await writeFile(
+			join(specsDir, "fastpath-wired.json"),
+			JSON.stringify({
+				id: "fastpath-wired",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["a"],
+				limits: { maxTurns: 3 },
+				// 刻意不声明 outputContract——是这条探针成立的前提,见上方 describe 的注释。
+				fastPath: {
+					enabled: true,
+					systemPrompt: "wired-fp-system.md",
+					rewritePrompt: "wired-fp-rewrite.md",
+					answerPrompt: "wired-fp-answer.md",
+					maxClauses: 5,
+					limits: { runTimeoutMs: 1000 },
+				},
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		await writeFile(profilePath, JSON.stringify(minimalProfile()));
+		const factory = await createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir });
+		await expect(
+			factory({
+				specId: "fastpath-wired",
+				sessionId: "s1",
+				runId: "r1",
+				filters: { corpusTypes: [] },
+				options: {},
+			}),
+		).rejects.toThrow(/createFastPathRuntime requires outputContractSchema/);
+	});
+});
+
+// 2026-08-04 复审 I-3:上面那条锁只证明了"路由进了 createFastPathRuntime",装配在
+// outputContractSchema 缺失那一步就提前 reject 了,够不到"两阶段各自的 buildToolsets() 是否
+// 真的独立"、"createEscalatingRuntime 是否真的把 FastPathRuntime 包了起来"这两件事——它们只在
+// 真的发生一次升级、两次 buildToolsets() 都被调用到时才会暴露。要抓住这两类 bug 必须真正驱动
+// 一次"阶段 1 判负 → 真升级 → 阶段 2 重新装配",光靠不落地的假装配置不够。
+//
+// 复用仓库里已有的两个端到端 fixture(test/cli.test.ts 已经在用它们跑真实子进程):
+//   - echo-mcp-server.mjs:真 spawn 的 stdio MCP server,只提供 "echo"/"boom"/"leak" 三个工具。
+//   - mock-openai-server.mjs:进程内 HTTP、OpenAI 兼容,不区分请求内容,固定回一段非 JSON 文本。
+//
+// 触发真实升级不需要伪造"模型两次给不同回答"或额外基础设施,固定回复就够:
+//   1. 抢跑 `assembled.callTool("search_policy", …)`(fast-path-runtime.ts 的 headStart)—— toolset
+//      只提供 "echo" 不提供 "search_policy",这次调用会抛"toolset 不提供该工具"(assembler.ts 的
+//      Assembled.callTool / PluginContext.callTool 是同一个函数,按 toolset 实际提供的工具名找,
+//      不看 spec.tools 白名单),被 headStart 的 `.catch(() => [])` 吃掉,得到空列表。
+//   2. 模型①(改写检索词)收到的是 mock server 固定回的非 JSON 文本,`parseRewriteTerms` 解析成
+//      空数组,规格 §2.4 的降级路径生效(不升级、继续用抢跑结果),但抢跑本身也是空列表。
+//   3. 两条线索合并后 `merged.length === 0` ⇒ 用"检索无命中"升级——`spec.tools` 只需要声明
+//      "echo"(echo-mcp-server.mjs 真的提供的工具),不需要声明 "search_policy" 之类的名字:
+//      阶段 1 的模型本来就看不到任何工具(setActiveToolsByName([])),这条工具白名单只用来过
+//      assemble() 的交叉校验,不影响上面第 1 步能不能调用到 "search_policy"。
+describe("createDefaultRuntimeFactory - 快路径真升级时的接线(2026-08-04 复审 I-3 配方 A + B)", () => {
+	const SERVER = fileURLToPath(new URL("./fixtures/echo-mcp-server.mjs", import.meta.url));
+	const API_KEY_ENV = "DFZQ_TEST_FASTPATH_ESCALATION_KEY";
+
+	let mockServer: Awaited<ReturnType<typeof startMockOpenAiServer>> | undefined;
+	let rt: Runtime | undefined;
+
+	afterEach(async () => {
+		if (rt) await rt.dispose();
+		rt = undefined;
+		delete process.env[API_KEY_ENV];
+		if (mockServer) {
+			await mockServer.close();
+			mockServer = undefined;
+		}
+	});
+
+	async function buildEscalatingRuntime(): Promise<Runtime> {
+		mockServer = await startMockOpenAiServer({ finalText: "mock: 不是 JSON,逼真实升级发生。" });
+		const specsDir = join(root, "specs");
+		await writeFile(join(specsDir, "esc-fp-system.md"), "快路径 system prompt 正文\n");
+		await writeFile(join(specsDir, "esc-fp-rewrite.md"), "快路径改写 prompt 正文\n");
+		await writeFile(join(specsDir, "esc-fp-answer.md"), "快路径回答 prompt 正文\n");
+		await writeFile(
+			join(specsDir, "esc-schema.json"),
+			JSON.stringify({
+				type: "object",
+				required: ["conclusion", "basis", "finish_reason", "confidence"],
+				properties: {
+					conclusion: { type: "string" },
+					basis: { type: "array" },
+					finish_reason: { enum: ["stop", "refused"] },
+					confidence: { enum: ["high", "medium", "low"] },
+				},
+			}),
+		);
+		await writeFile(
+			join(specsDir, "escalation.json"),
+			JSON.stringify({
+				id: "escalation",
+				model: { role: "main" },
+				toolset: "t",
+				tools: ["echo"],
+				// maxTurns 故意压得很低:阶段 2 的固定假回复大概率过不了 C6,不需要让重试/repair
+				// 循环跑完才终止,压低 maxTurns 让它尽快撞 limit_exceeded,测试更快、更确定。
+				limits: { maxTurns: 2 },
+				mcpServers: [{ id: "echo", command: process.execPath, args: [SERVER], env: {} }],
+				outputContract: { schema: "esc-schema.json" },
+				fastPath: {
+					enabled: true,
+					systemPrompt: "esc-fp-system.md",
+					rewritePrompt: "esc-fp-rewrite.md",
+					answerPrompt: "esc-fp-answer.md",
+					maxClauses: 5,
+					limits: { runTimeoutMs: 5000 },
+				},
+			}),
+		);
+		const profilePath = join(root, "profile.json");
+		process.env[API_KEY_ENV] = "sk-test-unused";
+		await writeFile(
+			profilePath,
+			JSON.stringify({
+				id: "test",
+				baseUrl: mockServer.baseUrl,
+				apiKeyEnv: API_KEY_ENV,
+				api: "openai-completions",
+				roles: {
+					main: {
+						provider: "mock",
+						modelId: "mock-model",
+						contextWindow: 8192,
+						maxTokens: 1024,
+						reasoning: false,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					},
+				},
+			}),
+		);
+		const factory = await createDefaultRuntimeFactory({ profilePath, workRoot: join(root, "work"), specsDir });
+		return factory({
+			specId: "escalation",
+			sessionId: "s1",
+			runId: "r1",
+			// 空 corpusTypes 会被 mcp/adapter.ts 的 assertScope 判"无授权范围"直接拒绝
+			// (fail-closed,不是本测试要触碰的分支)——两个阶段都要真的走到 assemble() 的
+			// 工具解析,必须给一个非空值。
+			filters: { corpusTypes: ["internal"] },
+			options: {},
+		});
+	}
+
+	it(
+		"配方 A:装配后拿到的对象不是 FastPathRuntime 本身 —— 证明真的被 createEscalatingRuntime 包过",
+		{ timeout: CASE_TIMEOUT_MS },
+		async () => {
+			rt = await buildEscalatingRuntime();
+			// createEscalatingRuntime(escalating-runtime.ts)的返回对象只满足 Runtime 接口,
+			// 没有 runFast;FastPathRuntime 才有(fast-path-runtime.ts 的 FastPathRuntime extends
+			// Runtime,多出 runFast)。main.ts 若漏了包装、直接把 fast 当 Runtime 返回,这里会是
+			// true——这条断言不依赖真的调用 .run(),装配完成的那一刻就能查。
+			expect("runFast" in rt).toBe(false);
+		},
+	);
+
+	it(
+		"配方 B:真实升级发生时,阶段 2 的 buildToolsets() 独立成功(不会撞 already registered)",
+		{ timeout: CASE_TIMEOUT_MS },
+		async () => {
+			rt = await buildEscalatingRuntime();
+			const result = await rt.run("测试问题:员工能不能这样操作?", {});
+			// 不断言具体 status——阶段 2 用同一个固定假回复,大概率过不了 C6 的 schema 校验或撞
+			// maxTurns,两种都是合理终态。这里要锁的只是"升级过程本身没有抛错"(尤其不是
+			// `Toolset "..." is already registered`),以及"阶段 2 真的发起了自己的模型请求"
+			// (不是被短路掉、什么都没做就返回)。
+			expect(typeof result.status).toBe("string");
+			expect(mockServer?.requests.length ?? 0).toBeGreaterThan(1);
+		},
+	);
 });
 
 // 以下用例来自评审对 main.ts 的复审(Critical + Important),补在 brief 逐字采用的

@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RunResult } from "../src/runtime/contract.ts";
 import type { NewRun, RunStore } from "../src/store/contract.ts";
@@ -185,5 +186,73 @@ describe("sqlite run store", () => {
 
 	it("deleteRun on an unknown runId does not throw", () => {
 		expect(() => store.deleteRun("no-such-run")).not.toThrow();
+	});
+
+	it("payload_json 原样存档并读回(嵌套结构 + null 值一字不差)", () => {
+		// 嵌套 + null 值特意挑来验证「原样」:如果实现在存档前后走过一趟
+		// JSON.parse/JSON.stringify 之类的往返而不是原样字符串,这条最容易先暴露出差异。
+		const payloadJson = JSON.stringify({
+			external: { objectKey: "k1", uploadId: "U1", filename: "f.pdf", meta: { pages: 10, ocr: null } },
+			note: null,
+		});
+		store.insertQueued(newRun({ payloadJson }));
+		expect(store.findByRunId("run-1")?.payloadJson).toBe(payloadJson);
+	});
+
+	it("不传 payload 时该列为 undefined,不补默认值", () => {
+		store.insertQueued(newRun());
+		expect(store.findByRunId("run-1")?.payloadJson).toBeUndefined();
+	});
+
+	it("迁移幂等:对已存在但没有 payload_json 列的库文件重新打开,列被补上且既有行完好", () => {
+		const dbPath = join(root, "legacy.db");
+		// 手写迁移前的 DDL(没有 payload_json 列),模拟本仓已经在生产跑着的旧库文件。
+		const legacy = new DatabaseSync(dbPath);
+		legacy.exec(`
+			CREATE TABLE runs (
+			  run_id            TEXT PRIMARY KEY,
+			  client_request_id TEXT NOT NULL,
+			  request_id        TEXT,
+			  spec_id           TEXT NOT NULL,
+			  task_kind         TEXT NOT NULL,
+			  session_id        TEXT NOT NULL,
+			  filters_json      TEXT NOT NULL,
+			  options_json      TEXT,
+			  status            TEXT NOT NULL,
+			  input             TEXT NOT NULL,
+			  output            TEXT,
+			  error_message     TEXT,
+			  stop_reason       TEXT,
+			  limit_hit         TEXT,
+			  usage_json        TEXT,
+			  turns             INTEGER,
+			  created_at        INTEGER NOT NULL,
+			  started_at        INTEGER,
+			  finished_at       INTEGER
+			);
+		`);
+		legacy.exec(
+			`INSERT INTO runs (run_id, client_request_id, spec_id, task_kind, session_id, filters_json, status, input, created_at)
+			 VALUES ('legacy-1', 'legacy-cli-1', 'demo', 'demo', 'sess', '{"corpusTypes":["internal"]}', 'queued', 'hi', 1000)`,
+		);
+		legacy.close();
+
+		// 用带迁移逻辑的实现重新打开同一个文件:既有行的其它列必须完好,新列缺省为 undefined。
+		const migrated = createSqliteRunStore(dbPath);
+		const row = migrated.findByRunId("legacy-1");
+		expect(row?.payloadJson).toBeUndefined();
+		expect(row?.input).toBe("hi");
+		expect(row?.clientRequestId).toBe("legacy-cli-1");
+		expect(row?.filtersJson).toBe('{"corpusTypes":["internal"]}');
+
+		// 幂等:列已存在后再次打开不报错(ALTER TABLE ADD COLUMN 不会重复执行),
+		// 且新插入的行能正常写读 payload_json。
+		migrated.close();
+		expect(() => {
+			const reopened = createSqliteRunStore(dbPath);
+			reopened.insertQueued(newRun({ runId: "legacy-2", clientRequestId: "legacy-cli-2", payloadJson: '{"x":1}' }));
+			expect(reopened.findByRunId("legacy-2")?.payloadJson).toBe('{"x":1}');
+			reopened.close();
+		}).not.toThrow();
 	});
 });

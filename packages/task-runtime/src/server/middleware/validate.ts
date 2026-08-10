@@ -26,6 +26,10 @@ const FiltersSchema = Type.Object({
 const SubmitBodySchema = Type.Object({
 	taskKind: Type.String({ minLength: 1 }),
 	input: Type.String({ minLength: 1 }),
+	// 结构化任务输入。`input` 保持字符串不动 —— 各 spec 自己的 payload 形状由 runtime 在
+	// 装配期校验,HTTP 这层只保证「是个对象」。**不允许把结构化输入塞进 input 的 JSON 字符串**:
+	// 那会绕过本文件上面的四档 fail-closed 校验,错误全部退化成运行期。
+	payload: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 	clientRequestId: Type.String({ minLength: 1 }),
 	requestId: Type.Optional(Type.String()),
 	sessionId: Type.Optional(Type.String()),

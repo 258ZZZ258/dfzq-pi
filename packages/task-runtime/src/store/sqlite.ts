@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS runs (
   session_id        TEXT NOT NULL,
   filters_json      TEXT NOT NULL,
   options_json      TEXT,
+  payload_json      TEXT,
   status            TEXT NOT NULL,
   input             TEXT NOT NULL,
   output            TEXT,
@@ -46,6 +47,7 @@ interface RunRow {
 	session_id: string;
 	filters_json: string;
 	options_json: string | null;
+	payload_json: string | null;
 	status: string;
 	input: string;
 	output: string | null;
@@ -70,6 +72,7 @@ function toRecord(row: RunRow): RunRecord {
 		sessionId: row.session_id,
 		filtersJson: row.filters_json,
 		optionsJson: row.options_json ?? undefined,
+		payloadJson: row.payload_json ?? undefined,
 		status: row.status as StoredRunStatus,
 		input: row.input,
 		output: row.output ?? undefined,
@@ -93,11 +96,18 @@ export function createSqliteRunStore(path: string): RunStore {
 	db.exec("PRAGMA journal_mode = WAL");
 	db.exec("PRAGMA foreign_keys = ON");
 	db.exec(DDL);
+	// 本仓没有迁移框架,DDL 是 CREATE TABLE IF NOT EXISTS —— 既有库不会因为 DDL 变了就长出新列。
+	// 用 PRAGMA 查一次再补,幂等且对空库无副作用(空库刚被上面的 DDL 创建时就已带这一列,
+	// table_info 会查到它,不会重复 ALTER)。SQLite 的 ADD COLUMN 是 O(1) 元数据操作。
+	const columns = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+	if (!columns.some((c) => c.name === "payload_json")) {
+		db.exec("ALTER TABLE runs ADD COLUMN payload_json TEXT");
+	}
 
 	const insert = db.prepare(`
 		INSERT INTO runs (run_id, client_request_id, request_id, spec_id, task_kind, session_id,
-		                  filters_json, options_json, status, input, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+		                  filters_json, options_json, payload_json, status, input, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
 		ON CONFLICT(client_request_id) DO NOTHING
 	`);
 	const byRunId = db.prepare("SELECT * FROM runs WHERE run_id = ?");
@@ -137,6 +147,7 @@ export function createSqliteRunStore(path: string): RunStore {
 					rec.sessionId,
 					rec.filtersJson,
 					rec.optionsJson ?? null,
+					rec.payloadJson ?? null,
 					rec.input,
 					rec.createdAt,
 				).changes,

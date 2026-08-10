@@ -80,6 +80,18 @@ async function main(): Promise<void> {
 	// 没有声明这两个字段,这条留给引入它的人。
 	await resolveSpecPromptPaths(spec, dirname(values.spec as string));
 
+	// 复审必修2:cli/main.ts 从不检查 spec.fastPath,下面直接调 createSessionRuntime —— 一个
+	// fastPath.enabled:true 的 spec 经这条 CLI 路径跑会静默走 agent 路径。resolveSpecPromptPaths
+	// 刚把三个 fast prompt(systemPrompt/rewritePrompt/answerPrompt)读成正文,但这份正文在这条
+	// 路径上从未被使用——与本文件上面那段注释记着的 systemPrompt 曾经的静默失效同一形状
+	// (resolve-prompt-paths.ts 抽模块前,CLI 那份实现没被覆盖,spec.systemPrompt 长期没生效)。
+	// CLI 不支持快路径,这里只做响亮告警,不接线。
+	if (spec.fastPath?.enabled) {
+		console.error(
+			`[task-runtime] spec "${spec.id}" has fastPath.enabled=true, but cli/main.ts does not support the fast path — this run will use the agent path instead`,
+		);
+	}
+
 	const toolsets = new ToolsetRegistry();
 	if (spec.toolset === "audit-report") {
 		const reportType = values["report-type"];

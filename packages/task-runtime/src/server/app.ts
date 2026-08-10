@@ -98,6 +98,9 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			// 不为此收窄 schema —— options 是给下游 audit-ai 的透传位,收窄会让将来加一个
 			// 查询层字段变成一次 HTTP 层改动。
 			options: body.options as RunOptions | undefined,
+			// 与 filters 同款:**原样**下传,不补默认值 —— payload_json 是事后审计
+			// 「这个 run 当时拿到的任务输入是什么」的唯一凭证。
+			payload: body.payload,
 		});
 
 		if (outcome.kind === "rejected") {
@@ -146,7 +149,17 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 	app.get("/runs/:runId", (c) => {
 		const row = store.findByRunId(c.req.param("runId"));
 		if (!row) return c.json(errorBody("not_found", "run not found"), 404);
-		if (!isTerminal(row.status)) return c.json({ runId: row.runId, status: row.status }, 200);
+		// isTerminal 判定必须先于 progress —— 一个已经落库为终态的行不该再挂 progress 字段
+		// (规格 §7.2:progress 只描述「正在跑」这件事;终态的真相是下面的 RunResult)。
+		if (!isTerminal(row.status)) {
+			const progress = manager.progressOf(row.runId);
+			// 三元而非无条件展开:没有 progress 时响应体里根本不该出现这个键,不是「键在、值
+			// undefined」——两者在 JSON 线上不可区分,但代码语义不该暧昧(见测试里的同款纪律)。
+			return c.json(
+				progress ? { runId: row.runId, status: row.status, progress } : { runId: row.runId, status: row.status },
+				200,
+			);
+		}
 		return c.json(toWireResult(recordToRunResult(row)), 200);
 	});
 

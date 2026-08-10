@@ -1133,11 +1133,24 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 	const accountability = dataset.riskEvents.find(
 		(event) => event.type === "accountability" && event.state === "VERIFIED_VALUE",
 	);
-	const requiresExceptionConclusion = previousAuditComparison.unrectified.length > 0 || currentFindings.length >= 15;
-	const conclusionText = `${subjectName}同志任职期内，基本能够按照国家有关法规和公司规章制度的规定开展各项业务，总体上落实了营业部管理责任和合规与风险管理职责，未发现其所在营业部经营活动及内部控制存在重大违法违规事项或重大内控缺陷。${
-		requiresExceptionConclusion
+	const subjectPerformance = dataset.performance
+		.filter((record) => record.personId === subjectId)
+		.slice()
+		.sort((left, right) => Number(left.year) - Number(right.year));
+	const firstPerformanceYear = String(subjectPerformance.at(0)?.year ?? "");
+	const lastPerformanceYear = String(subjectPerformance.at(-1)?.year ?? "");
+	const performancePeriod =
+		firstPerformanceYear === lastPerformanceYear
+			? firstPerformanceYear
+			: `${firstPerformanceYear}-${lastPerformanceYear}`;
+	const exceptionConclusion =
+		previousAuditComparison.unrectified.length > 0
 			? "但历次审计发现的问题较多，且个别问题未得到有效整改，营业部合规与风险管理水平有待进一步加强。"
-			: ""
+			: currentFindings.length >= 15
+				? "但本次审计发现的问题较多，营业部合规与风险管理水平有待进一步加强。"
+				: "";
+	const conclusionText = `${subjectName}同志任职期内，基本能够按照国家有关法规和公司规章制度的规定开展各项业务，总体上落实了营业部管理责任和合规与风险管理职责，未发现其所在营业部经营活动及内部控制存在重大违法违规事项或重大内控缺陷。${
+		exceptionConclusion
 	}`;
 	const sections: ReportSection[] = [
 		{
@@ -1216,11 +1229,10 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 					paragraphs: [
 						paragraph(
 							"turnover-performance",
-							`${dataset.performance.at(0)?.year ?? ""}-${dataset.performance.at(-1)?.year ?? ""}年度，公司对${subjectName}同志绩效考核结果分别为${dataset.performance
-								.filter((record) => record.personId === subjectId)
+							`${performancePeriod}年度，公司对${subjectName}同志绩效考核结果分别为${subjectPerformance
 								.map((record) => record.rating)
 								.join("、")}。`,
-							dataset.performance.flatMap((record) => record.evidenceIds),
+							subjectPerformance.flatMap((record) => record.evidenceIds),
 						),
 					],
 				},

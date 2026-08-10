@@ -109,6 +109,30 @@ describe("audit-report RuntimeSpec", () => {
 		expect(getExecutableRubricItemCount()).toBe(108);
 	});
 
+	it("binds turnover performance evidence only to the audited subject", async () => {
+		const loaded = await loadSourceDataset();
+		const draft = generateReportDraft({
+			...loaded.dataset,
+			task: {
+				...loaded.dataset.task,
+				reportType: "turnover",
+				subjectPersonId: "PERSON-SUBJECT",
+				subjectPersonName: "张三",
+			},
+			performance: [
+				{ personId: "PERSON-SUBJECT", year: 2025, rating: "A", evidenceIds: ["E-SUBJECT-2025"] },
+				{ personId: "PERSON-OTHER", year: 2025, rating: "B", evidenceIds: ["E-OTHER-2025"] },
+			],
+		});
+		const performanceParagraph = draft.sections
+			.flatMap((section) => section.subsections)
+			.flatMap((subsection) => subsection.paragraphs)
+			.find((item) => item.paragraphId === "turnover-performance");
+
+		expect(performanceParagraph?.text).toContain("张三同志绩效考核结果分别为A");
+		expect(performanceParagraph?.evidenceIds).toEqual(["E-SUBJECT-2025"]);
+	});
+
 	it("runs the full agent loop through ToolsetRegistry and outputContract", async () => {
 		const loaded = await loadSourceDataset();
 		const draft = generateReportDraft(loaded.dataset);

@@ -93,8 +93,13 @@ def clone_cell_format(target: Any, source: Any, value: Any) -> None:
     if source_paragraph._p.pPr is not None:
         target_paragraph._p.insert(0, deepcopy(source_paragraph._p.pPr))
     run = target_paragraph.add_run(str(value))
-    source_run = first_text_run(source_paragraph)
-    if source_run._r.rPr is not None:
+    # Some official table prototypes intentionally keep data cells empty. In
+    # that case paragraph/cell properties still carry the layout, while there
+    # is no non-empty run whose character properties can be copied.
+    source_run = next((item for item in source_paragraph.runs if item.text.strip()), None)
+    if source_run is None:
+        source_run = next(iter(source_paragraph.runs), None)
+    if source_run is not None and source_run._r.rPr is not None:
         run._r.insert(0, deepcopy(source_run._r.rPr))
     if isinstance(value, (int, float)) and value < 0:
         run.font.color.rgb = RGBColor(255, 0, 0)
@@ -112,7 +117,10 @@ def add_table(document: DocumentObject, data: dict[str, Any], title_prototype: A
     if prototype._tbl.tblPr is not None:
         table._tbl.remove(table._tbl.tblPr)
         table._tbl.insert(0, deepcopy(prototype._tbl.tblPr))
-    if prototype._tbl.tblGrid is not None:
+    # Reuse the official column grid only when the generated table has the
+    # same number of columns. Copying a five-column prototype grid into a
+    # three-column period table leaves visible blank columns in Word.
+    if prototype._tbl.tblGrid is not None and len(prototype.columns) == len(headers):
         table._tbl.remove(table._tbl.tblGrid)
         table._tbl.insert(1, deepcopy(prototype._tbl.tblGrid))
     for index, header in enumerate(headers):
@@ -132,7 +140,10 @@ def add_paragraph(document: DocumentObject, item: dict[str, Any], prototypes: di
         key = "note"
     else:
         key = "body"
-    clone_paragraph(document, prototypes[key], item["text"])
+    # A report template may not contain an example finding title or note when
+    # that particular sample has no findings. Preserve report generation by
+    # falling back to the template's body style for these optional prototypes.
+    clone_paragraph(document, prototypes.get(key) or prototypes["body"], item["text"])
 
 
 def add_draft(document: DocumentObject, draft: dict[str, Any], prototypes: dict[str, Any], table_prototype: Any) -> None:

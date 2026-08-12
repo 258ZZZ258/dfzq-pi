@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type Assembled, type AssembleOptions, assemble, type PluginToolCallEvent } from "./assembler.ts";
-import type { LimitKind, LimitState, RunOptions, RunResult, Runtime, RuntimeEvent } from "./contract.ts";
+import type { LimitKind, LimitState, RunOptions, RunResult, Runtime, RuntimeEvent, SourceDetail } from "./contract.ts";
 import { collectClauseIds, type FinalJudge, runFinalJudges } from "./final-judge.ts";
 import { createOutputContractJudge } from "./output-contract.ts";
 import type { PluginContext } from "./plugin-registry.ts";
@@ -9,6 +9,23 @@ export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "pluginContext">
 	/** spec.outputContract.schema 指向的文件已由调用方读好。缺省即不挂 C6 判官。 */
 	outputContractSchema?: unknown;
 };
+
+/** 只接收 MCP adapter 已校验并放入工具私有 details 的条款正文。 */
+function sourceDetailsFromTool(result: unknown): SourceDetail[] {
+	if (typeof result !== "object" || result === null) return [];
+	const details = (result as { details?: unknown }).details;
+	if (typeof details !== "object" || details === null) return [];
+	const items = (details as { source_details?: unknown }).source_details;
+	if (!Array.isArray(items)) return [];
+	return items.filter(
+		(item): item is SourceDetail =>
+			typeof item === "object" &&
+			item !== null &&
+			typeof (item as { clause_id?: unknown }).clause_id === "string" &&
+			typeof (item as { text?: unknown }).text === "string" &&
+			(item as { text: string }).text.trim().length > 0,
+	);
+}
 
 export async function createSessionRuntime(options: CreateSessionRuntimeOptions): Promise<Runtime> {
 	// 装配期失败要早要响(这是全仓的一贯纪律,assemble() 里的 validateSpec / 工具名交叉校验
@@ -38,6 +55,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	// clauseIds 每次 run() 开头清空。
 	const judges: FinalJudge[] = [];
 	const clauseIds = new Set<string>();
+	const sourceDetails = new Map<string, SourceDetail>();
 
 	// seq/listeners 提到 assemble() 调用**之前**声明(比原先靠后的位置提早了):插件工厂在
 	// assemble() 内部同步执行(instantiatePlugins()),一个工厂完全可能同步发起
@@ -224,6 +242,9 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		if (event.type === "tool_execution_end" && !event.isError) {
 			try {
 				collectClauseIds(event.result, clauseIds);
+				for (const detail of sourceDetailsFromTool(event.result)) {
+					sourceDetails.set(detail.clause_id, detail);
+				}
 			} catch (error) {
 				console.error(
 					`[SessionRuntime] collectClauseIds threw for spec "${specId}"; this run's clauseIds may be incomplete`,
@@ -267,6 +288,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		state.turns = 0;
 		state.tripped = undefined;
 		clauseIds.clear();
+		sourceDetails.clear();
 		const startedAt = Date.now();
 
 		// runTimeoutMs lives here, not in the limits plugin: the plugin only observes
@@ -331,10 +353,11 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 			.reverse()
 			.find((message) => message.role === "assistant") as { stopReason?: string; errorMessage?: string } | undefined;
 
+		const status = classify(state.tripped, assistant?.stopReason, thrown, judgeError);
 		return {
 			runId,
 			specId,
-			status: classify(state.tripped, assistant?.stopReason, thrown, judgeError),
+			status,
 			output: session.getLastAssistantText() ?? undefined,
 			errorMessage: judgeError ?? (thrown instanceof Error ? thrown.message : assistant?.errorMessage),
 			stopReason: assistant?.stopReason,
@@ -350,6 +373,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 			turns: state.turns,
 			durationMs: Date.now() - startedAt,
 			judgeAttempts,
+			sourceDetails: status === "completed" && sourceDetails.size > 0 ? [...sourceDetails.values()] : undefined,
 		};
 	}
 

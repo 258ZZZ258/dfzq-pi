@@ -27,6 +27,7 @@ export function recordToRunResult(row: RunRecord): RunResult {
 		limit: row.limitHit,
 		usage,
 		turns: row.turns ?? 0,
+		sourceDetails: row.sourceDetails,
 		durationMs: row.finishedAt && row.startedAt ? row.finishedAt - row.startedAt : 0,
 	};
 }
@@ -36,7 +37,7 @@ export function isTerminal(status: RunRecord["status"]): boolean {
 }
 
 /**
- * 终态 RunResult → 上线形状。当前只做一件事:把 output 里的 JSON 块解析进 answer。
+ * 终态 RunResult → 上线形状：把 output 里的 JSON 块解析进 answer，并附上本 run 已取得的权威正文。
  *
  * ⚠ **终态结果有四个出口,必须全部经这里**(app.ts 的幂等分支 / 等待窗口超时但行已终态 /
  * 同步完成 / GET /runs/:runId)。其中「同步完成」那条**不经 recordToRunResult** ——
@@ -61,5 +62,14 @@ export function toWireResult(result: RunResult): RunResult {
 	const extracted = extractJsonBlock(result.output);
 	// 提取不到就原样返回 —— run 已经完成,拿不到 answer 是降级不是失败。
 	if (extracted.kind !== "ok") return result;
-	return { ...result, answer: extracted.value };
+	if (
+		result.sourceDetails === undefined ||
+		result.sourceDetails.length === 0 ||
+		typeof extracted.value !== "object" ||
+		extracted.value === null ||
+		Array.isArray(extracted.value)
+	) {
+		return { ...result, answer: extracted.value };
+	}
+	return { ...result, answer: { ...extracted.value, source_details: result.sourceDetails } };
 }

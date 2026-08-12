@@ -167,12 +167,12 @@ describe("出厂 spec: policy-query.json", () => {
 	it("forwards the selected sparse backend to the isolated MCP process", () => {
 		const servers = spec.mcpServers as Array<{ id: string; env: Record<string, string> }>;
 		const policyQuery = servers.find((server) => server.id === "policy-query");
-		expect(policyQuery?.env.PIPELINE_SPARSE_BACKEND).toBe("${PIPELINE_SPARSE_BACKEND}");
+		expect(policyQuery?.env.PIPELINE_SPARSE_BACKEND).toBe(`\${PIPELINE_SPARSE_BACKEND}`);
 	});
 
-	it("ships fastPath disabled by default", () => {
+	it("ships fastPath enabled by default", () => {
 		const fastPath = spec.fastPath as { enabled?: boolean } | undefined;
-		expect(fastPath?.enabled).toBe(false);
+		expect(fastPath?.enabled).toBe(true);
 	});
 
 	it("points fastPath at three prompt files that exist", async () => {

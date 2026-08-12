@@ -2,7 +2,7 @@
  * 存储层接口。换 PG 时上层不动(设计文档 §5.7)。
  * 不得 import 任何 pi 类型 —— 与 runtime/contract.ts 同一条隔离带纪律。
  */
-import type { LimitKind, RunResult } from "../runtime/contract.ts";
+import type { LimitKind, RunResult, SourceDetail } from "../runtime/contract.ts";
 
 /** 比 contract.ts 的 RunStatus 多 queued / running 两个非终态。 */
 export type StoredRunStatus = "queued" | "running" | "completed" | "aborted" | "limit_exceeded" | "error";
@@ -31,6 +31,8 @@ export interface RunRecord {
 	limitHit?: LimitKind;
 	usageJson?: string;
 	turns?: number;
+	/** 已取回的权威条款正文，供终态 HTTP 响应与下游详情展示复用。 */
+	sourceDetails?: SourceDetail[];
 	createdAt: number;
 	startedAt?: number;
 	finishedAt?: number;
@@ -38,7 +40,16 @@ export interface RunRecord {
 
 export type NewRun = Omit<
 	RunRecord,
-	"status" | "output" | "errorMessage" | "stopReason" | "limitHit" | "usageJson" | "turns" | "startedAt" | "finishedAt"
+	| "status"
+	| "output"
+	| "errorMessage"
+	| "stopReason"
+	| "limitHit"
+	| "usageJson"
+	| "turns"
+	| "sourceDetails"
+	| "startedAt"
+	| "finishedAt"
 >;
 
 export interface StoredEvent {

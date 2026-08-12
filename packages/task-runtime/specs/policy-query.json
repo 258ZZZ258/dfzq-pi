@@ -60,7 +60,7 @@
   },
   "fastPath": {
     "$comment": "规格《制度查询提速》§2:模型调用固定 2 次(改写检索词、依据代码检索好的正文作答),模型看不到工具,检索由代码经 Assembled.callTool 发起。enabled 缺省 false —— 新旧行为要能在同一个二进制上对照,任务 11 的真 run 验收靠它,不要擅自打开。thinkingLevel 固定 off,不用主 spec 的 medium —— 快路径要的是可预测的低延迟,off 的推理开销更低。maxClauses=12 与本文件 resultPolicy.options.maxHits.search_policy 的 12 条上限一致,是阶段 1 证据块大小唯一生效的护栏。刻意不配 maxChars:C4 result-budget 挂在 pi 的 tool_result hook 上做截断,而阶段 1 的检索全部经 Assembled.callTool 直打 tool.execute()、绕过 agent loop,该 hook 不会触发——配了也不生效,是一句谎(见 fast-path-runtime.ts 的 deriveFastSpec 与 test/policy-query-spec.test.ts 的回归锁)。runTimeoutMs=45000 不是性能目标,是防挂死的硬顶:比 30s 目标窗口宽,是为了不误杀「略微超窗但马上就好」的 run(那种 run 该被判据 1 记不过、直接返回结果,而不是白白升级再花一遍钱);又远小于主 spec 的 900s,防止一次挂住的阶段 1 把两条路径的耗时相加、比不做快路径还慢。",
-    "enabled": false,
+    "enabled": true,
     "systemPrompt": "policy-query/fast-system.md",
     "rewritePrompt": "policy-query/fast-rewrite.md",
     "answerPrompt": "policy-query/fast-answer.md",

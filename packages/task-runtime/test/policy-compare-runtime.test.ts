@@ -23,7 +23,38 @@ const ok = {
 
 describe("parseCoveragePayload", () => {
 	it("合法 payload 通过", () => {
-		expect(parseCoveragePayload(ok).external.uploadId).toBe("U1");
+		const external = parseCoveragePayload(ok).external!;
+		expect(external.source === "upload" ? external.uploadId : "").toBe("U1");
+	});
+
+	it("知识库外规版本 payload 通过", () => {
+		const got = parseCoveragePayload({ ...ok, external: { source: "library", docVersionId: "DV-1" } });
+		expect(got.external).toEqual({ source: "library", docVersionId: "DV-1" });
+	});
+
+	it("知识库内规 payload 自动切换为内规追踪外规版本", () => {
+		const got = parseCoveragePayload({
+			direction: "internal_to_external",
+			internal: { source: "library", docVersionId: "INT-DV-1" },
+			scope: { effectiveDateRange: ["2024-01-01", "2026-12-31"] },
+		});
+		expect(got.direction).toBe("internal_to_external");
+		expect(got.internal).toEqual({ source: "library", docVersionId: "INT-DV-1" });
+		expect(got.external).toBeUndefined();
+	});
+
+	it("上传内规 payload 通过", () => {
+		const got = parseCoveragePayload({
+			direction: "internal_to_external",
+			internal: { objectKey: "upload/I1/a.docx", uploadId: "I1", filename: "a.docx" },
+			scope: {},
+		});
+		expect(got.internal).toEqual({
+			source: "upload",
+			objectKey: "upload/I1/a.docx",
+			uploadId: "I1",
+			filename: "a.docx",
+		});
 	});
 
 	it("缺 external.objectKey → 抛错", () => {
@@ -140,8 +171,100 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1)
 }
 
 describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
+	it("知识库内规只做显式引用外规版本核查,不调用 MCP 工具或模型", async () => {
+		const requests: unknown[] = [];
+		const { runtime, toolCalls, faux } = await buildRuntime({
+			modelReplies: [],
+			payloadOverride: {
+				direction: "internal_to_external",
+				internal: { source: "library", docVersionId: "INT-DV-1" },
+				scope: { effectiveDateRange: ["2024-01-01", "2026-12-31"] },
+			},
+			documents: {
+				process: async () => {
+					throw new Error("知识库内规不应重新解析");
+				},
+				checkInternalReferenceVersions: async (req) => {
+					requests.push(req);
+					return {
+						compareType: "internal_to_external",
+						metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
+						rows: [],
+						gaps: ["当前内规没有可解析的显式外规引用"],
+						finish_reason: "stop",
+					};
+				},
+			},
+		});
+		const result = await runtime.run("核查引用外规版本");
+		expect(result.status).toBe("completed");
+		expect(result.turns).toBe(0);
+		expect(toolCalls).toEqual([]);
+		expect(faux.state.callCount).toBe(0);
+		expect(requests).toEqual([
+			{
+				docVersionId: "INT-DV-1",
+				clauses: undefined,
+				effectiveDateRange: ["2024-01-01", "2026-12-31"],
+				permTags: [],
+			},
+		]);
+	});
+
+	it("上传内规先按 internal 解析,再核查条款中的外规引用", async () => {
+		const processRequests: unknown[] = [];
+		const checkRequests: unknown[] = [];
+		const { runtime } = await buildRuntime({
+			modelReplies: [],
+			payloadOverride: {
+				direction: "internal_to_external",
+				internal: {
+					source: "upload",
+					objectKey: "upload/I1/internal.pdf",
+					uploadId: "I1",
+					filename: "internal.pdf",
+				},
+			},
+			documents: {
+				process: async (req) => {
+					processRequests.push(req);
+					return {
+						uploadId: "I1",
+						artifactKey: "artifact/I1.json",
+						title: "上传内规",
+						pageCount: 1,
+						chunkCount: 2,
+						status: "ok",
+					};
+				},
+				checkInternalReferenceVersions: async (req) => {
+					checkRequests.push(req);
+					return {
+						compareType: "internal_to_external",
+						metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
+						rows: [],
+						finish_reason: "stop",
+					};
+				},
+			},
+		});
+		const result = await runtime.run("核查上传内规");
+		expect(result.status).toBe("completed");
+		expect(processRequests).toEqual([
+			{
+				objectKey: "upload/I1/internal.pdf",
+				uploadId: "I1",
+				filename: "internal.pdf",
+				corpusHint: "internal",
+			},
+		]);
+		expect(checkRequests).toHaveLength(1);
+		expect(checkRequests[0]).toMatchObject({ docVersionId: undefined });
+		expect((checkRequests[0] as { clauses: unknown[] }).clauses).toHaveLength(2);
+	});
+
 	it("跑完六阶段并产出合规行表", async () => {
-		const { runtime, toolCalls } = await buildRuntime({
+		const { runtime, toolCalls, resolutionsArgs } = await buildRuntime({
 			modelReplies: [
 				verdictReply([
 					{ pairIndex: 0, state: "missing", gap: "缺期限", suggestion: "补期限" },
@@ -152,6 +275,12 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("completed");
 		expect(toolCalls).toEqual(["list_internal_obligations", "resolve_source_law"]);
+		expect(resolutionsArgs).toEqual([
+			{
+				chunk_ids: ["C-0", "C-1"],
+				target_document: { title: "基准外规", doc_no: null },
+			},
+		]);
 		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
 		expect(body.compareType).toBe("external_to_internal");
 		expect(body.rows).toHaveLength(1);

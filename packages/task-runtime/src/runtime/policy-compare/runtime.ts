@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Value } from "typebox/value";
 import type { ProviderProfile } from "../../env/provider-profile.ts";
 import type { RuntimeLimits, RuntimeSpec } from "../../spec/types.ts";
 import type { ToolsetRegistry } from "../../toolsets/registry.ts";
@@ -76,11 +77,25 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 		throw new Error("payload 必须是 JSON 对象");
 	}
 	const p = raw as Record<string, unknown>;
-	const external = p.external as Record<string, unknown> | undefined;
-	for (const key of ["objectKey", "uploadId", "filename"]) {
-		if (!external || typeof external[key] !== "string" || external[key] === "") {
-			throw new Error(`payload.external.${key} 必填且必须是非空字符串`);
+	const direction = p.direction === undefined ? "external_to_internal" : p.direction;
+	if (direction !== "external_to_internal" && direction !== "internal_to_external") {
+		throw new Error("payload.direction 仅支持 external_to_internal 或 internal_to_external");
+	}
+	const subjectKey = direction === "external_to_internal" ? "external" : "internal";
+	const external = p[subjectKey] as Record<string, unknown> | undefined;
+	const source =
+		external?.source ??
+		(external && (external.objectKey || external.uploadId || external.filename) ? "upload" : undefined);
+	if (source !== "upload" && source !== "library")
+		throw new Error(`payload.${subjectKey}.source 仅支持 upload 或 library`);
+	if (source === "upload") {
+		for (const key of ["objectKey", "uploadId", "filename"]) {
+			if (!external || typeof external[key] !== "string" || external[key] === "") {
+				throw new Error(`payload.${subjectKey}.${key} 必填且必须是非空字符串`);
+			}
 		}
+	} else if (!external || typeof external.docVersionId !== "string" || external.docVersionId === "") {
+		throw new Error(`payload.${subjectKey}.docVersionId 必填且必须是非空字符串`);
 	}
 	const scope = (p.scope ?? {}) as Record<string, unknown>;
 	// `organizations` 本轮压根没实现(PG 无对应列)—— 这个判断跟值的形状对不对无关,所以要在
@@ -110,11 +125,30 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 		}
 	}
 	return {
-		external: {
-			objectKey: external!.objectKey as string,
-			uploadId: external!.uploadId as string,
-			filename: external!.filename as string,
-		},
+		direction,
+		...(direction === "external_to_internal"
+			? {
+					external:
+						source === "upload"
+							? {
+									source: "upload" as const,
+									objectKey: external!.objectKey as string,
+									uploadId: external!.uploadId as string,
+									filename: external!.filename as string,
+								}
+							: { source: "library" as const, docVersionId: external!.docVersionId as string },
+				}
+			: {
+					internal:
+						source === "upload"
+							? {
+									source: "upload" as const,
+									objectKey: external!.objectKey as string,
+									uploadId: external!.uploadId as string,
+									filename: external!.filename as string,
+								}
+							: { source: "library" as const, docVersionId: external!.docVersionId as string },
+				}),
 		scope: {
 			organizations: [],
 			bizDomains: parseScopeStringArray(scope.bizDomains, "payload.scope.bizDomains"),
@@ -136,6 +170,7 @@ export interface PolicyCompareRuntimeOptions {
 	outputContractSchema: unknown;
 	payload: unknown;
 	documents: DocumentsClient;
+	permissionTags?: string[];
 	artifacts: ArtifactStore;
 	batchSize?: number;
 	skillPaths?: string[];
@@ -393,22 +428,93 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 
 	async function runInner(runId: string): Promise<RunResult> {
 		const startedAt = Date.now();
+		if (payload.direction === "internal_to_external") {
+			const internal = payload.internal!;
+			stage("extracting", 5, 0, 1, "正在解析待核查内规");
+			checkPreempted();
+			const processed =
+				internal.source === "upload"
+					? await options.documents.process({
+							objectKey: internal.objectKey,
+							uploadId: internal.uploadId,
+							filename: internal.filename,
+							corpusHint: "internal",
+						})
+					: null;
+			const doc = processed ? await options.artifacts.fetch(processed.artifactKey) : null;
+			stage("extracting", 35, doc?.clauses.length ?? 1, doc?.clauses.length ?? 1, "已取得内规条款与显式外规引用");
+			checkPreempted();
+			stage("matching", 55, 0, 1, "正在核对引用外规的当前版本");
+			if (!options.documents.checkInternalReferenceVersions) {
+				throw new Error("内规引用外规版本核查客户端未配置");
+			}
+			const result = await options.documents.checkInternalReferenceVersions({
+				docVersionId: internal.source === "library" ? internal.docVersionId : undefined,
+				clauses: doc?.clauses.map((clause) => ({
+					chunkId: `upload:${internal.source === "upload" ? internal.uploadId : "library"}:${clause.seq}`,
+					clausePath: clause.clausePath || null,
+					text: clause.text,
+				})),
+				effectiveDateRange: payload.scope.effectiveDateRange,
+				permTags: options.permissionTags ?? [],
+			});
+			stage("assembling", 95, 0, 1, "正在组装外规版本变更结果");
+			if (!Value.Check(options.outputContractSchema as never, result as never)) {
+				const first = [...Value.Errors(options.outputContractSchema as never, result as never)][0];
+				const errorMessage = `输出契约校验失败: ${first ? `${first.instancePath}: ${first.message}` : "schema 校验失败"}`;
+				emitTerminalStage(errorMessage);
+				return {
+					runId,
+					specId: options.spec.id,
+					status: "error",
+					errorMessage,
+					usage: currentUsage(),
+					turns: 0,
+					durationMs: Date.now() - startedAt,
+					judgeAttempts: {},
+				};
+			}
+			stage("assembling", 100, 1, 1, "比对完成");
+			return {
+				runId,
+				specId: options.spec.id,
+				status: "completed",
+				output: `\`\`\`json\n${JSON.stringify(result)}\n\`\`\``,
+				usage: currentUsage(),
+				turns: 0,
+				durationMs: Date.now() - startedAt,
+				judgeAttempts: {},
+			};
+		}
 
 		// ── 阶段 1:解析基准外规 ──────────────────────────────
 		stage("extracting", 5, 0, 1, "正在解析基准外规");
 		checkPreempted();
-		const processed = await options.documents.process({
-			objectKey: payload.external.objectKey,
-			uploadId: payload.external.uploadId,
-			filename: payload.external.filename,
-			corpusHint: "external",
-		});
+		const processed =
+			payload.external!.source === "upload"
+				? await options.documents.process({
+						objectKey: payload.external!.objectKey,
+						uploadId: payload.external!.uploadId,
+						filename: payload.external!.filename,
+						corpusHint: "external",
+					})
+				: null;
 		// 这一道只信 E0 自报的 `chunk_count`,作用是在下载整份 artifact **之前**就挡住明显超规模的
 		// 产物;它拦不住「E0 少回了这个字段」——`documents-client.ts` 对非数字落 `0`,恒不触发。
-		if (processed.chunkCount > MAX_EXTERNAL_CHUNKS) {
+		if (processed && processed.chunkCount > MAX_EXTERNAL_CHUNKS) {
 			throw new Error(`上传外规切块数 ${processed.chunkCount} 超过上限 ${MAX_EXTERNAL_CHUNKS}(E0 自报 chunk_count)`);
 		}
-		const doc = await options.artifacts.fetch(processed.artifactKey);
+		const doc =
+			payload.external!.source === "upload"
+				? await options.artifacts.fetch(processed!.artifactKey)
+				: options.documents.getExternalDocument
+					? await options.documents.getExternalDocument(
+							payload.external!.docVersionId,
+							options.permissionTags ?? [],
+						)
+					: (() => {
+							throw new Error("知识库外规读取客户端未配置");
+						})();
 		// 🔴 本地复核,与阶段 2 对 M1 的 `items.length > MAX_OBLIGATIONS` 是同一姿态:上游自报的数字
 		// 只是提示,真正决定阶段 5 扇出规模的是**这里实际拿到的条款数**。少了这一道,E0 漏回
 		// `chunk_count` 时一份 5000 条款的产物会长驱直入。
@@ -417,7 +523,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		if (doc.clauses.length > MAX_EXTERNAL_CHUNKS) {
 			throw new Error(
 				`上传外规解析出 ${doc.clauses.length} 条条款,超过上限 ${MAX_EXTERNAL_CHUNKS}` +
-					`(E0 自报 chunk_count=${processed.chunkCount},以实际解析条数为准)`,
+					`(E0 自报 chunk_count=${processed?.chunkCount ?? doc.clauses.length},以实际解析条数为准)`,
 			);
 		}
 		stage("extracting", 20, 1, 1, `已抽取外规条款 ${doc.clauses.length} 条`);
@@ -456,6 +562,9 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		stage("matching", 45, 0, obligations.items.length, "正在反查外规映射");
 		const resolutionsRaw = await assembled.callTool("resolve_source_law", {
 			chunk_ids: obligations.items.map((o) => o.chunkId),
+			// M2 先用权威 R4 映射；本地/早期数据尚无映射时，这个显式目标允许它返回
+			// doc_level 候选。候选仍须经过阶段 5 的逐条模型判定，不能直接算“已覆盖”。
+			target_document: { title: doc.title, doc_no: doc.docNo ?? null },
 		});
 		const resolutions = toResolutions(resolutionsRaw);
 
@@ -555,7 +664,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 			runId,
 			specId: options.spec.id,
 			status: "completed",
-			output: "```json\n" + JSON.stringify(result) + "\n```",
+			output: `\`\`\`json\n${JSON.stringify(result)}\n\`\`\``,
 			usage: currentUsage(),
 			turns: modelCalls,
 			durationMs: Date.now() - startedAt,

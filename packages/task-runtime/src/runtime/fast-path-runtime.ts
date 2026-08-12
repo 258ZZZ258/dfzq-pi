@@ -3,7 +3,16 @@ import type { ProviderProfile } from "../env/provider-profile.ts";
 import { type FastPathSpec, pluginName, pluginOptions, type RuntimeLimits, type RuntimeSpec } from "../spec/types.ts";
 import type { ToolsetRegistry } from "../toolsets/registry.ts";
 import { type Assembled, type AssembleOptions, assemble, type PluginToolCallEvent } from "./assembler.ts";
-import type { LimitKind, LimitState, RunOptions, RunResult, RunStatus, Runtime, RuntimeEvent } from "./contract.ts";
+import type {
+	LimitKind,
+	LimitState,
+	RunOptions,
+	RunResult,
+	RunStatus,
+	Runtime,
+	RuntimeEvent,
+	SourceDetail,
+} from "./contract.ts";
 import { mergeHitsRoundRobin, type RetrievalHit } from "./merge-hits.ts";
 import { extractJsonBlock, validateOutputContract } from "./output-contract.ts";
 import type { PluginContext, PluginRegistry } from "./plugin-registry.ts";
@@ -440,7 +449,13 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	// 被接线,Java 会原样收到一份从未通过 `judgeFastPathOutput` 的 JSON。`verdict.accept` 与
 	// `result.status` 因此必须同步:任何 `{accept:false}` 都要有一个非 "completed" 的
 	// status,这里以 `EscalationOutcome` 参数统一收口,不再让某个分支漏传。
-	function normalize(runId: string, startedAt: number, output: string, outcome?: EscalationOutcome): RunResult {
+	function normalize(
+		runId: string,
+		startedAt: number,
+		output: string,
+		outcome?: EscalationOutcome,
+		sourceDetails?: SourceDetail[],
+	): RunResult {
 		const stats = session.getSessionStats();
 		return {
 			runId,
@@ -460,6 +475,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 			turns: modelCalls,
 			durationMs: Date.now() - startedAt,
 			judgeAttempts: {},
+			sourceDetails,
 		};
 	}
 
@@ -692,6 +708,12 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 				// I-3:verdict 与 result.status 必须同步——被判负的答案不能带着 "completed"
 				// 状态往下游走(见 normalize 上方的注释)。
 				verdict.accept ? undefined : { status: "error", errorMessage: verdict.reason },
+				verdict.accept
+					? items.map((item) => ({
+							...item,
+							text: item.text as string,
+						}))
+					: undefined,
 			),
 		};
 	}

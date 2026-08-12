@@ -1,0 +1,17 @@
+{
+  "id": "policy-compare-version-diff",
+  "description": "制度比对 · 同一内规或外规的两个版本条款差异",
+  "workflow": "policy-version-diff",
+  "model": { "role": "main" },
+  "thinkingLevel": "off",
+  "toolset": "policy-compare",
+  "tools": ["list_internal_obligations"],
+  "limits": {
+    "maxTurns": 1,
+    "runTimeoutMs": 60000
+  },
+  "outputContract": {
+    "schema": "policy-compare/version-diff.schema.json",
+    "maxRepairAttempts": 0
+  }
+}

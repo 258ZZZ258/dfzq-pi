@@ -94,6 +94,11 @@ export interface CoverageRow {
 		externalClausePath: string | null;
 		externalDocNo: string | null;
 		matchKind: "exact" | "normalized" | "doc_level";
+		referenceId?: string;
+		referenceSurface?: string;
+		citedDocVersionId?: string | null;
+		currentDocVersionId?: string | null;
+		changeKind?: "unresolved" | "version_changed" | "clause_changed";
 	};
 }
 
@@ -114,7 +119,7 @@ export interface LinkedDetailItem {
 }
 
 export interface CoverageResult {
-	compareType: "external_to_internal";
+	compareType: "external_to_internal" | "internal_to_external";
 	metrics: CoverageMetrics;
 	rows: CoverageRow[];
 	linkedDetail?: LinkedDetailItem[];
@@ -124,7 +129,13 @@ export interface CoverageResult {
 
 /** `POST /runs` 的 `payload`(覆盖度引擎)。形状校验见 runtime.ts 的 parsePayload。 */
 export interface CoveragePayload {
-	external: { objectKey: string; uploadId: string; filename: string };
+	direction: "external_to_internal" | "internal_to_external";
+	external?:
+		| { source: "upload"; objectKey: string; uploadId: string; filename: string }
+		| { source: "library"; docVersionId: string };
+	internal?:
+		| { source: "upload"; objectKey: string; uploadId: string; filename: string }
+		| { source: "library"; docVersionId: string };
 	scope: {
 		organizations?: string[];
 		bizDomains?: string[];
@@ -132,4 +143,45 @@ export interface CoveragePayload {
 		effectiveDateRange?: [string, string];
 	};
 	outputTypes?: string[];
+}
+
+/** 同一逻辑制度的新旧版本条款差异。此路径不使用模型或 MCP。 */
+export interface VersionDiffPayload {
+	newDocVersionId: string;
+	oldDocVersionId: string;
+}
+
+export interface VersionDiffDocument {
+	docVersionId: string;
+	title: string;
+	versionLabel: string;
+	versionStatus: string;
+	versionCode?: string | null;
+	versionDisplayName?: string | null;
+	revisionNo?: number | null;
+	issueDate?: string | null;
+	effectiveDate?: string | null;
+}
+
+export interface VersionDiffRow {
+	index: number;
+	tabKey: "added" | "removed" | "changed" | "moved";
+	place: string;
+	oldPlace?: string;
+	newPlace?: string;
+	policyA: string;
+	policyB: string;
+	level: "新增" | "删除" | "修改" | "位置调整";
+	description: string;
+}
+
+export interface VersionDiffResult {
+	compareType: "version_diff";
+	corpusType: "internal" | "external";
+	logicalId: string;
+	newVersion: VersionDiffDocument;
+	oldVersion: VersionDiffDocument;
+	metrics: { added: number; removed: number; changed: number; moved: number; total: number };
+	rows: VersionDiffRow[];
+	finish_reason: "stop";
 }

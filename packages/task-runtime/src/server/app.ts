@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { SpecRouter } from "../router/router.ts";
 import type { RunResult } from "../runtime/contract.ts";
+import type { DocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import type { RunStore } from "../store/contract.ts";
 import { checkInternalToken, INTERNAL_TOKEN_HEADER } from "./middleware/auth.ts";
 import { clampWaitMs, validateSubmitBody } from "./middleware/validate.ts";
@@ -15,6 +16,7 @@ export interface AppOptions {
 	/** 未配置 = 边界关闭(fail-closed)。 */
 	internalToken: string | undefined;
 	newSessionId?: () => string;
+	documents?: DocumentsClient;
 }
 
 function errorBody(code: string, message: string) {
@@ -59,6 +61,26 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			return c.json(errorBody("unauthorized", "invalid internal token"), 401);
 		}
 		await next();
+	});
+
+	app.get("/library/external-documents", async (c) => {
+		if (!options.documents?.listExternalDocuments)
+			return c.json(errorBody("not_configured", "document library is not configured"), 503);
+		const items = await options.documents.listExternalDocuments(
+			c.req.queries("permTag") ?? [],
+			c.req.query("includeHistory") === "true",
+		);
+		return c.json(items);
+	});
+
+	app.get("/library/internal-documents", async (c) => {
+		if (!options.documents?.listInternalDocuments)
+			return c.json(errorBody("not_configured", "document library is not configured"), 503);
+		const items = await options.documents.listInternalDocuments(
+			c.req.queries("permTag") ?? [],
+			c.req.query("includeHistory") === "true",
+		);
+		return c.json(items);
 	});
 
 	app.post("/runs", async (c) => {

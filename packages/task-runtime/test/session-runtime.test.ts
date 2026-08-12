@@ -806,6 +806,28 @@ function toolsetsWithClauses(): ToolsetRegistry {
 	return registry;
 }
 
+function toolsetsWithSourceDetails(): ToolsetRegistry {
+	const registry = new ToolsetRegistry();
+	registry.register("source-details", async () => [
+		{
+			name: "get_clause_detail",
+			label: "Get clause detail",
+			description: "Fetch the authoritative clause text.",
+			parameters: Type.Object({ clause_id: Type.String() }),
+			execute: async (_id: string, params: { clause_id: string }) => {
+				const sourceDetail = { clause_id: params.clause_id, text: "权威正文", doc_title: "监管规则" };
+				const payload = JSON.stringify({ items: [sourceDetail] });
+				return {
+					output: payload,
+					content: [{ type: "text", text: payload }],
+					details: { source_details: [sourceDetail] },
+				};
+			},
+		} as never,
+	]);
+	return registry;
+}
+
 /** 在 toolsetsWithClauses() 之外再加一个必失败的工具:抛出的 Error message 是一段能被
  *  tryParseJson 解开的 JSON,且里面回显了调用参数里的 clause_id —— 照着
  *  toolsets/mcp/adapter.ts 的真实链路:MCP server 对业务级失败返回 isError:true 时,
@@ -844,6 +866,22 @@ function toolsetsWithClauseAndFailure(): ToolsetRegistry {
 // 测试证明 tool_execution_end 真的会填充它、它真的送达判官、clear() 真的挡住跨 run 串数据。
 // 这三条正是风险 10 说的"上游改字段名会静默失效"的失效面,而 C3/C6 直接压在上面。
 describe("SessionRuntime - clauseIds wiring (review I-4)", () => {
+	it("carries successful authoritative source details into the completed RunResult", async () => {
+		const runtime = await buildWithRegistry(
+			createDefaultPluginRegistry(),
+			{ toolset: "source-details", tools: ["get_clause_detail"] },
+			[
+				fauxAssistantMessage([fauxToolCall("get_clause_detail", { clause_id: "A-1" })], { stopReason: "toolUse" }),
+				fauxAssistantMessage("答完了"),
+			],
+			toolsetsWithSourceDetails(),
+		);
+
+		const result = await runtime.run("hello");
+		expect(result.status).toBe("completed");
+		expect(result.sourceDetails).toEqual([{ clause_id: "A-1", text: "权威正文", doc_title: "监管规则" }]);
+	});
+
 	it("feeds clause_ids from tool results into JudgeContext and clears them between runs", async () => {
 		const seen: string[][] = [];
 		const runtime = await buildWithRegistry(

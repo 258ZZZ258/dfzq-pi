@@ -7,8 +7,10 @@ import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createEscalatingRuntime } from "../runtime/escalating-runtime.ts";
 import { createFastPathRuntime } from "../runtime/fast-path-runtime.ts";
 import { createArtifactStore, createMinioObjectGetter } from "../runtime/policy-compare/artifact-store.ts";
+import type { DocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import { createDocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import { createPolicyCompareRuntime } from "../runtime/policy-compare/runtime.ts";
+import { createVersionDiffRuntime } from "../runtime/policy-compare/version-diff-runtime.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
@@ -31,6 +33,7 @@ export interface ServeOptions {
 	runtimeFactory: RuntimeFactory;
 	maxConcurrent?: number;
 	maxQueueDepth?: number;
+	documents?: DocumentsClient;
 }
 
 export async function startServer(options: ServeOptions): Promise<{ port: number; close: () => Promise<void> }> {
@@ -45,7 +48,13 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 	const gate = new Gate({ maxConcurrent: options.maxConcurrent, maxQueueDepth: options.maxQueueDepth });
 	const manager = new RunManager({ store, gate, runtimeFactory: options.runtimeFactory });
 
-	const app = createApp({ manager, router, store, internalToken: options.internalToken });
+	const app = createApp({
+		manager,
+		router,
+		store,
+		internalToken: options.internalToken,
+		documents: options.documents,
+	});
 	// `server.listen()`(hono 内部调用)是异步绑定的:serve() 同步返回时,底层 socket
 	// 大概率还没 bind 完成 —— 此刻 server.address() 恒为 null,若不等 "listening" 就
 	// 返回,close() 在真正开始监听前被调用会直接抛 ERR_SERVER_NOT_RUNNING(而不是把
@@ -222,6 +231,20 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		// 🔴 分派顺序:`workflow` 排在 `fastPath` 之前。前者整条换掉 Runtime 实现(连
 		// SessionRuntime 都不经过),后者是 SessionRuntime 内部把模型调用压成固定 2 次 ——
 		// 外层的先判。两者同时声明已由 validateSpec 在装配期拒掉,这里不会同时命中。
+		if (spec.workflow === "policy-version-diff") {
+			// 版本差异由 audit-ai 在同一 logical_id 的两份已入库版本上精确对齐条款；
+			// 不依赖 MinIO/MCP/模型，避免把确定性 diff 退化为 agent 推理。
+			return createVersionDiffRuntime({
+				spec,
+				payload,
+				documents: createDocumentsClient({
+					baseUrl: requireEnv("AUDIT_AI_BASE_URL"),
+					internalToken: requireEnv("AUDIT_AI_INTERNAL_TOKEN"),
+				}),
+				permissionTags: filters.permTags ?? [],
+			});
+		}
+
 		if (spec.workflow === "policy-compare") {
 			// 确定性工作流:模型不编排,工具由代码经 Assembled.callTool 发起。
 			// 三个外部依赖走 env —— 凭证绝不入库,缺任何一个都在这里 fail-closed。
@@ -248,6 +271,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 				outputContractSchema: outputContractSchemas.get(specId),
 				payload,
 				documents: createDocumentsClient({ baseUrl, internalToken }),
+				permissionTags: filters.permTags ?? [],
 				artifacts: createArtifactStore({
 					bucket,
 					get: createMinioObjectGetter({

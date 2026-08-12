@@ -9,6 +9,230 @@ function fakeFetch(handler: (url: string, init: RequestInit) => Response): typeo
 const req = { objectKey: "upload/U1/a.pdf", uploadId: "U1", filename: "a.pdf", corpusHint: "external" };
 
 describe("createDocumentsClient", () => {
+	it("读取知识库外规目录并保留 docVersionId", async () => {
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch((url) => {
+				expect(url).toContain("/v1/library/external-documents?perm_tag=");
+				return new Response(
+					JSON.stringify([
+						{
+							logical_id: "L1",
+							doc_version_id: "V1",
+							title: "某办法",
+							version_label: "2026版",
+							version_status: "effective",
+							version_code: "V1.2",
+							version_display_name: "2026年第二次修订版",
+							revision_no: 3,
+							issue_date: "2026-01-01",
+						},
+					]),
+				);
+			}),
+		});
+		expect(await client.listExternalDocuments!(["内部"])).toEqual([
+			expect.objectContaining({
+				logicalId: "L1",
+				docVersionId: "V1",
+				title: "某办法",
+				versionLabel: "2026版",
+				versionCode: "V1.2",
+				versionDisplayName: "2026年第二次修订版",
+				revisionNo: 3,
+			}),
+		]);
+	});
+
+	it("按 docVersionId 读取知识库外规条款", async () => {
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch(
+				() =>
+					new Response(
+						JSON.stringify({
+							doc_version_id: "V1",
+							title: "某办法",
+							doc_no: "文号",
+							clauses: [{ seq: 1, clause_path: "第一条", text: "正文" }],
+						}),
+					),
+			),
+		});
+		expect(await client.getExternalDocument!("V1")).toEqual({
+			uploadId: "library:V1",
+			title: "某办法",
+			docNo: "文号",
+			clauses: [{ seq: 1, clausePath: "第一条", text: "正文", pageStart: undefined, pageEnd: undefined }],
+		});
+	});
+
+	it("读取知识库内规目录", async () => {
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch((url) => {
+				expect(url).toContain("/v1/library/internal-documents?perm_tag=");
+				return new Response(
+					JSON.stringify([
+						{
+							logical_id: "IL1",
+							doc_version_id: "IV1",
+							title: "内部控制制度",
+							version_label: "2026版",
+							version_status: "effective",
+						},
+					]),
+				);
+			}),
+		});
+		expect(await client.listInternalDocuments!(["内部"])).toEqual([
+			expect.objectContaining({ logicalId: "IL1", docVersionId: "IV1", title: "内部控制制度" }),
+		]);
+	});
+
+	it("提交内规引用外规版本核查并映射日期范围", async () => {
+		let seenUrl = "";
+		let seenBody: unknown;
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch((url, init) => {
+				seenUrl = url;
+				seenBody = JSON.parse(String(init.body));
+				return new Response(
+					JSON.stringify({
+						compareType: "internal_to_external",
+						metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
+						rows: [],
+						finish_reason: "stop",
+					}),
+				);
+			}),
+		});
+		const result = await client.checkInternalReferenceVersions!({
+			docVersionId: "IV1",
+			effectiveDateRange: ["2024-01-01", "2026-12-31"],
+			permTags: ["内部"],
+		});
+		expect(seenUrl).toBe("http://ai.local/v1/internal-reference-version-check");
+		expect(seenBody).toEqual({
+			perm_tags: ["内部"],
+			doc_version_id: "IV1",
+			effective_from: "2024-01-01",
+			effective_to: "2026-12-31",
+		});
+		expect(result.compareType).toBe("internal_to_external");
+	});
+
+	it("提交同一逻辑制度的两个版本并映射为前端差异行", async () => {
+		let seenUrl = "";
+		let seenBody: unknown;
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch((url, init) => {
+				seenUrl = url;
+				seenBody = JSON.parse(String(init.body));
+				return new Response(
+					JSON.stringify({
+						compare_type: "version_diff",
+						corpus_type: "internal",
+						logical_id: "POLICY-1",
+						new_version: {
+							doc_version_id: "NEW",
+							title: "测试内规",
+							version_label: "2026版",
+							version_status: "effective",
+						},
+						old_version: {
+							doc_version_id: "OLD",
+							title: "测试内规",
+							version_label: "2025版",
+							version_status: "superseded",
+						},
+						metrics: { added: 0, removed: 0, changed: 1, moved: 0, total: 1 },
+						rows: [
+							{
+								index: 1,
+								tab_key: "changed",
+								clause_path: "第二条",
+								old_text: "旧内容",
+								new_text: "新内容",
+								change_type: "changed",
+							},
+						],
+					}),
+				);
+			}),
+		});
+
+		const result = await client.compareVersions!({
+			newDocVersionId: "NEW",
+			oldDocVersionId: "OLD",
+			permTags: ["内部"],
+		});
+
+		expect(seenUrl).toBe("http://ai.local/v1/library/version-diff");
+		expect(seenBody).toEqual({ new_doc_version_id: "NEW", old_doc_version_id: "OLD", perm_tags: ["内部"] });
+		expect(result).toMatchObject({ corpusType: "internal", logicalId: "POLICY-1", metrics: { changed: 1 } });
+		expect(result.rows[0]).toMatchObject({
+			tabKey: "changed",
+			place: "第二条",
+			policyA: "新内容",
+			policyB: "旧内容",
+			level: "修改",
+		});
+	});
+
+	it("maps a strict same-text path change to a dedicated moved row", async () => {
+		const client = createDocumentsClient({
+			baseUrl: "http://ai.local",
+			internalToken: "T",
+			fetchImpl: fakeFetch(
+				() =>
+					new Response(
+						JSON.stringify({
+							compare_type: "version_diff",
+							corpus_type: "internal",
+							logical_id: "POLICY-1",
+							new_version: { doc_version_id: "V2", title: "制度", version_label: "新" },
+							old_version: { doc_version_id: "V1", title: "制度", version_label: "旧" },
+							metrics: { added: 0, removed: 0, changed: 0, moved: 1, total: 1 },
+							rows: [
+								{
+									index: 1,
+									tab_key: "moved",
+									clause_path: "第三章/第一条",
+									old_clause_path: "第二章/第一条",
+									new_clause_path: "第三章/第一条",
+									old_text: "正文未变",
+									new_text: "正文未变",
+									change_type: "moved",
+								},
+							],
+						}),
+					),
+			),
+		});
+
+		const result = await client.compareVersions!({
+			newDocVersionId: "V2",
+			oldDocVersionId: "V1",
+			permTags: ["内部"],
+		});
+
+		expect(result.metrics).toMatchObject({ moved: 1, total: 1 });
+		expect(result.rows[0]).toMatchObject({
+			tabKey: "moved",
+			level: "位置调整",
+			oldPlace: "第二章/第一条",
+			newPlace: "第三章/第一条",
+		});
+	});
+
 	it("POST 到 /v1/documents:process 并带 X-Internal-Token", async () => {
 		let seenUrl = "";
 		let seenToken: string | null = null;

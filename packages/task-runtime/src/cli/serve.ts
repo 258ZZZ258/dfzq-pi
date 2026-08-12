@@ -1,3 +1,4 @@
+import { createDocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import { createDefaultRuntimeFactory, startServer } from "../server/main.ts";
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
@@ -35,12 +36,18 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 	const workRoot = requireEnv(env, "TASK_RUNTIME_WORK_ROOT");
 
 	const runtimeFactory = await createDefaultRuntimeFactory({ profilePath, workRoot, specsDir });
+	const auditBaseUrl = env.AUDIT_AI_BASE_URL;
+	const auditToken = env.AUDIT_AI_INTERNAL_TOKEN;
 	return startServer({
 		port,
 		dbPath,
 		specsDir,
 		internalToken,
 		runtimeFactory,
+		documents:
+			auditBaseUrl && auditToken
+				? createDocumentsClient({ baseUrl: auditBaseUrl, internalToken: auditToken })
+				: undefined,
 		maxConcurrent: optionalNumber(env, "TASK_RUNTIME_MAX_CONCURRENT"),
 		maxQueueDepth: optionalNumber(env, "TASK_RUNTIME_MAX_QUEUE_DEPTH"),
 	});

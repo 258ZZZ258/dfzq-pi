@@ -128,7 +128,7 @@ export interface RuntimeSpec {
 	 * 则整条换成另一个 `Runtime` 实现,连 SessionRuntime 都不经过。两者同时声明没有意义,
 	 * 校验见 `validate.ts`。
 	 */
-	workflow?: "policy-compare";
+	workflow?: "policy-compare" | "policy-version-diff";
 
 	/** 缺省不填 = 不启用,既有 spec 行为不变。 */
 	fastPath?: FastPathSpec;

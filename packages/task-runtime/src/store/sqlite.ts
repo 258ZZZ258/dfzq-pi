@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS runs (
   limit_hit         TEXT,
   usage_json        TEXT,
   turns             INTEGER,
+  source_details_json TEXT,
   created_at        INTEGER NOT NULL,
   started_at        INTEGER,
   finished_at       INTEGER
@@ -56,6 +57,7 @@ interface RunRow {
 	limit_hit: string | null;
 	usage_json: string | null;
 	turns: number | null;
+	source_details_json: string | null;
 	created_at: number;
 	started_at: number | null;
 	finished_at: number | null;
@@ -81,6 +83,9 @@ function toRecord(row: RunRow): RunRecord {
 		limitHit: (row.limit_hit as LimitKind | null) ?? undefined,
 		usageJson: row.usage_json ?? undefined,
 		turns: row.turns ?? undefined,
+		sourceDetails: row.source_details_json
+			? (JSON.parse(row.source_details_json) as RunRecord["sourceDetails"])
+			: undefined,
 		createdAt: row.created_at,
 		startedAt: row.started_at ?? undefined,
 		finishedAt: row.finished_at ?? undefined,
@@ -103,6 +108,9 @@ export function createSqliteRunStore(path: string): RunStore {
 	if (!columns.some((c) => c.name === "payload_json")) {
 		db.exec("ALTER TABLE runs ADD COLUMN payload_json TEXT");
 	}
+	if (!columns.some((c) => c.name === "source_details_json")) {
+		db.exec("ALTER TABLE runs ADD COLUMN source_details_json TEXT");
+	}
 
 	const insert = db.prepare(`
 		INSERT INTO runs (run_id, client_request_id, request_id, spec_id, task_kind, session_id,
@@ -115,7 +123,7 @@ export function createSqliteRunStore(path: string): RunStore {
 	const setRunning = db.prepare("UPDATE runs SET status = 'running', started_at = ? WHERE run_id = ?");
 	const setFinished = db.prepare(`
 		UPDATE runs SET status = ?, output = ?, error_message = ?, stop_reason = ?, limit_hit = ?,
-		                usage_json = ?, turns = ?, finished_at = ?
+		                usage_json = ?, turns = ?, source_details_json = ?, finished_at = ?
 		WHERE run_id = ?
 	`);
 	const setError = db.prepare("UPDATE runs SET status = 'error', error_message = ?, finished_at = ? WHERE run_id = ?");
@@ -178,6 +186,7 @@ export function createSqliteRunStore(path: string): RunStore {
 					result.limit ?? null,
 					JSON.stringify(result.usage),
 					result.turns,
+					result.sourceDetails ? JSON.stringify(result.sourceDetails) : null,
 					finishedAt,
 					runId,
 				).changes,

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["compareType", "corpusType", "logicalId", "newVersion", "oldVersion", "metrics", "rows", "finish_reason"],
+  "properties": {
+    "compareType": { "const": "version_diff" },
+    "corpusType": { "enum": ["internal", "external"] },
+    "logicalId": { "type": "string", "minLength": 1 },
+    "newVersion": { "type": "object" },
+    "oldVersion": { "type": "object" },
+    "metrics": { "type": "object" },
+    "rows": { "type": "array" },
+    "finish_reason": { "const": "stop" }
+  },
+  "additionalProperties": true
+}

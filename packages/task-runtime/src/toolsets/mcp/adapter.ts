@@ -41,6 +41,27 @@ function assertScope(scope: McpRunScope): void {
 	}
 }
 
+/**
+ * `get_clause_detail` 的正文已经由受信 MCP 返回；把通过最小形状校验的正文放进工具私有 details，
+ * 供运行时在最终响应中复用。details 不会进入模型上下文，避免正文因展示需求重复占用 prompt。
+ */
+function sourceDetails(text: string): Array<Record<string, unknown>> {
+	try {
+		const parsed = JSON.parse(text) as { items?: unknown };
+		if (!Array.isArray(parsed.items)) return [];
+		return parsed.items.filter(
+			(item): item is Record<string, unknown> =>
+				typeof item === "object" &&
+				item !== null &&
+				typeof (item as { clause_id?: unknown }).clause_id === "string" &&
+				typeof (item as { text?: unknown }).text === "string" &&
+				(item as { text: string }).text.trim().length > 0,
+		);
+	} catch {
+		return [];
+	}
+}
+
 const ENV_REF = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g;
 
 function expandValue(raw: string, env: NodeJS.ProcessEnv, where: string): string {
@@ -167,7 +188,7 @@ function toToolDefinition(
 			}
 			return {
 				content: [{ type: "text", text: result.text }],
-				details: undefined,
+				details: info.name === "get_clause_detail" ? { source_details: sourceDetails(result.text) } : undefined,
 			};
 		},
 	};

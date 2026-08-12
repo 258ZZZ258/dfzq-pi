@@ -158,7 +158,12 @@ export async function buildRuntime(o: HarnessOpts) {
 			name: "resolve_source_law",
 			label: "resolve_source_law",
 			description: "faux",
-			parameters: Type.Object({ chunk_ids: Type.Array(Type.String()) }),
+			parameters: Type.Object({
+				chunk_ids: Type.Array(Type.String()),
+				target_document: Type.Optional(
+					Type.Object({ title: Type.String(), doc_no: Type.Union([Type.String(), Type.Null()]) }),
+				),
+			}),
 			execute: async (_id: string, params: Record<string, unknown>) => {
 				toolCalls.push("resolve_source_law");
 				resolutionsArgs.push(params);
@@ -257,7 +262,7 @@ export async function buildRuntime(o: HarnessOpts) {
 	return { runtime, toolCalls, obligationsArgs, resolutionsArgs, faux: harness.faux };
 }
 
-export const verdictReply = (items: unknown[]) => "```json\n" + JSON.stringify({ verdicts: items }) + "\n```";
+export const verdictReply = (items: unknown[]) => `\`\`\`json\n${JSON.stringify({ verdicts: items })}\n\`\`\``;
 
 /** `outputContractSchema` 的缺省值 —— `buildRuntime` 自己内部用,调用方要另外断言 schema
  *  校验时各自独立 `readFileSync` 同一份文件(两个测试文件本来就都这么做,读一份静态 JSON

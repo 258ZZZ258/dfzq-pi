@@ -6,30 +6,26 @@ import type { ToolsetRegistry } from "../../toolsets/registry.ts";
 import { type Assembled, type AssembleOptions, assemble, type PluginToolCallEvent } from "../assembler.ts";
 import type { LimitKind, LimitState, RunOptions, RunResult, Runtime, RuntimeEvent } from "../contract.ts";
 import type { PluginContext, PluginRegistry } from "../plugin-registry.ts";
-import { alignClauses } from "./align.ts";
+import { alignBatchCandidates } from "./align.ts";
 import type { ArtifactStore } from "./artifact-store.ts";
 import { buildCoverageResult } from "./assemble.ts";
 import type { DocumentsClient } from "./documents-client.ts";
-import type { CoveragePayload, InternalObligation, SourceLawResolution, Verdict } from "./types.ts";
+import { filterExternalObligationClauses } from "./obligation.ts";
+import type { CoveragePayload, InternalObligation, Verdict } from "./types.ts";
 import { validateCoverageResult } from "./validate-result.ts";
 import { batchPairs, parseVerdicts, renderBatchPrompt } from "./verdicts.ts";
 
 /** 规格 §3.5 的护栏定值。 */
 export const MAX_BATCH_SIZE = 20;
 export const DEFAULT_BATCH_SIZE = 8;
-export const MAX_OBLIGATIONS = 500;
 export const MAX_EXTERNAL_CHUNKS = 800;
 /**
  * 阶段 4 产出的待判定条款对上限(规格 §3.5)。
  *
- * 🔴 决定阶段 5 扇出的是 `pairs.length`,**不是**义务条款数:`align.ts` 的 `doc_level` 分支
- * (M2 映射粒度为文档级时的降级形态,规格 §5.2)让**一条**内规与上传件的**全部**条款成对,
- * 上界因此是 `MAX_OBLIGATIONS × MAX_EXTERNAL_CHUNKS`,不是 `MAX_OBLIGATIONS`。没有这道护栏时,
- * 50 条内规 × 100 条外规条款 = 5000 对 → 625 批,先撞 `maxCostUsd` 或 `maxTurns`,两者都是
- * fail-closed 丢弃整个 output —— 烧完预算、零产出。
+ * 🔴 决定阶段 5 扇出的是每条外规返回的内规候选总数。没有这道护栏时，一份大外规与大量
+ * 候选内规会产生数千对待判定条款，先撞 `maxCostUsd` 或 `maxTurns`，最后零产出。
  *
- * 定值 500:非 `doc_level` 路径下一条内规最多产 1 对,所以 500 恰好放行 `MAX_OBLIGATIONS`
- * 的全量;同时 `ceil(500 / batchSize 下界 1) = 500 < maxTurns=600`,spec 那条不等式仍成立。
+ * 定值 500：同时 `ceil(500 / batchSize 下界 1) = 500 < maxTurns=600`，spec 的不等式仍成立。
  */
 export const MAX_PAIRS = 500;
 
@@ -179,84 +175,49 @@ export interface PolicyCompareRuntimeOptions {
 
 type Stage = "extracting" | "matching" | "judging" | "assembling";
 
-/** 从 M1 的工具返回里取义务条款。形状不对即抛 —— 阶段 2 拿不到东西不能当成「零义务」。 */
-function toObligations(raw: unknown): { items: InternalObligation[]; total: number; truncated: boolean } {
-	const r = raw as { items?: unknown; total?: unknown; truncated?: unknown } | null;
-	if (!r || !Array.isArray(r.items)) {
-		throw new Error("list_internal_obligations 返回缺少 items 数组");
+/** 解析 audit-ai 批量检索候选。每条输入必须得到同序、唯一的结果项，避免候选错配。 */
+function toBatchCandidates(raw: unknown, expectedCount: number, toolName = "retrieve_internal_candidates_batch"): Array<{
+	queryIndex: number;
+	candidates: InternalObligation[];
+	error: string | null;
+}> {
+	const r = raw as { items?: unknown } | null;
+	if (!r || !Array.isArray(r.items) || r.items.length !== expectedCount) {
+		throw new Error(`${toolName} 返回 items 数量异常(期望 ${expectedCount})`);
 	}
-	const items = r.items.map((it) => {
-		const row = it as Record<string, unknown>;
-		return {
-			chunkId: String(row.chunk_id ?? ""),
-			clausePath: typeof row.clause_path === "string" ? row.clause_path : null,
-			docTitle: typeof row.doc_title === "string" ? row.doc_title : null,
-			docNo: typeof row.doc_no === "string" ? row.doc_no : null,
-			deonticType: (row.deontic_type ?? "obligation") as InternalObligation["deonticType"],
-			evidence: typeof row.evidence === "string" ? row.evidence : null,
-			text: String(row.text ?? ""),
-			sourceCode: typeof row.source_code === "string" ? row.source_code : null,
-		} satisfies InternalObligation;
+	const seen = new Set<number>();
+	return r.items.map((value) => {
+		const row = value as Record<string, unknown>;
+		const queryIndex = row.query_index;
+		if (typeof queryIndex !== "number" || !Number.isInteger(queryIndex) || queryIndex < 0 || queryIndex >= expectedCount || seen.has(queryIndex)) {
+			throw new Error(`${toolName} 返回了非法或重复 query_index`);
+		}
+		seen.add(queryIndex);
+		if (!Array.isArray(row.candidates)) {
+			throw new Error(`${toolName} 返回缺少 candidates 数组`);
+		}
+		const candidateIds = new Set<string>();
+		const candidates = row.candidates.map((candidate) => {
+			const c = candidate as Record<string, unknown>;
+			const chunkId = typeof c.chunk_id === "string" ? c.chunk_id : "";
+			const text = typeof c.text === "string" ? c.text : "";
+			if (!chunkId || !text || candidateIds.has(chunkId)) {
+				throw new Error(`${toolName} 返回候选缺少正文、chunk_id 或有重复候选`);
+			}
+			candidateIds.add(chunkId);
+			return {
+				chunkId,
+				clausePath: typeof c.clause_path === "string" ? c.clause_path : null,
+				docTitle: typeof c.doc_title === "string" ? c.doc_title : null,
+				docNo: typeof c.doc_no === "string" ? c.doc_no : null,
+				deonticType: "obligation",
+				evidence: null,
+				text,
+				sourceCode: typeof c.source_code === "string" ? c.source_code : null,
+			} satisfies InternalObligation;
+		});
+		return { queryIndex, candidates, error: typeof row.error === "string" ? row.error : null };
 	});
-	// 🔴 chunk_id 必须唯一,否则守恒会以一条**指错病因**的信息判负:`checkedCount` 取
-	// `items.length`(按行数),而 `buildCoverageResult` 的 metrics 按 `chunkId` 分组累加
-	// (按去重后的条数),两者只在唯一时相等。规格 §5.1 的 M1 SQL 是
-	// `chunks JOIN clause_tags ... AND deontic_type IN (:deontic_types)` —— 同一 chunk 挂了多条
-	// `is_obligation` 标签(不同 `deontic_type`)就会出重复行,E1 富集里并非不可能。
-	// 届时 `validate-result.ts` 会报「metrics 不自洽」,而那条信息的文档写着「判负 = 代码 bug」,
-	// 值班的人会去查 TS 组装代码,病因却在 M1 的 JOIN。
-	// **抛错而不是去重**:去重会把 `checkedCount` 的语义从「M1 返回了几条」悄悄改成
-	// 「去重后几条」,是另一个更难发现的口径漂移。
-	const seen = new Set<string>();
-	const duplicated = new Set<string>();
-	for (const it of items) {
-		if (seen.has(it.chunkId)) duplicated.add(it.chunkId);
-		seen.add(it.chunkId);
-	}
-	if (duplicated.size > 0) {
-		throw new Error(
-			`list_internal_obligations 返回了重复 chunk_id(${[...duplicated].join("、")})—— ` +
-				"同一 chunk 挂多条 is_obligation 标签会让 M1 的 JOIN 出重复行;请在 M1 侧按 chunk_id 去重后再返回",
-		);
-	}
-	return {
-		items,
-		total: typeof r.total === "number" ? r.total : items.length,
-		truncated: r.truncated === true,
-	};
-}
-
-/** 从 M2 的工具返回里取映射。`rejected` / `unresolved` 原样带出,由调用方写进 gaps。 */
-function toResolutions(raw: unknown): {
-	items: SourceLawResolution[];
-	rejected: string[];
-	unresolved: string[];
-} {
-	const r = raw as { items?: unknown; rejected?: unknown; unresolved?: unknown } | null;
-	if (!r || !Array.isArray(r.items)) {
-		throw new Error("resolve_source_law 返回缺少 items 数组");
-	}
-	const items = r.items.map((it) => {
-		const row = it as Record<string, unknown>;
-		const laws = Array.isArray(row.source_laws) ? row.source_laws : [];
-		return {
-			chunkId: String(row.chunk_id ?? ""),
-			sourceLaws: laws.map((l) => {
-				const law = l as Record<string, unknown>;
-				return {
-					docNo: typeof law.doc_no === "string" ? law.doc_no : null,
-					docTitle: typeof law.doc_title === "string" ? law.doc_title : null,
-					clausePath: typeof law.clause_path === "string" ? law.clause_path : null,
-					sourceCode: typeof law.source_code === "string" ? law.source_code : null,
-				};
-			}),
-		} satisfies SourceLawResolution;
-	});
-	return {
-		items,
-		rejected: Array.isArray(r.rejected) ? (r.rejected as string[]) : [],
-		unresolved: Array.isArray(r.unresolved) ? (r.unresolved as string[]) : [],
-	};
 }
 
 /** `limitState.tripped` 的人可读描述。照 `fast-path-runtime.ts` 的 `describeTripped`:
@@ -432,6 +393,9 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 			const internal = payload.internal!;
 			stage("extracting", 5, 0, 1, "正在解析待核查内规");
 			checkPreempted();
+			if (!options.documents.checkInternalReferenceVersions) {
+				throw new Error("内规→外规覆盖核查客户端未配置");
+			}
 			const processed =
 				internal.source === "upload"
 					? await options.documents.process({
@@ -441,38 +405,32 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 							corpusHint: "internal",
 						})
 					: null;
-			const doc = processed ? await options.artifacts.fetch(processed.artifactKey) : null;
-			stage("extracting", 35, doc?.clauses.length ?? 1, doc?.clauses.length ?? 1, "已取得内规条款与显式外规引用");
-			checkPreempted();
-			stage("matching", 55, 0, 1, "正在核对引用外规的当前版本");
-			if (!options.documents.checkInternalReferenceVersions) {
-				throw new Error("内规引用外规版本核查客户端未配置");
+			const uploadDocument = internal.source === "upload" ? await options.artifacts.fetch(processed!.artifactKey) : undefined;
+			if (uploadDocument && uploadDocument.clauses.length > MAX_EXTERNAL_CHUNKS) {
+				throw new Error(`内规解析出 ${uploadDocument.clauses.length} 条条款,超过上限 ${MAX_EXTERNAL_CHUNKS}`);
 			}
-			const result = await options.documents.checkInternalReferenceVersions({
-				docVersionId: internal.source === "library" ? internal.docVersionId : undefined,
-				clauses: doc?.clauses.map((clause) => ({
-					chunkId: `upload:${internal.source === "upload" ? internal.uploadId : "library"}:${clause.seq}`,
-					clausePath: clause.clausePath || null,
-					text: clause.text,
-				})),
-				effectiveDateRange: payload.scope.effectiveDateRange,
-				permTags: options.permissionTags ?? [],
-			});
-			stage("assembling", 95, 0, 1, "正在组装外规版本变更结果");
+			stage("extracting", 20, 0, 1, "正在核对内规已引用外规的版本与条款变动");
+			checkPreempted();
+			const result = await options.documents.checkInternalReferenceVersions(
+				internal.source === "library"
+					? {
+						docVersionId: internal.docVersionId,
+						effectiveDateRange: payload.scope.effectiveDateRange,
+						permTags: options.permissionTags ?? [],
+					}
+					: {
+						clauses: uploadDocument!.clauses.map((clause) => ({
+							chunkId: `${internal.uploadId}:${clause.seq}`,
+							clausePath: clause.clausePath,
+							text: clause.text,
+						})),
+						effectiveDateRange: payload.scope.effectiveDateRange,
+						permTags: options.permissionTags ?? [],
+					},
+			);
 			if (!Value.Check(options.outputContractSchema as never, result as never)) {
 				const first = [...Value.Errors(options.outputContractSchema as never, result as never)][0];
-				const errorMessage = `输出契约校验失败: ${first ? `${first.instancePath}: ${first.message}` : "schema 校验失败"}`;
-				emitTerminalStage(errorMessage);
-				return {
-					runId,
-					specId: options.spec.id,
-					status: "error",
-					errorMessage,
-					usage: currentUsage(),
-					turns: 0,
-					durationMs: Date.now() - startedAt,
-					judgeAttempts: {},
-				};
+				throw new Error(`引用版本核查输出契约校验失败:${first ? `${first.instancePath}: ${first.message}` : "未知错误"}`);
 			}
 			stage("assembling", 100, 1, 1, "比对完成");
 			return {
@@ -515,8 +473,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 					: (() => {
 							throw new Error("知识库外规读取客户端未配置");
 						})();
-		// 🔴 本地复核,与阶段 2 对 M1 的 `items.length > MAX_OBLIGATIONS` 是同一姿态:上游自报的数字
-		// 只是提示,真正决定阶段 5 扇出规模的是**这里实际拿到的条款数**。少了这一道,E0 漏回
+		// 🔴 本地复核:上游自报的数字只是提示,真正决定阶段 5 扇出规模的是**这里实际拿到的条款数**。少了这一道,E0 漏回
 		// `chunk_count` 时一份 5000 条款的产物会长驱直入。
 		// 注意两个数不同义:`chunk_count` 是全部切块,这里是过滤掉表格/目录之后的条款块 ——
 		// 后者才是与 `MAX_EXTERNAL_CHUNKS` 同量纲的那个量(它给阶段 4/5 定扇出上界)。
@@ -526,65 +483,77 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 					`(E0 自报 chunk_count=${processed?.chunkCount ?? doc.clauses.length},以实际解析条数为准)`,
 			);
 		}
-		stage("extracting", 20, 1, 1, `已抽取外规条款 ${doc.clauses.length} 条`);
+		const coverageDoc = {
+			...doc,
+			clauses: filterExternalObligationClauses(doc.clauses),
+		};
+		stage(
+			"extracting",
+			20,
+			coverageDoc.clauses.length,
+			doc.clauses.length,
+			`已抽取外规条款 ${doc.clauses.length} 条，其中规范性义务条款 ${coverageDoc.clauses.length} 条`,
+		);
 
-		// ── 阶段 2:圈定内规义务条款 ──────────────────────────
-		checkPreempted();
-		const obligationsRaw = await assembled.callTool("list_internal_obligations", {
-			organizations: [],
-			biz_domains: payload.scope.bizDomains ?? [],
-			chapters: payload.scope.chapters ?? [],
-			effective_from: payload.scope.effectiveDateRange?.[0],
-			effective_to: payload.scope.effectiveDateRange?.[1],
-			limit: MAX_OBLIGATIONS,
-		});
-		const obligations = toObligations(obligationsRaw);
-		// `limit: MAX_OBLIGATIONS` 只是请求里的一个字段,M1 有没有真的遵守它是另一回事(评审
-		// Minor)——`MAX_EXTERNAL_CHUNKS`/`MAX_BATCH_SIZE` 两条护栏都是本地强制的,这条不能只
-		// 停在"传了参数"就算数。M1 若回了 600 条,阶段 5 会扇出 ~75 次模型调用,`batchSize` 上限
-		// 20 也管不住总条数。
-		if (obligations.items.length > MAX_OBLIGATIONS) {
-			throw new Error(
-				`list_internal_obligations 返回 ${obligations.items.length} 条,超过上限 ${MAX_OBLIGATIONS}` +
-					"(已传 limit 参数但返回条数仍超限,M1 未遵守)",
+		// 说明性、定义性外规条款不是覆盖度核查对象；为空时绝不向 audit-ai 发起空批量语义检索。
+		if (coverageDoc.clauses.length === 0) {
+			stage("assembling", 95, 0, 1, "未识别到规范性义务条款，无需检索内规");
+			const result = buildCoverageResult({
+				alignment: { pairs: [], unmatched: [], countBy: "external" },
+				verdicts: [],
+				checkedCount: 0,
+				truncated: false,
+				externalDocNo: coverageDoc.docNo ?? null,
+				extraGaps: [
+					"未识别到含应当、必须、不得、禁止等规范性义务词的外规条款，本次未执行内规语义检索。",
+				],
+			});
+			const checked = validateCoverageResult(
+				result,
+				{ internalChunkIds: new Set(), externalTexts: new Set(), internalTexts: new Set(), checkedCount: 0 },
+				options.outputContractSchema,
 			);
+			if (!checked.ok) throw new Error(`输出契约校验失败: ${checked.detail}`);
+			stage("assembling", 100, 1, 1, "比对完成");
+			return {
+				runId,
+				specId: options.spec.id,
+				status: "completed",
+				output: `\`\`\`json\n${JSON.stringify(result)}\n\`\`\``,
+				usage: currentUsage(),
+				turns: 0,
+				durationMs: Date.now() - startedAt,
+				judgeAttempts: {},
+			};
 		}
+
+		// ── 阶段 2:外规条款批量检索候选内规 ───────────────────
+		checkPreempted();
+		const candidatesRaw = await assembled.callTool("retrieve_internal_candidates_batch", {
+			clauses: coverageDoc.clauses.map((clause) => ({ clause_path: clause.clausePath, text: clause.text })),
+		});
+		const candidateItems = toBatchCandidates(candidatesRaw, coverageDoc.clauses.length);
+		const candidateCount = candidateItems.reduce((sum, item) => sum + item.candidates.length, 0);
 		stage(
 			"extracting",
 			35,
-			obligations.items.length,
-			obligations.total,
-			`已圈定内规义务条款 ${obligations.items.length} 条`,
+			candidateItems.length,
+			coverageDoc.clauses.length,
+			`已为 ${coverageDoc.clauses.length} 条外规检索到 ${candidateCount} 条内规候选`,
 		);
 
-		// ── 阶段 3:映射反查 ─────────────────────────────────
+		// ── 阶段 3:按外规条款建立候选配对 ─────────────────────
 		checkPreempted();
-		stage("matching", 45, 0, obligations.items.length, "正在反查外规映射");
-		const resolutionsRaw = await assembled.callTool("resolve_source_law", {
-			chunk_ids: obligations.items.map((o) => o.chunkId),
-			// M2 先用权威 R4 映射；本地/早期数据尚无映射时，这个显式目标允许它返回
-			// doc_level 候选。候选仍须经过阶段 5 的逐条模型判定，不能直接算“已覆盖”。
-			target_document: { title: doc.title, doc_no: doc.docNo ?? null },
-		});
-		const resolutions = toResolutions(resolutionsRaw);
-
-		// ── 阶段 4:正文对齐(纯代码)────────────────────────
-		checkPreempted();
-		const alignment = alignClauses(doc, obligations.items, resolutions.items);
-		// 🔴 扇出护栏(规格 §3.5)。批数是 `ceil(pairs.length / batchSize)`,而 `doc_level` 降级下
-		// pairs 是「内规条款数 × 上传件条款数」的乘积 —— 阶段 2 的 500 条上限完全管不住它。
-		// 超限就在这里响亮停下:继续跑只会撞 maxTurns/maxCostUsd,那两条都是 fail-closed 丢弃整个
-		// output,钱花完、一行结果也拿不到。
+		stage("matching", 45, 0, coverageDoc.clauses.length, "正在匹配候选内部制度条款");
+		const alignment = alignBatchCandidates(coverageDoc, candidateItems);
+		// 🔴 扇出护栏(规格 §3.5)。候选总对数决定模型批数；超限就在这里停下，避免烧完预算后零产出。
 		if (alignment.pairs.length > MAX_PAIRS) {
-			const docLevel = alignment.pairs.filter((p) => p.matchKind === "doc_level").length;
 			throw new Error(
 				`阶段 4 产出 ${alignment.pairs.length} 对待判定条款,超过上限 ${MAX_PAIRS}` +
-					`(内规义务 ${obligations.items.length} 条 × 上传外规 ${doc.clauses.length} 条条款;` +
-					`其中 doc_level 扇出 ${docLevel} 对 —— M2 映射粒度为文档级时一条内规与整篇外规全部条款成对,` +
-					"见规格 §5.2 的降级说明。请收窄 scope 或等条款级映射到位)",
+					"(请收窄上传外规范围或降低 audit-ai 的候选条数)",
 			);
 		}
-		stage("matching", 55, alignment.pairs.length, obligations.items.length, "正在匹配内部制度条款");
+		stage("matching", 55, alignment.pairs.length, coverageDoc.clauses.length, "正在匹配内部制度条款");
 
 		// ── 阶段 5:模型判定 ─────────────────────────────────
 		const batches = batchPairs(alignment.pairs, batchSize);
@@ -617,30 +586,23 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		// ── 阶段 6:组装 ────────────────────────────────────
 		checkPreempted();
 		stage("assembling", 95, 0, 1, "正在组装结果");
-		const extraGaps = [
-			...resolutions.rejected.map((cid) => `resolve_source_law 拒绝了本 run 结果集外的 chunk_id:${cid}`),
-			...resolutions.unresolved.map((cid) => `内规条款 ${cid} 在源库中没有外规映射`),
-			...discardedVerdicts,
-		];
+		const extraGaps = [...discardedVerdicts];
 		const result = buildCoverageResult({
 			alignment,
 			verdicts,
-			// ⚠ `items.length` 不是 `total`:守恒按**实际处理**的条数算。`total` 是库内真实
-			// 条数,被 limit 截断时更大,只用于 truncated 的 gaps 文案。
-			checkedCount: obligations.items.length,
-			libraryTotal: obligations.total,
-			truncated: obligations.truncated,
-			externalDocNo: doc.docNo ?? null,
+			// 批量检索路径按外规条款计数；每条外规最终都必须落为 covered/missing/conflict/unmatched 之一。
+			checkedCount: coverageDoc.clauses.length,
+			truncated: false,
+			externalDocNo: coverageDoc.docNo ?? null,
 			extraGaps,
 		});
 		const checked = validateCoverageResult(
 			result,
 			{
-				internalChunkIds: new Set(obligations.items.map((o) => o.chunkId)),
-				externalTexts: new Set(doc.clauses.map((c) => c.text)),
-				internalTexts: new Set(obligations.items.map((o) => o.text)),
-				// 与上面 buildCoverageResult 同一个口径:实际处理数,不是库内总数
-				checkedCount: obligations.items.length,
+				internalChunkIds: new Set(candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.chunkId))),
+				externalTexts: new Set(coverageDoc.clauses.map((c) => c.text)),
+				internalTexts: new Set(candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.text))),
+				checkedCount: coverageDoc.clauses.length,
 			},
 			options.outputContractSchema,
 		);

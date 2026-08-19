@@ -40,8 +40,8 @@ const ARTIFACT = {
 	upload_id: "U1",
 	doc: { title: "基准外规", page_count: 1, chunk_count: 2 },
 	chunks: [
-		{ seq: 0, clause_path: "第五条", chunk_type: "clause", text: "外规第五条正文", is_table: false },
-		{ seq: 1, clause_path: "第十条", chunk_type: "clause", text: "外规第十条正文", is_table: false },
+		{ seq: 0, clause_path: "第五条", chunk_type: "clause", text: "外规第五条正文应当", is_table: false },
+		{ seq: 1, clause_path: "第十条", chunk_type: "clause", text: "外规第十条正文不得", is_table: false },
 	],
 	markdown: "",
 };
@@ -63,6 +63,12 @@ export interface HarnessOpts {
 	artifacts?: ArtifactStore;
 	/** 让 list_internal_obligations 直接回这个形状(绕开正常生成),测 toObligations 的 fail-closed。 */
 	obligationsRawOverride?: unknown;
+	/** 批量候选检索工具直接返回此响应，用于验证外规→内规实际检索链的 fail-closed 语义。 */
+	candidateBatchRawOverride?: unknown;
+	/** 反向批量检索工具直接返回此响应，用于验证内规→外规语义覆盖链。 */
+	externalCandidateBatchRawOverride?: unknown;
+	/** 批量候选检索工具直接抛出，模拟 audit-ai MCP 的 JSON-RPC / 上游失败。 */
+	candidateBatchThrows?: string;
 	/** 让 resolve_source_law 直接回这个形状,测 toResolutions 的 fail-closed。 */
 	resolutionsRawOverride?: unknown;
 	/** 覆盖 outputContractSchema —— 用于让阶段 6 校验必然判负。 */
@@ -115,10 +121,83 @@ export async function buildRuntime(o: HarnessOpts) {
 	const n = o.obligationCount ?? 2;
 	const paths = ["第五条", "第十条"];
 	const toolCalls: string[] = [];
+	const candidateBatchArgs: Record<string, unknown>[] = [];
+	const externalCandidateBatchArgs: Record<string, unknown>[] = [];
 	const obligationsArgs: Record<string, unknown>[] = [];
 	const resolutionsArgs: Record<string, unknown>[] = [];
 	const registry = new ToolsetRegistry();
 	registry.register("pc", async () => [
+		{
+			name: "retrieve_internal_candidates_batch",
+			label: "retrieve_internal_candidates_batch",
+			description: "faux",
+			parameters: Type.Object({ clauses: Type.Array(Type.Object({ clause_path: Type.Optional(Type.String()), text: Type.String() })) }),
+			execute: async (_id: string, params: Record<string, unknown>) => {
+				toolCalls.push("retrieve_internal_candidates_batch");
+				candidateBatchArgs.push(params);
+				if (o.gateObligations) await o.gateObligations;
+				if (o.candidateBatchThrows) throw new Error(o.candidateBatchThrows);
+				const clauses = params.clauses as Array<Record<string, unknown>>;
+				if (o.obligationsMalformed) {
+					const body = JSON.stringify({ total: 0 });
+					return { output: body, content: body };
+				}
+				if (o.candidateBatchRawOverride !== undefined) {
+					const body = JSON.stringify(o.candidateBatchRawOverride);
+					return { output: body, content: body };
+				}
+				const items = clauses.map((_, index) => ({
+					query_index: index,
+					candidates: Array.from({ length: Math.floor((n + clauses.length - 1 - index) / clauses.length) }, (_, slot) => {
+						const candidateIndex = index + slot * clauses.length;
+						return {
+							chunk_id: `C-${candidateIndex}`,
+							clause_path: `内第${candidateIndex}条`,
+							doc_title: "内规",
+							doc_no: "内〔2026〕1号",
+							text: `内规第${candidateIndex}条正文`,
+							source_code: `SC-${candidateIndex}`,
+							score: 0.9,
+						};
+					}),
+					error: null,
+				}));
+				const body = JSON.stringify({ items, total: items.length });
+				return { output: body, content: body };
+			},
+		} as never,
+		{
+			name: "retrieve_external_candidates_batch",
+			label: "retrieve_external_candidates_batch",
+			description: "faux",
+			parameters: Type.Object({ clauses: Type.Array(Type.Object({ clause_path: Type.Optional(Type.String()), text: Type.String() })) }),
+			execute: async (_id: string, params: Record<string, unknown>) => {
+				toolCalls.push("retrieve_external_candidates_batch");
+				externalCandidateBatchArgs.push(params);
+				const clauses = params.clauses as Array<Record<string, unknown>>;
+				const body = JSON.stringify(
+					o.externalCandidateBatchRawOverride ?? {
+						items: clauses.map((_, index) => ({
+							query_index: index,
+							candidates: [
+								{
+									chunk_id: `EXT-${index}`,
+									clause_path: `外第${index}条`,
+									doc_title: "外规",
+									doc_no: "外〔2026〕1号",
+									text: `外规第${index}条正文应当`,
+									source_code: `EXT-SC-${index}`,
+									score: 0.9,
+								},
+							],
+							error: null,
+						})),
+						total: clauses.length,
+					},
+				);
+				return { output: body, content: body };
+			},
+		} as never,
 		{
 			name: "list_internal_obligations",
 			label: "list_internal_obligations",
@@ -210,9 +289,24 @@ export async function buildRuntime(o: HarnessOpts) {
 						title: "基准外规",
 						pageCount: 1,
 						chunkCount: 2,
-						status: "ok",
-					}),
-				});
+					status: "ok",
+				}),
+				getInternalDocument: async () => ({
+					uploadId: "library:INT-DV-1",
+					title: "知识库内规",
+					clauses: [
+						{ seq: 0, clausePath: "第一条", text: "内规第一条应当落实外规要求" },
+						{ seq: 1, clausePath: "第二条", text: "内规第二条不得违反规定" },
+					],
+				}),
+				checkInternalReferenceVersions: async () => ({
+					compareType: "internal_to_external",
+					metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
+					rows: [],
+					gaps: [],
+					finish_reason: "stop",
+				}),
+			});
 
 	const artifacts: ArtifactStore =
 		o.artifacts ??
@@ -235,7 +329,7 @@ export async function buildRuntime(o: HarnessOpts) {
 			id: "policy-compare-coverage",
 			model: { role: "main" },
 			toolset: "pc",
-			tools: ["list_internal_obligations", "resolve_source_law"],
+			tools: ["retrieve_internal_candidates_batch", "retrieve_external_candidates_batch"],
 			limits: o.limits ?? { maxTurns: 100, runTimeoutMs: 1_800_000 },
 		},
 		profile,
@@ -259,7 +353,7 @@ export async function buildRuntime(o: HarnessOpts) {
 		modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
 	});
 	cleanups.push(() => runtime.dispose());
-	return { runtime, toolCalls, obligationsArgs, resolutionsArgs, faux: harness.faux };
+	return { runtime, toolCalls, candidateBatchArgs, externalCandidateBatchArgs, obligationsArgs, resolutionsArgs, faux: harness.faux };
 }
 
 export const verdictReply = (items: unknown[]) => `\`\`\`json\n${JSON.stringify({ verdicts: items })}\n\`\`\``;

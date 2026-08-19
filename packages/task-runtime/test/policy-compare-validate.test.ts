@@ -69,6 +69,32 @@ describe("validateCoverageResult", () => {
 		if (!got.ok) expect(got.detail).toContain("externalClause");
 	});
 
+	it("内规未命中任何外规候选时，保留内规原文并以空外规条款作为缺失点", () => {
+		const noCandidate = good();
+		noCandidate.compareType = "internal_to_external";
+		noCandidate.rows[0] = {
+			...row(),
+			conflictType: "未命中外部规则条款",
+			externalClause: "",
+			internalClause: "待核查内规原文",
+			judgement: "未检索到可核验的外部规则条款",
+			basis: {
+				...row().basis,
+				internalChunkId: "SRC-1",
+				matchKind: "semantic_retrieval",
+			},
+		};
+		noCandidate.metrics = { checked: 1, missing: 1, conflict: 0, covered: 0, unmatched: 0, linked: 0 };
+		const noCandidateCtx = {
+			internalChunkIds: new Set<string>(),
+			externalTexts: new Set<string>(),
+			internalTexts: new Set(["待核查内规原文"]),
+			checkedCount: 1,
+		};
+
+		expect(validateCoverageResult(noCandidate, noCandidateCtx, schema)).toEqual({ ok: true });
+	});
+
 	it("internalClause 不是阶段 2 的原文 → 判负(反幻觉 2)", () => {
 		const bad = good();
 		bad.rows[0].internalClause = "模型改写过的内规";

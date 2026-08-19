@@ -31,6 +31,67 @@ const alignment = (
 });
 
 describe("buildCoverageResult", () => {
+	it("批量检索路径按外规条款计数，空候选生成缺失行而不是静默遗漏", () => {
+		const got = buildCoverageResult({
+			alignment: {
+				pairs: [
+					{
+						...pair(0),
+						matchKind: "semantic_retrieval",
+					},
+				],
+				unmatched: [],
+				uncoveredExternalClauses: [
+					{
+						externalClause: { seq: 1, clausePath: "第2条", text: "外规第2条正文" },
+						reason: "no_internal_candidate",
+					},
+				],
+				countBy: "external",
+			},
+			verdicts: [{ pairIndex: 0, state: "covered" }],
+			checkedCount: 2,
+			truncated: false,
+		});
+		expect(got.metrics).toMatchObject({ checked: 2, covered: 1, missing: 1, conflict: 0, unmatched: 0 });
+		expect(got.rows).toHaveLength(1);
+		expect(got.rows[0]).toMatchObject({
+			tabKey: "missing",
+			externalClause: "外规第2条正文",
+			internalClause: "",
+			basis: { internalChunkId: "", matchKind: "semantic_retrieval" },
+		});
+	});
+
+	it("批量检索的同一外规条款全部缺失时，只显示一条无内部候选的缺失结果", () => {
+		const externalClause = { seq: 1, clausePath: "第一条", text: "外规第一条正文" };
+		const got = buildCoverageResult({
+			alignment: {
+				pairs: [
+					{ ...pair(1), externalClause, matchKind: "semantic_retrieval" },
+					{ ...pair(2), externalClause, matchKind: "semantic_retrieval" },
+				],
+				unmatched: [],
+				countBy: "external",
+			},
+			verdicts: [
+				{ pairIndex: 0, state: "missing", gap: "未覆盖", suggestion: "补充内部制度" },
+				{ pairIndex: 1, state: "missing", gap: "未覆盖", suggestion: "补充内部制度" },
+			],
+			checkedCount: 1,
+			truncated: false,
+		});
+
+		expect(got.metrics).toMatchObject({ checked: 1, missing: 1 });
+		expect(got.rows).toHaveLength(1);
+		expect(got.rows[0]).toMatchObject({
+			externalClause: "外规第一条正文",
+			internalClause: "",
+			source: "",
+			basis: { internalChunkId: "", internalSourceCode: null, matchKind: "semantic_retrieval" },
+		});
+	});
+
 	it("covered 不进 rows,只进 metrics", () => {
 		const got = buildCoverageResult({
 			alignment: alignment([pair(0)]),
@@ -53,6 +114,41 @@ describe("buildCoverageResult", () => {
 		expect(got.rows[0].tabKey).toBe("missing");
 		expect(got.rows[0].conflictType).toBe("部分覆盖");
 		expect(got.metrics.missing).toBe(1);
+	});
+
+	it("内规→外规将未覆盖与无候选展示为缺失点，部分覆盖和冲突展示为差错点", () => {
+		const got = buildCoverageResult({
+			compareType: "internal_to_external",
+			alignment: {
+				pairs: [pair(0), pair(1), pair(2)],
+				unmatched: [{ internalChunkId: "C-3", reason: "no_external_candidate" }],
+				uncoveredInternalClauses: [
+					{
+						internalObligation: pair(3).internalObligation,
+						reason: "no_external_candidate",
+					},
+				],
+				countBy: "internal",
+			},
+			verdicts: [
+				{ pairIndex: 0, state: "covered" },
+				{ pairIndex: 1, state: "missing", gap: "不构成覆盖" },
+				{ pairIndex: 2, state: "partial", gap: "缺少时限", suggestion: "补充时限" },
+			],
+			checkedCount: 4,
+			truncated: false,
+		});
+
+		expect(got.metrics).toMatchObject({ checked: 4, covered: 1, missing: 2, conflict: 1, unmatched: 0 });
+		expect(got.rows).toHaveLength(3);
+		expect(got.rows).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ tabKey: "missing", conflictType: "缺失要求", internalClause: "内规第1条正文" }),
+				expect.objectContaining({ tabKey: "error", conflictType: "部分覆盖" }),
+				expect.objectContaining({ tabKey: "missing", conflictType: "未命中外部规则条款", externalClause: "" }),
+			]),
+		);
+		expect(got.gaps).toEqual(expect.arrayContaining(["C-1:不构成覆盖", "C-2:缺少时限", "内规条款 C-3 no_external_candidate"]));
 	});
 
 	it("conflict 归 tabKey=error,conflictType 用模型给的", () => {

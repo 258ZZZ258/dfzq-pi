@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { alignClauses, normalizeClauseKey } from "../src/runtime/policy-compare/align.ts";
+import {
+	alignBatchCandidates,
+	alignClauses,
+	alignInternalToExternalBatchCandidates,
+	normalizeClauseKey,
+} from "../src/runtime/policy-compare/align.ts";
 import type { ExternalDocument, InternalObligation } from "../src/runtime/policy-compare/types.ts";
 
 const doc: ExternalDocument = {
@@ -227,5 +232,47 @@ describe("alignClauses", () => {
 		);
 		expect(got.pairs).toEqual([]);
 		expect(got.unmatched).toEqual([{ internalChunkId: "I", reason: "external_clause_not_in_uploaded_document" }]);
+	});
+});
+
+describe("alignBatchCandidates", () => {
+	it("每条外规只配对本条批量检索到的内规候选，空候选显式标为缺失", () => {
+		const got = alignBatchCandidates(doc, [
+			{
+				queryIndex: 0,
+				candidates: [ob("C-1")],
+				error: null,
+			},
+			{ queryIndex: 1, candidates: [], error: null },
+		]);
+
+		expect(got.countBy).toBe("external");
+		expect(got.pairs).toHaveLength(1);
+		expect(got.pairs[0].externalClause.seq).toBe(0);
+		expect(got.pairs[0].matchKind).toBe("semantic_retrieval");
+		expect(got.uncoveredExternalClauses).toEqual([{ externalClause: doc.clauses[1], reason: "no_internal_candidate" }]);
+	});
+});
+
+describe("alignInternalToExternalBatchCandidates", () => {
+	it("按待核查内规条款分组；没有外规候选也保留为未匹配", () => {
+		const got = alignInternalToExternalBatchCandidates(
+			[
+				{ seq: 0, clausePath: "第一条", text: "说明性内规条款也应参与语义检索" },
+				{ seq: 1, clausePath: "第二条", text: "第二条内规正文" },
+			],
+			[
+				{ queryIndex: 0, candidates: [ob("EXT-1")], error: null },
+				{ queryIndex: 1, candidates: [], error: null },
+			],
+			"待核查内规",
+		);
+
+		expect(got.countBy).toBe("internal");
+		expect(got.pairs).toHaveLength(1);
+		expect(got.pairs[0].internalObligation.text).toBe("说明性内规条款也应参与语义检索");
+		expect(got.unmatched).toEqual([
+			{ internalChunkId: "source-internal:1:1", reason: "no_external_candidate" },
+		]);
 	});
 });

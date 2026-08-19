@@ -258,7 +258,24 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			const rawBatchSize = parseBatchSizeOption((runOptions as { batchSize?: unknown }).batchSize);
 			const baseUrl = requireEnv("AUDIT_AI_BASE_URL");
 			const internalToken = requireEnv("AUDIT_AI_INTERNAL_TOKEN");
-			const bucket = requireEnv("DFZQ_UPLOADS_BUCKET");
+			// 知识库选文档的覆盖比对不会读 MinIO。若在这里一次性 require 全部上传配置，
+			// 它会被与上传无关的 library→library 请求错误拦截；把配置读取推迟至真的 fetch 时。
+			// 上传路径仍然 fail-closed：任一 MinIO 配置缺失会在第一次取 artifact 前明确失败。
+			const artifacts = {
+				fetch: async (artifactKey: string) => {
+					const bucket = requireEnv("DFZQ_UPLOADS_BUCKET");
+					return createArtifactStore({
+						bucket,
+						get: createMinioObjectGetter({
+							endPoint: requireEnv("DFZQ_MINIO_ENDPOINT"),
+							port: process.env.DFZQ_MINIO_PORT ? Number(process.env.DFZQ_MINIO_PORT) : undefined,
+							useSSL: process.env.DFZQ_MINIO_USE_SSL === "1",
+							accessKey: requireEnv("DFZQ_MINIO_ACCESS_KEY"),
+							secretKey: requireEnv("DFZQ_MINIO_SECRET_KEY"),
+						}),
+					}).fetch(artifactKey);
+				},
+			};
 			return createPolicyCompareRuntime({
 				spec,
 				profile,
@@ -272,16 +289,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 				payload,
 				documents: createDocumentsClient({ baseUrl, internalToken }),
 				permissionTags: filters.permTags ?? [],
-				artifacts: createArtifactStore({
-					bucket,
-					get: createMinioObjectGetter({
-						endPoint: requireEnv("DFZQ_MINIO_ENDPOINT"),
-						port: process.env.DFZQ_MINIO_PORT ? Number(process.env.DFZQ_MINIO_PORT) : undefined,
-						useSSL: process.env.DFZQ_MINIO_USE_SSL === "1",
-						accessKey: requireEnv("DFZQ_MINIO_ACCESS_KEY"),
-						secretKey: requireEnv("DFZQ_MINIO_SECRET_KEY"),
-					}),
-				}),
+				artifacts,
 				batchSize: rawBatchSize,
 				skillPaths: skillPaths.get(specId),
 			});

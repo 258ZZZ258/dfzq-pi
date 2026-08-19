@@ -32,17 +32,43 @@ export function validateCoverageResult(
 	}
 
 	// 反幻觉 1:引用必须来自阶段 2 的结果集
-	const invented = result.rows.map((r) => r.basis.internalChunkId).filter((id) => !ctx.internalChunkIds.has(id));
+	const invented = result.rows
+		.filter(
+			(r) =>
+				!(
+					r.basis.matchKind === "semantic_retrieval" &&
+					((r.basis.internalChunkId === "" && r.internalClause === "") ||
+						(r.externalClause === "" && r.tabKey === "missing")) &&
+					r.tabKey === "missing"
+				),
+		)
+		.map((r) => r.basis.internalChunkId)
+		.filter((id) => !ctx.internalChunkIds.has(id));
 	if (invented.length > 0) {
 		return { ok: false, detail: `basis.internalChunkId 不在阶段 2 结果集内:${invented.join("、")}` };
 	}
 
 	// 反幻觉 2:两侧正文必须逐字来自原始数据
 	for (const [i, r] of result.rows.entries()) {
-		if (!ctx.externalTexts.has(r.externalClause)) {
+		const isNoCandidate = r.basis.matchKind === "semantic_retrieval" && r.basis.internalChunkId === "";
+		const isNoExternalCandidate =
+			r.basis.matchKind === "semantic_retrieval" && r.externalClause === "" && r.tabKey === "missing";
+		if (!isNoExternalCandidate && !ctx.externalTexts.has(r.externalClause)) {
 			return { ok: false, detail: `第 ${i + 1} 行的 externalClause 不是阶段 1 的原文(正文不得由模型产出)` };
 		}
-		if (!ctx.internalTexts.has(r.internalClause)) {
+		if (isNoExternalCandidate) {
+			if (!ctx.internalTexts.has(r.internalClause)) {
+				return { ok: false, detail: `第 ${i + 1} 行的 internalClause 不是阶段 2 的原文(正文不得由模型产出)` };
+			}
+			continue;
+		}
+		if (isNoCandidate && r.externalClause === "") {
+			return { ok: false, detail: `第 ${i + 1} 行的空外规条款必须保留内规原文` };
+		}
+		if (r.externalClause === "") {
+			return { ok: false, detail: `第 ${i + 1} 行的 externalClause 不能为空` };
+		}
+		if (!isNoCandidate && !ctx.internalTexts.has(r.internalClause)) {
 			return { ok: false, detail: `第 ${i + 1} 行的 internalClause 不是阶段 2 的原文(正文不得由模型产出)` };
 		}
 	}

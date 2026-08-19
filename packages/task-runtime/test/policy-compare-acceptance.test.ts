@@ -117,7 +117,7 @@ describe("制度比对 · 档 1 验收(无语料,fixture + fake MCP)", () => {
 				body,
 				{
 					internalChunkIds: new Set(["C-0", "C-1"]),
-					externalTexts: new Set(["外规第五条正文", "外规第十条正文"]),
+					externalTexts: new Set(["外规第五条正文应当", "外规第十条正文不得"]),
 					internalTexts: new Set(["内规第0条正文", "内规第1条正文"]),
 					checkedCount: 2,
 				},
@@ -147,26 +147,25 @@ describe("制度比对 · 档 1 验收(无语料,fixture + fake MCP)", () => {
 	// { notItems: true }`,这条用本任务新加的 `obligationsMalformed: true` 便捷开关(回一个
 	// 更贴近真实 M1 故障形状的 `{"total":0}`,见 HarnessOpts 里的注释)。这里复述一遍是为了让
 	// 这份验收文件能自足地逐条指认 A7,不用跳去另一个文件才能确认 A7-2 这道闸测过。
-	it("A7-2 fail-closed:M1 返回形状不对 ⇒ error,不当成零义务", async () => {
+	it("A7-2 fail-closed:批量候选返回形状不对 ⇒ error,不当成零命中", async () => {
 		const { runtime } = await buildRuntime({ modelReplies: [verdictReply([])], obligationsMalformed: true });
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
-		// "items" 是 toObligations() 里那句报错消息的关键字 —— 定位到具体是 M1 的形状校验拦下的,
-		// 不是巧合落在别的 error 分支(比如 M2 或阶段 6)。
+		// "items" 定位到批量候选响应的形状校验，不是后续模型或结果契约错误。
 		expect(result.errorMessage).toContain("items");
-		expect(result.errorMessage).toContain("list_internal_obligations");
+		expect(result.errorMessage).toContain("retrieve_internal_candidates_batch");
 	});
 
-	it("A7-3 fail-closed:M2 抛 JSON-RPC error ⇒ error,不产半张表", async () => {
+	it("A7-3 fail-closed:批量候选 MCP 抛 JSON-RPC error ⇒ error,不产半张表", async () => {
 		const { runtime } = await buildRuntime({
 			modelReplies: [verdictReply([])],
-			resolveThrows: "source_law mapping unavailable",
+			candidateBatchThrows: "batch retrieval unavailable",
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
-		expect(result.errorMessage).toContain("source_law mapping unavailable");
+		expect(result.errorMessage).toContain("batch retrieval unavailable");
 	});
 
 	// ⚠ policy-compare-runtime.test.ts 有一条"外规解析失败(artifacts.fetch 抛错)"用例断言

@@ -10,6 +10,11 @@ export interface McpServerSpec {
 	/** 白名单 env(安全方案 L1(a))。eval 模式下在此注入 EVAL_TASK_LOG。 */
 	env: Record<string, string>;
 	cwd?: string;
+	/**
+	 * 单次 MCP 请求的硬超时。默认由 McpClient 采用 30s；检索/模型类工具可在 spec 中
+	 * 显式放宽，避免首次加载模型时被通用超时误杀。
+	 */
+	requestTimeoutMs?: number;
 }
 
 /** 多 server 同名工具时的前缀分隔符。 */

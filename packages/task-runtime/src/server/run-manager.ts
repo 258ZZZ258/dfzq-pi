@@ -132,7 +132,7 @@ export interface RunProgress {
 }
 
 export interface RunManagerOptions {
-	store: RunStore;
+	store: RunStore<boolean>;
 	gate: Gate;
 	runtimeFactory: RuntimeFactory;
 	now?: () => number;
@@ -159,7 +159,7 @@ interface LiveRun {
  * race 它与等待窗口,超时回 202 后**不再碰它** —— 连接断开也不中断 run(设计文档 §6.4.2)。
  */
 export class RunManager {
-	private readonly store: RunStore;
+	private readonly store: RunStore<boolean>;
 	private readonly gate: Gate;
 	private readonly runtimeFactory: RuntimeFactory;
 	private readonly now: () => number;
@@ -218,7 +218,9 @@ export class RunManager {
 			}
 			if (!shouldRecord(event.type)) return;
 			try {
-				this.store.appendEvents(runId, [toStoredEvent(event)]);
+				void Promise.resolve(this.store.appendEvents(runId, [toStoredEvent(event)])).catch((error) => {
+					console.error(`[RunManager] failed to persist event for run "${runId}"; this event is dropped`, error);
+				});
 			} catch (error) {
 				console.error(`[RunManager] failed to persist event for run "${runId}"; this event is dropped`, error);
 			}
@@ -227,7 +229,7 @@ export class RunManager {
 
 	async submit(req: SubmitRequest): Promise<SubmitOutcome> {
 		const runId = this.newRunId();
-		const created = this.store.insertQueued({
+		const created = await this.store.insertQueued({
 			runId,
 			clientRequestId: req.clientRequestId,
 			requestId: req.requestId,
@@ -281,7 +283,7 @@ export class RunManager {
 			// DatabaseSync,同步 API)、tryAcquire(Gate 的同步准入判定)、deleteRun(同样是
 			// DatabaseSync 同步 API)三者之间这段代码不含任何 await,Node 单线程不会在这里
 			// 让出控制权,所以不存在"另一个同键请求在这行即将被删之间读到它"的窗口。
-			this.store.deleteRun(runId);
+			await this.store.deleteRun(runId);
 			return { kind: "rejected", rejection: admission };
 		}
 		const ticketPromise = admission.kind === "admitted" ? Promise.resolve(admission.ticket) : admission.ticket;
@@ -323,7 +325,7 @@ export class RunManager {
 			// 装配期失败要早、要响亮,且必须还回令牌 —— 否则一次装配失败永久占额。
 			const message = error instanceof Error ? error.message : String(error);
 			try {
-				this.store.markError(runId, message, this.now());
+				await this.store.markError(runId, message, this.now());
 			} catch (markErrorFailure) {
 				// markError 本身也可能抛(磁盘满 / 优雅下线期间 store 已 close 等,见 drive()
 				// 里同一条注释)。绝不能让这个次生错误盖过下面要 throw 的 error——那才是这个
@@ -371,7 +373,7 @@ export class RunManager {
 		}
 
 		try {
-			this.store.markRunning(runId, this.now());
+			await this.store.markRunning(runId, this.now());
 		} catch (error) {
 			// 与上面装配失败的分支同一条纪律:markRunning 落库失败(store 已 close / 磁盘满等)
 			// 时,drive() 根本不会被调用,它自己的 finally 救不到这里——必须在这里自己补上
@@ -404,7 +406,7 @@ export class RunManager {
 			judgeAttempts: {},
 		};
 		try {
-			this.store.finish(runId, result, this.now());
+			await this.store.finish(runId, result, this.now());
 		} catch (error) {
 			// 同上:finish() 落库失败不能让下面的 live.delete/ticket.release 被跳过——
 			// finally 保证两者无条件执行,catch 只负责记日志、原样把错误抛给调用方
@@ -431,12 +433,12 @@ export class RunManager {
 	): Promise<RunResult> {
 		try {
 			const result = await runtime.run(input, { runId });
-			this.store.finish(runId, result, this.now());
+			await this.store.finish(runId, result, this.now());
 			return result;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			try {
-				this.store.markError(runId, message, this.now());
+				await this.store.markError(runId, message, this.now());
 			} catch (markErrorFailure) {
 				// markError 自身也可能抛(典型场景:进程正在优雅下线,store 已经 close()
 				// 过)。这里不能让它盖过下面要 throw 的原始 error ——原始 error 才是这个 run
@@ -486,7 +488,7 @@ export class RunManager {
 			}
 			return "accepted";
 		}
-		const row = this.store.findByRunId(runId);
+		const row = await this.store.findByRunId(runId);
 		if (!row) return "not_found";
 		return isTerminal(row.status) ? "already_terminal" : "not_found";
 	}

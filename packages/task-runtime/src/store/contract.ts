@@ -60,7 +60,13 @@ export interface StoredEvent {
 	payload: string;
 }
 
-export interface RunStore {
+type MaybePromise<T, Async extends boolean> = Async extends true ? Promise<T> : T;
+
+/**
+ * `Async=false` 保留给 SQLite 单测；生产 PostgreSQL store 为 `Async=true`。
+ * RunManager 始终 await 这组方法，因而不会依赖某种具体驱动的同步语义。
+ */
+export interface RunStore<Async extends boolean = false> {
 	/**
 	 * 原子幂等。INSERT ... ON CONFLICT(client_request_id) DO NOTHING,
 	 * changes===1 → inserted:true;否则按 clientRequestId 读出既有行返回 inserted:false。
@@ -68,11 +74,11 @@ export interface RunStore {
 	 * 不用 try/catch 捕 UNIQUE 违约:设计文档 §4.1 画的「先 SELECT 再 INSERT」在并发同键下
 	 * 会双双 miss 再双双 INSERT,一个吃约束违约并冒成 500。
 	 */
-	insertQueued(rec: NewRun): { inserted: boolean; run: RunRecord };
-	findByRunId(runId: string): RunRecord | undefined;
-	markRunning(runId: string, startedAt: number): void;
-	finish(runId: string, result: RunResult, finishedAt: number): void;
-	markError(runId: string, message: string, finishedAt: number): void;
+	insertQueued(rec: NewRun): MaybePromise<{ inserted: boolean; run: RunRecord }, Async>;
+	findByRunId(runId: string): MaybePromise<RunRecord | undefined, Async>;
+	markRunning(runId: string, startedAt: number): MaybePromise<void, Async>;
+	finish(runId: string, result: RunResult, finishedAt: number): MaybePromise<void, Async>;
+	markError(runId: string, message: string, finishedAt: number): MaybePromise<void, Async>;
 	/**
 	 * 按主键删除该行。语义是「撤销 insertQueued 的原子占用」——目前唯一调用方是
 	 * RunManager.submit() 的闸门拒绝分支:insertQueued 原子占了 clientRequestId 唯一索引,
@@ -81,10 +87,10 @@ export interface RunStore {
 	 * 拒绝分支注释)。删不到行(runId 不存在)不抛——拒绝路径是唯一调用方,不存在的行
 	 * 意味着别的路径已经先一步清理掉了,吞掉比抛错更安全。
 	 */
-	deleteRun(runId: string): void;
+	deleteRun(runId: string): MaybePromise<void, Async>;
 	/** 启动时 status IN ('queued','running') → error,返回受影响行数。 */
-	recoverStaleRuns(now: number): number;
-	appendEvents(runId: string, events: StoredEvent[]): void;
+	recoverStaleRuns(now: number): MaybePromise<number, Async>;
+	appendEvents(runId: string, events: StoredEvent[]): MaybePromise<void, Async>;
 	/**
 	 * 按 seq 升序读回该 run 落库的事件(task-18b 复审 Important-3)。serve 路径下这是
 	 * `reconcile()` 的 pi 侧数据源 —— 与 CLI 路径下 `readTrajectory()` 读 trajectory
@@ -92,6 +98,6 @@ export interface RunStore {
 	 * `observability/reconcile.ts` 的 `reconcileRunEvents`)。不存在的 runId 返回空数组,
 	 * 不抛 —— 与 `findByRunId` 的「查无则 undefined」同一条纪律,读路径不该因为查不到就报错。
 	 */
-	listEvents(runId: string): StoredEvent[];
-	close(): void;
+	listEvents(runId: string): MaybePromise<StoredEvent[], Async>;
+	close(): MaybePromise<void, Async>;
 }

@@ -14,6 +14,7 @@ import { createVersionDiffRuntime } from "../runtime/policy-compare/version-diff
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
+import { createPostgresRunStore } from "../store/postgres.ts";
 import { createSqliteRunStore } from "../store/sqlite.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
@@ -24,7 +25,10 @@ import { RunManager } from "./run-manager.ts";
 
 export interface ServeOptions {
 	port: number;
-	dbPath: string;
+	/** audit-ai pipeline PostgreSQL DSN；任务历史唯一持久化位置。 */
+	databaseUrl?: string;
+	/** @deprecated 仅兼容旧测试配置；生产服务不再读取 SQLite。 */
+	dbPath?: string;
 	specsDir: string;
 	internalToken: string | undefined;
 	// 必填注入点(不是可选):真实装配要么起 MCP 子进程要么要真实模型,两者都超出 S1a
@@ -37,9 +41,16 @@ export interface ServeOptions {
 }
 
 export async function startServer(options: ServeOptions): Promise<{ port: number; close: () => Promise<void> }> {
-	const store = createSqliteRunStore(options.dbPath);
+	// `dbPath` 仅供已有单测注入同步 fake-store 行为；CLI 生产路径只传 databaseUrl，缺失即拒绝启动。
+	const store = options.databaseUrl
+		? await createPostgresRunStore(options.databaseUrl)
+		: options.dbPath
+			? createSqliteRunStore(options.dbPath)
+			: (() => {
+					throw new Error("PIPELINE_DB_DSN is required; SQLite task storage has been removed");
+				})();
 	// 必须在开始接请求之前跑:否则 Java 会永远等一个不会完成的 run(设计文档 §5.7)。
-	const recovered = store.recoverStaleRuns(Date.now());
+	const recovered = await store.recoverStaleRuns(Date.now());
 	if (recovered > 0) {
 		console.error(`[task-runtime] startup recovery marked ${recovered} stale run(s) as error`);
 	}
@@ -96,7 +107,7 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 		// session-runtime.ts)。这里若不吞掉,会用一个面目全非的次生报错替换掉本该抛出的
 		// error(比如 EADDRINUSE),让「端口被占用」变成一个毫不相关的 store 关闭失败。
 		try {
-			store.close();
+			await store.close();
 		} catch (closeError) {
 			console.error("[task-runtime] failed to close the store after a bind failure", closeError);
 		}
@@ -127,7 +138,7 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			});
-			store.close();
+			await store.close();
 		},
 	};
 }

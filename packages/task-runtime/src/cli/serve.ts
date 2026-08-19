@@ -30,7 +30,7 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 			`TASK_RUNTIME_PORT must be an integer in [0, 65535], got ${JSON.stringify(env.TASK_RUNTIME_PORT)}`,
 		);
 	}
-	const dbPath = requireEnv(env, "TASK_RUNTIME_DB_PATH");
+	const databaseUrl = requireEnv(env, "PIPELINE_DB_DSN");
 	const specsDir = requireEnv(env, "TASK_RUNTIME_SPECS_DIR");
 	const profilePath = requireEnv(env, "TASK_RUNTIME_PROFILE");
 	const workRoot = requireEnv(env, "TASK_RUNTIME_WORK_ROOT");
@@ -40,7 +40,7 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 	const auditToken = env.AUDIT_AI_INTERNAL_TOKEN;
 	return startServer({
 		port,
-		dbPath,
+		databaseUrl,
 		specsDir,
 		internalToken,
 		runtimeFactory,

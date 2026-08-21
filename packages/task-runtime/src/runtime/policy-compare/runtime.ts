@@ -11,7 +11,7 @@ import type { ArtifactStore } from "./artifact-store.ts";
 import { buildCoverageResult } from "./assemble.ts";
 import type { DocumentsClient } from "./documents-client.ts";
 import { filterExternalObligationClauses } from "./obligation.ts";
-import type { CoveragePayload, InternalObligation, Verdict } from "./types.ts";
+import type { CoveragePayload, InlinePolicyDocument, InternalObligation, Verdict } from "./types.ts";
 import { validateCoverageResult } from "./validate-result.ts";
 import { batchPairs, parseVerdicts, renderBatchPrompt } from "./verdicts.ts";
 
@@ -58,6 +58,63 @@ function parseScopeDateRange(value: unknown, path: string): [string, string] | u
 	return [value[0] as string, value[1] as string];
 }
 
+function parseInlineDocument(value: unknown, path: string): InlinePolicyDocument {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error(`${path} 必须是文档对象`);
+	}
+	const document = value as Record<string, unknown>;
+	if (typeof document.documentId !== "string" || document.documentId === "") {
+		throw new Error(`${path}.documentId 必填且必须是非空字符串`);
+	}
+	if (typeof document.title !== "string" || document.title === "") {
+		throw new Error(`${path}.title 必填且必须是非空字符串`);
+	}
+	if (document.docNo !== undefined && typeof document.docNo !== "string") {
+		throw new Error(`${path}.docNo 必须是字符串`);
+	}
+	if (document.issueDate !== undefined && typeof document.issueDate !== "string") {
+		throw new Error(`${path}.issueDate 必须是字符串`);
+	}
+	if (
+		!Array.isArray(document.clauses) ||
+		document.clauses.length < 1 ||
+		document.clauses.length > MAX_EXTERNAL_CHUNKS
+	) {
+		throw new Error(`${path}.clauses 必须包含 1 至 ${MAX_EXTERNAL_CHUNKS} 条条款`);
+	}
+	const seenSequence = new Set<number>();
+	const clauses = document.clauses.map((value, index) => {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			throw new Error(`${path}.clauses[${index}] 必须是条款对象`);
+		}
+		const clause = value as Record<string, unknown>;
+		if (
+			typeof clause.seq !== "number" ||
+			!Number.isInteger(clause.seq) ||
+			clause.seq < 0 ||
+			seenSequence.has(clause.seq)
+		) {
+			throw new Error(`${path}.clauses[${index}].seq 必须是唯一的非负整数`);
+		}
+		if (typeof clause.clausePath !== "string" || clause.clausePath === "") {
+			throw new Error(`${path}.clauses[${index}].clausePath 必填且必须是非空字符串`);
+		}
+		if (typeof clause.text !== "string" || clause.text === "") {
+			throw new Error(`${path}.clauses[${index}].text 必填且必须是非空字符串`);
+		}
+		seenSequence.add(clause.seq);
+		return { seq: clause.seq, clausePath: clause.clausePath, text: clause.text };
+	});
+	return {
+		documentId: document.documentId,
+		...(typeof document.logicalId === "string" && document.logicalId !== "" ? { logicalId: document.logicalId } : {}),
+		title: document.title,
+		...(typeof document.docNo === "string" && document.docNo !== "" ? { docNo: document.docNo } : {}),
+		...(typeof document.issueDate === "string" && document.issueDate !== "" ? { issueDate: document.issueDate } : {}),
+		clauses,
+	};
+}
+
 /**
  * `POST /runs` 的 `payload` 形状校验。**装配期就跑**,不拖到阶段 5(规格 §7.1)。
  *
@@ -82,15 +139,18 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 	const source =
 		external?.source ??
 		(external && (external.objectKey || external.uploadId || external.filename) ? "upload" : undefined);
-	if (source !== "upload" && source !== "library")
-		throw new Error(`payload.${subjectKey}.source 仅支持 upload 或 library`);
+	if (source !== "upload" && source !== "library" && source !== "inline")
+		throw new Error(`payload.${subjectKey}.source 仅支持 upload、library 或 inline`);
 	if (source === "upload") {
 		for (const key of ["objectKey", "uploadId", "filename"]) {
 			if (!external || typeof external[key] !== "string" || external[key] === "") {
 				throw new Error(`payload.${subjectKey}.${key} 必填且必须是非空字符串`);
 			}
 		}
-	} else if (!external || typeof external.docVersionId !== "string" || external.docVersionId === "") {
+	} else if (
+		source === "library" &&
+		(!external || typeof external.docVersionId !== "string" || external.docVersionId === "")
+	) {
 		throw new Error(`payload.${subjectKey}.docVersionId 必填且必须是非空字符串`);
 	}
 	const scope = (p.scope ?? {}) as Record<string, unknown>;
@@ -132,7 +192,12 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 									uploadId: external!.uploadId as string,
 									filename: external!.filename as string,
 								}
-							: { source: "library" as const, docVersionId: external!.docVersionId as string },
+							: source === "library"
+								? { source: "library" as const, docVersionId: external!.docVersionId as string }
+								: {
+										source: "inline" as const,
+										document: parseInlineDocument(external!.document, `payload.${subjectKey}.document`),
+									},
 				}
 			: {
 					internal:
@@ -143,7 +208,12 @@ export function parseCoveragePayload(raw: unknown): CoveragePayload {
 									uploadId: external!.uploadId as string,
 									filename: external!.filename as string,
 								}
-							: { source: "library" as const, docVersionId: external!.docVersionId as string },
+							: source === "library"
+								? { source: "library" as const, docVersionId: external!.docVersionId as string }
+								: {
+										source: "inline" as const,
+										document: parseInlineDocument(external!.document, `payload.${subjectKey}.document`),
+									},
 				}),
 		scope: {
 			organizations: [],
@@ -176,7 +246,11 @@ export interface PolicyCompareRuntimeOptions {
 type Stage = "extracting" | "matching" | "judging" | "assembling";
 
 /** 解析 audit-ai 批量检索候选。每条输入必须得到同序、唯一的结果项，避免候选错配。 */
-function toBatchCandidates(raw: unknown, expectedCount: number, toolName = "retrieve_internal_candidates_batch"): Array<{
+function toBatchCandidates(
+	raw: unknown,
+	expectedCount: number,
+	toolName = "retrieve_internal_candidates_batch",
+): Array<{
 	queryIndex: number;
 	candidates: InternalObligation[];
 	error: string | null;
@@ -189,7 +263,13 @@ function toBatchCandidates(raw: unknown, expectedCount: number, toolName = "retr
 	return r.items.map((value) => {
 		const row = value as Record<string, unknown>;
 		const queryIndex = row.query_index;
-		if (typeof queryIndex !== "number" || !Number.isInteger(queryIndex) || queryIndex < 0 || queryIndex >= expectedCount || seen.has(queryIndex)) {
+		if (
+			typeof queryIndex !== "number" ||
+			!Number.isInteger(queryIndex) ||
+			queryIndex < 0 ||
+			queryIndex >= expectedCount ||
+			seen.has(queryIndex)
+		) {
 			throw new Error(`${toolName} 返回了非法或重复 query_index`);
 		}
 		seen.add(queryIndex);
@@ -405,32 +485,37 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 							corpusHint: "internal",
 						})
 					: null;
-			const uploadDocument = internal.source === "upload" ? await options.artifacts.fetch(processed!.artifactKey) : undefined;
-			if (uploadDocument && uploadDocument.clauses.length > MAX_EXTERNAL_CHUNKS) {
-				throw new Error(`内规解析出 ${uploadDocument.clauses.length} 条条款,超过上限 ${MAX_EXTERNAL_CHUNKS}`);
+			const uploadDocument =
+				internal.source === "upload" ? await options.artifacts.fetch(processed!.artifactKey) : undefined;
+			const inlineDocument = internal.source === "inline" ? internal.document : undefined;
+			const sourceDocument = inlineDocument ?? uploadDocument;
+			if (sourceDocument && sourceDocument.clauses.length > MAX_EXTERNAL_CHUNKS) {
+				throw new Error(`内规解析出 ${sourceDocument.clauses.length} 条条款,超过上限 ${MAX_EXTERNAL_CHUNKS}`);
 			}
 			stage("extracting", 20, 0, 1, "正在核对内规已引用外规的版本与条款变动");
 			checkPreempted();
 			const result = await options.documents.checkInternalReferenceVersions(
 				internal.source === "library"
 					? {
-						docVersionId: internal.docVersionId,
-						effectiveDateRange: payload.scope.effectiveDateRange,
-						permTags: options.permissionTags ?? [],
-					}
+							docVersionId: internal.docVersionId,
+							effectiveDateRange: payload.scope.effectiveDateRange,
+							permTags: options.permissionTags ?? [],
+						}
 					: {
-						clauses: uploadDocument!.clauses.map((clause) => ({
-							chunkId: `${internal.uploadId}:${clause.seq}`,
-							clausePath: clause.clausePath,
-							text: clause.text,
-						})),
-						effectiveDateRange: payload.scope.effectiveDateRange,
-						permTags: options.permissionTags ?? [],
-					},
+							clauses: sourceDocument!.clauses.map((clause) => ({
+								chunkId: `${internal.source === "inline" ? internal.document.documentId : internal.uploadId}:${clause.seq}`,
+								clausePath: clause.clausePath,
+								text: clause.text,
+							})),
+							effectiveDateRange: payload.scope.effectiveDateRange,
+							permTags: options.permissionTags ?? [],
+						},
 			);
 			if (!Value.Check(options.outputContractSchema as never, result as never)) {
 				const first = [...Value.Errors(options.outputContractSchema as never, result as never)][0];
-				throw new Error(`引用版本核查输出契约校验失败:${first ? `${first.instancePath}: ${first.message}` : "未知错误"}`);
+				throw new Error(
+					`引用版本核查输出契约校验失败:${first ? `${first.instancePath}: ${first.message}` : "未知错误"}`,
+				);
 			}
 			stage("assembling", 100, 1, 1, "比对完成");
 			return {
@@ -465,14 +550,21 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		const doc =
 			payload.external!.source === "upload"
 				? await options.artifacts.fetch(processed!.artifactKey)
-				: options.documents.getExternalDocument
-					? await options.documents.getExternalDocument(
-							payload.external!.docVersionId,
-							options.permissionTags ?? [],
-						)
-					: (() => {
-							throw new Error("知识库外规读取客户端未配置");
-						})();
+				: payload.external!.source === "inline"
+					? {
+							uploadId: `inline:${payload.external!.document.documentId}`,
+							title: payload.external!.document.title,
+							...(payload.external!.document.docNo ? { docNo: payload.external!.document.docNo } : {}),
+							clauses: payload.external!.document.clauses,
+						}
+					: options.documents.getExternalDocument
+						? await options.documents.getExternalDocument(
+								payload.external!.docVersionId,
+								options.permissionTags ?? [],
+							)
+						: (() => {
+								throw new Error("知识库外规读取客户端未配置");
+							})();
 		// 🔴 本地复核:上游自报的数字只是提示,真正决定阶段 5 扇出规模的是**这里实际拿到的条款数**。少了这一道,E0 漏回
 		// `chunk_count` 时一份 5000 条款的产物会长驱直入。
 		// 注意两个数不同义:`chunk_count` 是全部切块,这里是过滤掉表格/目录之后的条款块 ——
@@ -504,9 +596,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 				checkedCount: 0,
 				truncated: false,
 				externalDocNo: coverageDoc.docNo ?? null,
-				extraGaps: [
-					"未识别到含应当、必须、不得、禁止等规范性义务词的外规条款，本次未执行内规语义检索。",
-				],
+				extraGaps: ["未识别到含应当、必须、不得、禁止等规范性义务词的外规条款，本次未执行内规语义检索。"],
 			});
 			const checked = validateCoverageResult(
 				result,
@@ -531,6 +621,12 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		checkPreempted();
 		const candidatesRaw = await assembled.callTool("retrieve_internal_candidates_batch", {
 			clauses: coverageDoc.clauses.map((clause) => ({ clause_path: clause.clausePath, text: clause.text })),
+			...(payload.scope.effectiveDateRange
+				? {
+						effective_from: payload.scope.effectiveDateRange[0],
+						effective_to: payload.scope.effectiveDateRange[1],
+					}
+				: {}),
 		});
 		const candidateItems = toBatchCandidates(candidatesRaw, coverageDoc.clauses.length);
 		const candidateCount = candidateItems.reduce((sum, item) => sum + item.candidates.length, 0);
@@ -599,9 +695,13 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		const checked = validateCoverageResult(
 			result,
 			{
-				internalChunkIds: new Set(candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.chunkId))),
+				internalChunkIds: new Set(
+					candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.chunkId)),
+				),
 				externalTexts: new Set(coverageDoc.clauses.map((c) => c.text)),
-				internalTexts: new Set(candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.text))),
+				internalTexts: new Set(
+					candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.text)),
+				),
 				checkedCount: coverageDoc.clauses.length,
 			},
 			options.outputContractSchema,

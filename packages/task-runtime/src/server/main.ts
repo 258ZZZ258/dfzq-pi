@@ -243,16 +243,11 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		// SessionRuntime 都不经过),后者是 SessionRuntime 内部把模型调用压成固定 2 次 ——
 		// 外层的先判。两者同时声明已由 validateSpec 在装配期拒掉,这里不会同时命中。
 		if (spec.workflow === "policy-version-diff") {
-			// 版本差异由 audit-ai 在同一 logical_id 的两份已入库版本上精确对齐条款；
-			// 不依赖 MinIO/MCP/模型，避免把确定性 diff 退化为 agent 推理。
+			// 版本差异由 Java 主库读取两份条款后 inline 下传；
+			// 不依赖 MinIO、audit-ai 制度目录或模型，避免把确定性 diff 退化为 agent 推理。
 			return createVersionDiffRuntime({
 				spec,
 				payload,
-				documents: createDocumentsClient({
-					baseUrl: requireEnv("AUDIT_AI_BASE_URL"),
-					internalToken: requireEnv("AUDIT_AI_INTERNAL_TOKEN"),
-				}),
-				permissionTags: filters.permTags ?? [],
 			});
 		}
 

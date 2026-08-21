@@ -31,6 +31,30 @@ describe("parseCoveragePayload", () => {
 		expect(got.external).toEqual({ source: "library", docVersionId: "DV-1" });
 	});
 
+	it("Java 主库读取的外规条款可以 inline 下传，不要求 Pi 再查询制度目录", () => {
+		const got = parseCoveragePayload({
+			...ok,
+			external: {
+				source: "inline",
+				document: {
+					documentId: "DM-EXT-2026",
+					title: "达梦外规",
+					docNo: "证监规〔2026〕1号",
+					clauses: [{ seq: 1, clausePath: "第一条", text: "上市公司应当建立内部控制制度。" }],
+				},
+			},
+		});
+		expect(got.external).toEqual({
+			source: "inline",
+			document: {
+				documentId: "DM-EXT-2026",
+				title: "达梦外规",
+				docNo: "证监规〔2026〕1号",
+				clauses: [{ seq: 1, clausePath: "第一条", text: "上市公司应当建立内部控制制度。" }],
+			},
+		});
+	});
+
 	it("知识库内规 payload 自动切换为内规追踪外规版本", () => {
 		const got = parseCoveragePayload({
 			direction: "internal_to_external",
@@ -253,7 +277,9 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 					return {
 						compareType: "internal_to_external",
 						metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
-						rows: [], gaps: [], finish_reason: "stop",
+						rows: [],
+						gaps: [],
+						finish_reason: "stop",
 					};
 				},
 			},
@@ -281,7 +307,7 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 	});
 
 	it("跑完六阶段并产出合规行表", async () => {
-		const { runtime, toolCalls, resolutionsArgs } = await buildRuntime({
+		const { runtime, toolCalls } = await buildRuntime({
 			modelReplies: [
 				verdictReply([
 					{ pairIndex: 0, state: "missing", gap: "缺期限", suggestion: "补期限" },
@@ -395,7 +421,21 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		const { runtime } = await buildRuntime({
 			candidateBatchRawOverride: {
 				items: [
-					{ query_index: 0, candidates: [{ chunk_id: "C-0", clause_path: "内第一条", doc_title: "内规", doc_no: null, text: "内规第一条正文", source_code: "SC-0", score: 0.9 }], error: null },
+					{
+						query_index: 0,
+						candidates: [
+							{
+								chunk_id: "C-0",
+								clause_path: "内第一条",
+								doc_title: "内规",
+								doc_no: null,
+								text: "内规第一条正文",
+								source_code: "SC-0",
+								score: 0.9,
+							},
+						],
+						error: null,
+					},
 					{ query_index: 1, candidates: [], error: null },
 				],
 				total: 2,
@@ -410,13 +450,22 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 
 	it("批量检索单条失败必须落为明确的缺失项", async () => {
 		const { runtime } = await buildRuntime({
-			candidateBatchRawOverride: { items: [{ query_index: 0, candidates: [], error: "embedding failed" }, { query_index: 1, candidates: [], error: null }], total: 2 },
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates: [], error: "embedding failed" },
+					{ query_index: 1, candidates: [], error: null },
+				],
+				total: 2,
+			},
 			modelReplies: [verdictReply([])],
 		});
 		const result = await runtime.run("比对");
 		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
 		expect(body.metrics.missing).toBe(2);
-		expect(body.rows.map((row: { conflictType: string }) => row.conflictType)).toEqual(["检索失败", "未命中内部制度条款"]);
+		expect(body.rows.map((row: { conflictType: string }) => row.conflictType)).toEqual([
+			"检索失败",
+			"未命中内部制度条款",
+		]);
 	});
 
 	it("守恒:checkedCount 按待核查外规条款数统计，不受候选内规条数影响", async () => {
@@ -446,10 +495,14 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 			],
 		});
 		await runtime.run("比对");
-		expect(candidateBatchArgs).toEqual([{ clauses: [
-			{ clause_path: "第五条", text: "外规第五条正文应当" },
-			{ clause_path: "第十条", text: "外规第十条正文不得" },
-		] }]);
+		expect(candidateBatchArgs).toEqual([
+			{
+				clauses: [
+					{ clause_path: "第五条", text: "外规第五条正文应当" },
+					{ clause_path: "第十条", text: "外规第十条正文不得" },
+				],
+			},
+		]);
 	});
 
 	it("上传与知识库外规都只将规范性义务条款送入内规语义检索", async () => {
@@ -464,7 +517,9 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 			artifacts: { fetch: async () => ({ uploadId: "U-filter", title: "上传外规", clauses }) },
 		});
 		await upload.runtime.run("比对");
-		expect(upload.candidateBatchArgs).toEqual([{ clauses: [{ clause_path: "第二条", text: "相关主体应当保存完整记录。" }] }]);
+		expect(upload.candidateBatchArgs).toEqual([
+			{ clauses: [{ clause_path: "第二条", text: "相关主体应当保存完整记录。" }] },
+		]);
 
 		const library = await buildRuntime({
 			modelReplies,
@@ -477,7 +532,9 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 			},
 		});
 		await library.runtime.run("比对");
-		expect(library.candidateBatchArgs).toEqual([{ clauses: [{ clause_path: "第二条", text: "相关主体应当保存完整记录。" }] }]);
+		expect(library.candidateBatchArgs).toEqual([
+			{ clauses: [{ clause_path: "第二条", text: "相关主体应当保存完整记录。" }] },
+		]);
 	});
 
 	it("没有规范性义务词的外规不触发内规语义检索", async () => {
@@ -504,7 +561,7 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 	 * 四行整个删掉,当时没有任何测试会红。收窄参数丢一个,M1 就按「不限」处理,比对范围会从
 	 * 「费用报销这一个域」悄悄放大到全部内规,而调用方看到的是一次正常完成的 run。
 	 */
-	it("批量候选工具不接收前端业务范围，检索范围由 audit-ai 权限域固定为内规", async () => {
+	it("批量候选工具接收目标内部知识库的有效期范围", async () => {
 		const { runtime, candidateBatchArgs } = await buildRuntime({
 			payloadOverride: {
 				scope: {
@@ -522,10 +579,14 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("completed");
-		expect(candidateBatchArgs[0]).toEqual({ clauses: [
-			{ clause_path: "第五条", text: "外规第五条正文应当" },
-			{ clause_path: "第十条", text: "外规第十条正文不得" },
-		] });
+		expect(candidateBatchArgs[0]).toEqual({
+			clauses: [
+				{ clause_path: "第五条", text: "外规第五条正文应当" },
+				{ clause_path: "第十条", text: "外规第十条正文不得" },
+			],
+			effective_from: "2024-01-01",
+			effective_to: "2026-12-31",
+		});
 	});
 
 	it("模型不产正文:即使模型回了 externalClause,行表里也是原文", async () => {
@@ -724,12 +785,23 @@ describe("PolicyCompareRuntime fail-closed(各条路径都不产出结果,不只
 
 	it("终审 I1:批量候选总对数超过 MAX_PAIRS → 不产出结果,且一次模型调用都没发出", async () => {
 		const candidates = Array.from({ length: MAX_PAIRS + 1 }, (_, i) => ({
-			chunk_id: `C-${i}`, clause_path: `内第${i}条`, doc_title: "内规", doc_no: null,
-			text: `内规第${i}条正文`, source_code: `SC-${i}`, score: 0.9,
+			chunk_id: `C-${i}`,
+			clause_path: `内第${i}条`,
+			doc_title: "内规",
+			doc_no: null,
+			text: `内规第${i}条正文`,
+			source_code: `SC-${i}`,
+			score: 0.9,
 		}));
 		const { runtime } = await buildRuntime({
 			modelReplies: [verdictReply([])],
-			candidateBatchRawOverride: { items: [{ query_index: 0, candidates, error: null }, { query_index: 1, candidates: [], error: null }], total: 2 },
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates, error: null },
+					{ query_index: 1, candidates: [], error: null },
+				],
+				total: 2,
+			},
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
@@ -752,12 +824,20 @@ describe("PolicyCompareRuntime fail-closed(各条路径都不产出结果,不只
 		});
 		const { runtime } = await buildRuntime({
 			modelReplies: [verdictReply([])],
-			candidateBatchRawOverride: { items: [{ query_index: 0, candidates: [row(), row()], error: null }, { query_index: 1, candidates: [], error: null }], total: 2 },
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates: [row(), row()], error: null },
+					{ query_index: 1, candidates: [], error: null },
+				],
+				total: 2,
+			},
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
-		expect(result.errorMessage).toContain("retrieve_internal_candidates_batch 返回候选缺少正文、chunk_id 或有重复候选");
+		expect(result.errorMessage).toContain(
+			"retrieve_internal_candidates_batch 返回候选缺少正文、chunk_id 或有重复候选",
+		);
 		// 🔴 判别力就在这条:病因指向 M1,不是笼统的守恒判负
 		expect(result.errorMessage).not.toContain("metrics 不自洽");
 	});
@@ -786,7 +866,13 @@ describe("PolicyCompareRuntime fail-closed(各条路径都不产出结果,不只
 
 	it("批量候选响应索引重复→ 不产出结果", async () => {
 		const { runtime } = await buildRuntime({
-			candidateBatchRawOverride: { items: [{ query_index: 0, candidates: [], error: null }, { query_index: 0, candidates: [], error: null }], total: 2 },
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates: [], error: null },
+					{ query_index: 0, candidates: [], error: null },
+				],
+				total: 2,
+			},
 			modelReplies: [verdictReply([])],
 		});
 		const result = await runtime.run("比对");

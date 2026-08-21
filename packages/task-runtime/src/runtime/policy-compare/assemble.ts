@@ -52,7 +52,12 @@ export function buildCoverageResult(input: BuildInput): CoverageResult {
 	// rejected/unresolved、C1 的越界判定明细)前面:这条诊断的是「对齐本身可能已经失效」这种更根源性
 	// 的问题,理应比任何逐条明细更早被看到。N 条明细仍然保留(不静默丢,审计人员要能顺着 chunk_id
 	// 回查)。
-	if (!isInternalToExternal && alignment.pairs.length === 0 && checkedCount > 0 && alignment.unmatched.length === checkedCount) {
+	if (
+		!isInternalToExternal &&
+		alignment.pairs.length === 0 &&
+		checkedCount > 0 &&
+		alignment.unmatched.length === checkedCount
+	) {
 		gaps.unshift(
 			`🔴 全部 ${checkedCount} 条内规义务条款都没能对齐到上传外规,零条款对进入判定 —— ` +
 				"这更像对齐失效而不是「内规全都没接住」:阶段 4 今天只有「上传件标题归一后逐字等于映射侧 doc_title」" +
@@ -77,7 +82,7 @@ export function buildCoverageResult(input: BuildInput): CoverageResult {
 		const key = countByExternal
 			? `${pair.externalClause.seq}\u0000${pair.externalClause.clausePath}\u0000${pair.externalClause.text}`
 			: pair.internalObligation.chunkId;
-	if (!byChunkId.has(key)) {
+		if (!byChunkId.has(key)) {
 			byChunkId.set(key, { pairs: [], verdicts: [], indexes: [] });
 		}
 		const group = byChunkId.get(key)!;
@@ -145,7 +150,7 @@ export function buildCoverageResult(input: BuildInput): CoverageResult {
 		for (const { verdicts: pairVerdicts, indexes } of byChunkId.values()) {
 			if (pairVerdicts.length > 0 && pairVerdicts.every((verdict) => verdict?.state === "missing")) {
 				collapsedMissingRows.add(indexes[0]);
-				indexes.slice(1).forEach((index) => hiddenCandidateRows.add(index));
+				for (const index of indexes.slice(1)) hiddenCandidateRows.add(index);
 			}
 		}
 	}
@@ -167,9 +172,7 @@ export function buildCoverageResult(input: BuildInput): CoverageResult {
 		rows.push({
 			index: rows.length + 1,
 			tabKey:
-				verdict.state === "conflict" || (isInternalToExternal && verdict.state === "partial")
-					? "error"
-					: "missing",
+				verdict.state === "conflict" || (isInternalToExternal && verdict.state === "partial") ? "error" : "missing",
 			conflictType:
 				verdict.state === "partial" ? "部分覆盖" : (verdict.conflictType ?? JUDGEMENT_BY_STATE[verdict.state]),
 			externalClause: pair.externalClause.text,

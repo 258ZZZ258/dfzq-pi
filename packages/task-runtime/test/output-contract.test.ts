@@ -80,7 +80,7 @@ describe("extractJsonBlock", () => {
 	// 长输入时 snippet 必须围绕出错位置截,而不是恒取开头 —— 第 7 次真 run 的错误在
 	// char 2532,恒取开头等于把人指向一段完全正确的文本。
 	it("centres the snippet on the parser's reported position", () => {
-		const filler = '{"pad":"' + "x".repeat(500) + '" "boom":1}';
+		const filler = `{"pad":"${"x".repeat(500)}" "boom":1}`;
 		const result = extractJsonBlock(filler);
 		expect(result.kind).toBe("unparsable");
 		if (result.kind === "unparsable") {

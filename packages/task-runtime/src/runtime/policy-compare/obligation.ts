@@ -6,17 +6,7 @@ import type { ExternalClause } from "./types.ts";
  * 覆盖比对只核查需要被落实的规范性要求；说明性、定义性条款不进入后续的
  * 内规语义检索。该过滤发生在 Pi 侧，因而上传外规和知识库外规走同一规则。
  */
-const NON_BARE_OBLIGATION_MARKERS = [
-	"必须",
-	"不得",
-	"禁止",
-	"严禁",
-	"不应",
-	"不准",
-	"有义务",
-	"负有",
-	"责令",
-] as const;
+const NON_BARE_OBLIGATION_MARKERS = ["必须", "不得", "禁止", "严禁", "不应", "不准", "有义务", "负有", "责令"] as const;
 
 const BARE_MARKERS = ["应", "须"] as const;
 

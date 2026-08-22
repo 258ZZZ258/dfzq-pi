@@ -131,7 +131,9 @@ export async function buildRuntime(o: HarnessOpts) {
 			name: "retrieve_internal_candidates_batch",
 			label: "retrieve_internal_candidates_batch",
 			description: "faux",
-			parameters: Type.Object({ clauses: Type.Array(Type.Object({ clause_path: Type.Optional(Type.String()), text: Type.String() })) }),
+			parameters: Type.Object({
+				clauses: Type.Array(Type.Object({ clause_path: Type.Optional(Type.String()), text: Type.String() })),
+			}),
 			execute: async (_id: string, params: Record<string, unknown>) => {
 				toolCalls.push("retrieve_internal_candidates_batch");
 				candidateBatchArgs.push(params);
@@ -148,18 +150,21 @@ export async function buildRuntime(o: HarnessOpts) {
 				}
 				const items = clauses.map((_, index) => ({
 					query_index: index,
-					candidates: Array.from({ length: Math.floor((n + clauses.length - 1 - index) / clauses.length) }, (_, slot) => {
-						const candidateIndex = index + slot * clauses.length;
-						return {
-							chunk_id: `C-${candidateIndex}`,
-							clause_path: `内第${candidateIndex}条`,
-							doc_title: "内规",
-							doc_no: "内〔2026〕1号",
-							text: `内规第${candidateIndex}条正文`,
-							source_code: `SC-${candidateIndex}`,
-							score: 0.9,
-						};
-					}),
+					candidates: Array.from(
+						{ length: Math.floor((n + clauses.length - 1 - index) / clauses.length) },
+						(_, slot) => {
+							const candidateIndex = index + slot * clauses.length;
+							return {
+								chunk_id: `C-${candidateIndex}`,
+								clause_path: `内第${candidateIndex}条`,
+								doc_title: "内规",
+								doc_no: "内〔2026〕1号",
+								text: `内规第${candidateIndex}条正文`,
+								source_code: `SC-${candidateIndex}`,
+								score: 0.9,
+							};
+						},
+					),
 					error: null,
 				}));
 				const body = JSON.stringify({ items, total: items.length });
@@ -170,7 +175,9 @@ export async function buildRuntime(o: HarnessOpts) {
 			name: "retrieve_external_candidates_batch",
 			label: "retrieve_external_candidates_batch",
 			description: "faux",
-			parameters: Type.Object({ clauses: Type.Array(Type.Object({ clause_path: Type.Optional(Type.String()), text: Type.String() })) }),
+			parameters: Type.Object({
+				clauses: Type.Array(Type.Object({ clause_path: Type.Optional(Type.String()), text: Type.String() })),
+			}),
 			execute: async (_id: string, params: Record<string, unknown>) => {
 				toolCalls.push("retrieve_external_candidates_batch");
 				externalCandidateBatchArgs.push(params);
@@ -289,24 +296,24 @@ export async function buildRuntime(o: HarnessOpts) {
 						title: "基准外规",
 						pageCount: 1,
 						chunkCount: 2,
-					status: "ok",
-				}),
-				getInternalDocument: async () => ({
-					uploadId: "library:INT-DV-1",
-					title: "知识库内规",
-					clauses: [
-						{ seq: 0, clausePath: "第一条", text: "内规第一条应当落实外规要求" },
-						{ seq: 1, clausePath: "第二条", text: "内规第二条不得违反规定" },
-					],
-				}),
-				checkInternalReferenceVersions: async () => ({
-					compareType: "internal_to_external",
-					metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
-					rows: [],
-					gaps: [],
-					finish_reason: "stop",
-				}),
-			});
+						status: "ok",
+					}),
+					getInternalDocument: async () => ({
+						uploadId: "library:INT-DV-1",
+						title: "知识库内规",
+						clauses: [
+							{ seq: 0, clausePath: "第一条", text: "内规第一条应当落实外规要求" },
+							{ seq: 1, clausePath: "第二条", text: "内规第二条不得违反规定" },
+						],
+					}),
+					checkInternalReferenceVersions: async () => ({
+						compareType: "internal_to_external",
+						metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
+						rows: [],
+						gaps: [],
+						finish_reason: "stop",
+					}),
+				});
 
 	const artifacts: ArtifactStore =
 		o.artifacts ??
@@ -353,7 +360,15 @@ export async function buildRuntime(o: HarnessOpts) {
 		modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
 	});
 	cleanups.push(() => runtime.dispose());
-	return { runtime, toolCalls, candidateBatchArgs, externalCandidateBatchArgs, obligationsArgs, resolutionsArgs, faux: harness.faux };
+	return {
+		runtime,
+		toolCalls,
+		candidateBatchArgs,
+		externalCandidateBatchArgs,
+		obligationsArgs,
+		resolutionsArgs,
+		faux: harness.faux,
+	};
 }
 
 export const verdictReply = (items: unknown[]) => `\`\`\`json\n${JSON.stringify({ verdicts: items })}\n\`\`\``;

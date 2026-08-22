@@ -176,7 +176,11 @@ export interface PolicyCompareRuntimeOptions {
 type Stage = "extracting" | "matching" | "judging" | "assembling";
 
 /** 解析 audit-ai 批量检索候选。每条输入必须得到同序、唯一的结果项，避免候选错配。 */
-function toBatchCandidates(raw: unknown, expectedCount: number, toolName = "retrieve_internal_candidates_batch"): Array<{
+function toBatchCandidates(
+	raw: unknown,
+	expectedCount: number,
+	toolName = "retrieve_internal_candidates_batch",
+): Array<{
 	queryIndex: number;
 	candidates: InternalObligation[];
 	error: string | null;
@@ -189,7 +193,13 @@ function toBatchCandidates(raw: unknown, expectedCount: number, toolName = "retr
 	return r.items.map((value) => {
 		const row = value as Record<string, unknown>;
 		const queryIndex = row.query_index;
-		if (typeof queryIndex !== "number" || !Number.isInteger(queryIndex) || queryIndex < 0 || queryIndex >= expectedCount || seen.has(queryIndex)) {
+		if (
+			typeof queryIndex !== "number" ||
+			!Number.isInteger(queryIndex) ||
+			queryIndex < 0 ||
+			queryIndex >= expectedCount ||
+			seen.has(queryIndex)
+		) {
 			throw new Error(`${toolName} 返回了非法或重复 query_index`);
 		}
 		seen.add(queryIndex);
@@ -405,7 +415,8 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 							corpusHint: "internal",
 						})
 					: null;
-			const uploadDocument = internal.source === "upload" ? await options.artifacts.fetch(processed!.artifactKey) : undefined;
+			const uploadDocument =
+				internal.source === "upload" ? await options.artifacts.fetch(processed!.artifactKey) : undefined;
 			if (uploadDocument && uploadDocument.clauses.length > MAX_EXTERNAL_CHUNKS) {
 				throw new Error(`内规解析出 ${uploadDocument.clauses.length} 条条款,超过上限 ${MAX_EXTERNAL_CHUNKS}`);
 			}
@@ -414,23 +425,25 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 			const result = await options.documents.checkInternalReferenceVersions(
 				internal.source === "library"
 					? {
-						docVersionId: internal.docVersionId,
-						effectiveDateRange: payload.scope.effectiveDateRange,
-						permTags: options.permissionTags ?? [],
-					}
+							docVersionId: internal.docVersionId,
+							effectiveDateRange: payload.scope.effectiveDateRange,
+							permTags: options.permissionTags ?? [],
+						}
 					: {
-						clauses: uploadDocument!.clauses.map((clause) => ({
-							chunkId: `${internal.uploadId}:${clause.seq}`,
-							clausePath: clause.clausePath,
-							text: clause.text,
-						})),
-						effectiveDateRange: payload.scope.effectiveDateRange,
-						permTags: options.permissionTags ?? [],
-					},
+							clauses: uploadDocument!.clauses.map((clause) => ({
+								chunkId: `${internal.uploadId}:${clause.seq}`,
+								clausePath: clause.clausePath,
+								text: clause.text,
+							})),
+							effectiveDateRange: payload.scope.effectiveDateRange,
+							permTags: options.permissionTags ?? [],
+						},
 			);
 			if (!Value.Check(options.outputContractSchema as never, result as never)) {
 				const first = [...Value.Errors(options.outputContractSchema as never, result as never)][0];
-				throw new Error(`引用版本核查输出契约校验失败:${first ? `${first.instancePath}: ${first.message}` : "未知错误"}`);
+				throw new Error(
+					`引用版本核查输出契约校验失败:${first ? `${first.instancePath}: ${first.message}` : "未知错误"}`,
+				);
 			}
 			stage("assembling", 100, 1, 1, "比对完成");
 			return {
@@ -504,9 +517,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 				checkedCount: 0,
 				truncated: false,
 				externalDocNo: coverageDoc.docNo ?? null,
-				extraGaps: [
-					"未识别到含应当、必须、不得、禁止等规范性义务词的外规条款，本次未执行内规语义检索。",
-				],
+				extraGaps: ["未识别到含应当、必须、不得、禁止等规范性义务词的外规条款，本次未执行内规语义检索。"],
 			});
 			const checked = validateCoverageResult(
 				result,
@@ -599,9 +610,13 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		const checked = validateCoverageResult(
 			result,
 			{
-				internalChunkIds: new Set(candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.chunkId))),
+				internalChunkIds: new Set(
+					candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.chunkId)),
+				),
 				externalTexts: new Set(coverageDoc.clauses.map((c) => c.text)),
-				internalTexts: new Set(candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.text))),
+				internalTexts: new Set(
+					candidateItems.flatMap((item) => item.candidates.map((candidate) => candidate.text)),
+				),
 				checkedCount: coverageDoc.clauses.length,
 			},
 			options.outputContractSchema,

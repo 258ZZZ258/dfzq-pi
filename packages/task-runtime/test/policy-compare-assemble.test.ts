@@ -148,7 +148,9 @@ describe("buildCoverageResult", () => {
 				expect.objectContaining({ tabKey: "missing", conflictType: "未命中外部规则条款", externalClause: "" }),
 			]),
 		);
-		expect(got.gaps).toEqual(expect.arrayContaining(["C-1:不构成覆盖", "C-2:缺少时限", "内规条款 C-3 no_external_candidate"]));
+		expect(got.gaps).toEqual(
+			expect.arrayContaining(["C-1:不构成覆盖", "C-2:缺少时限", "内规条款 C-3 no_external_candidate"]),
+		);
 	});
 
 	it("conflict 归 tabKey=error,conflictType 用模型给的", () => {

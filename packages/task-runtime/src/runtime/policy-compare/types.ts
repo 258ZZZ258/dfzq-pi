@@ -68,7 +68,10 @@ export interface AlignmentResult {
 	pairs: ClausePair[];
 	unmatched: UnmatchedObligation[];
 	/** 批量检索路径以外规条款为核查单位；空候选和单条检索失败不能静默丢失。 */
-	uncoveredExternalClauses?: Array<{ externalClause: ExternalClause; reason: "no_internal_candidate" | "retrieval_failed" }>;
+	uncoveredExternalClauses?: Array<{
+		externalClause: ExternalClause;
+		reason: "no_internal_candidate" | "retrieval_failed";
+	}>;
 	/** 内规→外规批量检索中没有外规候选的待核查内规条款。
 	 * 不能只留 chunkId：结果页需要展示真实内规原文，且必须明确说明外规侧未命中。 */
 	uncoveredInternalClauses?: Array<{

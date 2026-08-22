@@ -250,7 +250,9 @@ describe("alignBatchCandidates", () => {
 		expect(got.pairs).toHaveLength(1);
 		expect(got.pairs[0].externalClause.seq).toBe(0);
 		expect(got.pairs[0].matchKind).toBe("semantic_retrieval");
-		expect(got.uncoveredExternalClauses).toEqual([{ externalClause: doc.clauses[1], reason: "no_internal_candidate" }]);
+		expect(got.uncoveredExternalClauses).toEqual([
+			{ externalClause: doc.clauses[1], reason: "no_internal_candidate" },
+		]);
 	});
 });
 
@@ -271,8 +273,6 @@ describe("alignInternalToExternalBatchCandidates", () => {
 		expect(got.countBy).toBe("internal");
 		expect(got.pairs).toHaveLength(1);
 		expect(got.pairs[0].internalObligation.text).toBe("说明性内规条款也应参与语义检索");
-		expect(got.unmatched).toEqual([
-			{ internalChunkId: "source-internal:1:1", reason: "no_external_candidate" },
-		]);
+		expect(got.unmatched).toEqual([{ internalChunkId: "source-internal:1:1", reason: "no_external_candidate" }]);
 	});
 });

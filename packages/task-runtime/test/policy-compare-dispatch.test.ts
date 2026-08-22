@@ -52,10 +52,7 @@ function minimalProfile(): unknown {
 
 /** 所有制度比对请求都必须具备的 audit-ai 连接环境变量。
  * MinIO 只服务上传件，知识库选文档不应因其未配置而被阻塞，故不在此列。 */
-const REQUIRED_ENV_KEYS = [
-	"AUDIT_AI_BASE_URL",
-	"AUDIT_AI_INTERNAL_TOKEN",
-] as const;
+const REQUIRED_ENV_KEYS = ["AUDIT_AI_BASE_URL", "AUDIT_AI_INTERNAL_TOKEN"] as const;
 
 let root: string;
 let savedEnv: Record<string, string | undefined>;

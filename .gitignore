@@ -8,7 +8,10 @@ dist/
 packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
-packages/ai/src/providers/data/
+# packages/ai/src/providers/data/   ← 内网分支刻意取消忽略:该目录由 hydrate:model-data
+#   联网生成,离线内网无法重建,而 packages/ai 的测试会 import ./data/*.json。
+#   548K / 37 个文件,直接进版本库换 CI 零联网依赖。从 origin 同步时这一行会冲突,
+#   保留本地(注释)版本即可。
 packages/ai/src/providers/.model-generation-*/
 *.cpuprofile
 

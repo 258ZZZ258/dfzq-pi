@@ -40,8 +40,21 @@ fi
 # 脚本 exit 0 不等于装上了 —— postgres 是 task-runtime 的运行期依赖,单独确认
 test -d node_modules/postgres || { echo "✗ postgres 未装上(内网 npm 镜像里可能没有)"; exit 1; }
 
-echo "=== 格式与类型检查 ==="
-npm run check
+echo "=== 类型与契约检查 ==="
+# 🔴 这里**刻意不跑 `npm run check`** —— 它的第一条是 biome,而 biome 的预编译二进制
+#    要 glibc >= 2.30,构建机是 Kylin V10 / glibc 2.28(恰好也是 Milvus 的下限)。
+#    症状:`libc.so.6: version 'GLIBC_2.29' not found`。这是**环境硬约束,不是配置问题**。
+#
+#    ⚠ 因此**格式检查只在外网门禁把关**(那边 `npm run check` 是绿的),内网 CI 不重复。
+#      这条与既定纪律一致:代码改动一律在外网做,内网只拉不改。
+#
+#    下面六条是 `npm run check` 里除 biome 之外的全部内容,逐条跑 —— set -e 保证任一失败即停。
+npm run check:pinned-deps
+npm run check:ts-imports
+npm run check:shrinkwrap
+npm run check:install-lock:coding-agent
+npx tsgo --noEmit
+npm run check:browser-smoke
 
 echo "=== 测试 ==="
 # 🔴 拆两条,而不是排掉 serve-cli.test.ts 整个文件:

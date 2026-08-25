@@ -50,6 +50,10 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 				: undefined,
 		maxConcurrent: optionalNumber(env, "TASK_RUNTIME_MAX_CONCURRENT"),
 		maxQueueDepth: optionalNumber(env, "TASK_RUNTIME_MAX_QUEUE_DEPTH"),
+		// 缺省 127.0.0.1(宿主部署的既有行为,不变)。容器化部署必须设成 0.0.0.0,
+		// 否则 Docker 的端口转发到不了 —— 见 ServeOptions.hostname 的说明。
+		// 空串与未设置同等对待,与本文件其余 env 读取口径一致。
+		hostname: env.TASK_RUNTIME_BIND_HOST || undefined,
 	});
 }
 

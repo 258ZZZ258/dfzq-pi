@@ -104,6 +104,68 @@ describe("server startup", () => {
 	);
 
 	it(
+		"binds 127.0.0.1 by default —— 不显式给 hostname 时不得监听在所有网卡上",
+		async () => {
+			// 🔴 这是安全默认值的回归锁,不是功能测试。
+			// 本服务不做鉴权(TASK_RUNTIME_INTERNAL_TOKEN 是唯一门禁,内网部署里填的是
+			// 固定占位值),绑回环是「18080 不会被办公网段直接摸到」的最后一道保障。
+			// 若有人把 main.ts 的缺省改成 0.0.0.0,宿主部署会静默地把无鉴权接口暴露出去,
+			// 而所有功能测试照样全绿 —— 只有这条会红。
+			const server = await startServer({
+				port: 0,
+				dbPath: join(root, "runs-default-bind.db"),
+				specsDir: join(root, "specs"),
+				internalToken: "t",
+				runtimeFactory: async () => createStubRuntime(),
+			});
+			stop = server.close;
+			// 回环连得上
+			const loopback = await fetch(`http://127.0.0.1:${server.port}/healthz`, {
+				signal: AbortSignal.timeout(5_000),
+			});
+			expect(loopback.status).toBe(200);
+			// 非回环地址连不上。用本机的真实对外 IP 探:绑了 0.0.0.0 才连得通,
+			// 绑 127.0.0.1 则 ECONNREFUSED。拿不到非回环网卡时跳过这半条断言
+			// (CI 容器里可能只有 lo),不伪装成通过。
+			const { networkInterfaces } = await import("node:os");
+			const external = Object.values(networkInterfaces())
+				.flat()
+				.find((n) => n && n.family === "IPv4" && !n.internal)?.address;
+			if (external) {
+				await expect(
+					fetch(`http://${external}:${server.port}/healthz`, {
+						signal: AbortSignal.timeout(3_000),
+					}),
+				).rejects.toThrow();
+			}
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
+		"honours an explicit hostname —— 容器化部署靠它绑 0.0.0.0",
+		async () => {
+			// 容器内绑回环 = Docker 端口转发够不着(宿主 curl 报 Empty reply from server,
+			// 而容器日志里明明已经 listening)。deploy/compose.yml 靠
+			// TASK_RUNTIME_BIND_HOST=0.0.0.0 走到这条路径上。
+			const server = await startServer({
+				port: 0,
+				hostname: "0.0.0.0",
+				dbPath: join(root, "runs-explicit-bind.db"),
+				specsDir: join(root, "specs"),
+				internalToken: "t",
+				runtimeFactory: async () => createStubRuntime(),
+			});
+			stop = server.close;
+			const res = await fetch(`http://127.0.0.1:${server.port}/healthz`, {
+				signal: AbortSignal.timeout(5_000),
+			});
+			expect(res.status).toBe(200);
+		},
+		CASE_TIMEOUT_MS,
+	);
+
+	it(
 		"serves healthz on the bound port",
 		async () => {
 			const server = await startServer({

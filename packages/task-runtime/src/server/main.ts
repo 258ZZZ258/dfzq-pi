@@ -38,6 +38,16 @@ export interface ServeOptions {
 	maxConcurrent?: number;
 	maxQueueDepth?: number;
 	documents?: DocumentsClient;
+	/**
+	 * 监听地址。缺省 `127.0.0.1` —— 本服务**不做鉴权之外的网络边界**,绑回环是
+	 * 宿主部署时的纵深防御(禁止把 18080 暴露到办公网段)。
+	 *
+	 * 🔴 容器化部署必须显式传 `0.0.0.0`:容器内绑回环 = Docker 的端口转发够不着,
+	 * 症状是宿主 curl 报 `Empty reply from server`,而容器日志里明明已经 "listening"。
+	 * 在容器里放宽到 0.0.0.0 不降低边界:容器网络命名空间本身是隔离的,且 compose
+	 * 只把宿主端口发布到 `127.0.0.1:`,对外可达性与宿主部署时一致。
+	 */
+	hostname?: string;
 }
 
 export async function startServer(options: ServeOptions): Promise<{ port: number; close: () => Promise<void> }> {
@@ -94,7 +104,10 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 				instance.off("error", onError);
 				resolve(instance);
 			};
-			instance = serve({ fetch: app.fetch, port: options.port, hostname: "127.0.0.1" }, onListening);
+			instance = serve(
+				{ fetch: app.fetch, port: options.port, hostname: options.hostname ?? "127.0.0.1" },
+				onListening,
+			);
 			instance.once("error", onError);
 		});
 	} catch (error) {

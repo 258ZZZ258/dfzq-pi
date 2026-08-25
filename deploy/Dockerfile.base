@@ -1,0 +1,84 @@
+# dfzq-pi 底座镜像 —— Node 22 运行时 + audit-ai 源码 + Python venv
+#
+# 规格:dfzq-pi开发任务/骨架/规格-容器化与一键部署.md §2.1
+#
+# 构建上下文由 build.sh --base 组装:<staging>/audit-ai/ ← dfzq-audit-ai 工作树。
+# 🔴 Docker 19.03 是经典 builder,一次 build 只有一个上下文,两个仓不能各给一个;
+#    拆底座/薄层两层后,audit-ai 只在本文件需要,薄层的上下文就只有 dfzq-pi。
+#
+# ⚠ MCP 只有 stdio 传输(toolsets/mcp/client.ts:100 spawn + stdio pipe),不跨容器,
+#   所以 audit-ai 的 query.mcp.server 必须与 pi 在同一个镜像里。
+
+ARG NODE_BASE=node:22-bookworm-slim
+FROM ${NODE_BASE}
+
+# curl:HEALTHCHECK 与 init 用。python3.11-venv:bookworm 自带 3.11,只缺 venv 模块。
+# 🔴 这三样在 node:22-bookworm-slim 里**一个都没有**(实测:curl/wget/python3 全无,
+#    连 ca-certificates 都没有 —— 所以 apt 只能走 http,不能改 https)。
+#
+# ARG APT_MIRROR:apt 源可替换。
+#   · 缺省 deb.debian.org
+#   · 本机开发:实测代理会间歇性掐 80 端口出站(先 502、后 Unable to connect),
+#     换就近镜像(如 mirrors.aliyun.com)可靠得多
+#   · 🔴 内网构建:目标环境**没有公网**。Artifactory 已知有 pypi/npm 代理,
+#     **有没有 Debian 代理是未确认项** —— 没有的话底座只能在外网构建后 push,
+#     见规格 §0.3-1 与 §0.3-7
+# -o Acquire::Retries=3:apt 默认不重试,单个包一次 502 就整条 RUN 失败(本机实测撞到过)。
+ARG APT_MIRROR=deb.debian.org
+RUN set -eux; \
+    if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    apt-get -o Acquire::Retries=3 update; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+      ca-certificates curl python3.11-venv; \
+    rm -rf /var/lib/apt/lists/*
+
+# audit-ai 源码。只带运行与初始化必需的目录 —— 不带 .venv / tests / docs / .git
+COPY audit-ai/pyproject.toml  audit-ai/alembic.ini  /opt/audit-ai/
+COPY audit-ai/libs/     /opt/audit-ai/libs/
+COPY audit-ai/pipeline/ /opt/audit-ai/pipeline/
+COPY audit-ai/eval/     /opt/audit-ai/eval/
+COPY audit-ai/query/    /opt/audit-ai/query/
+COPY audit-ai/alembic/  /opt/audit-ai/alembic/
+COPY audit-ai/config/   /opt/audit-ai/config/
+COPY audit-ai/seeds/    /opt/audit-ai/seeds/
+
+ARG PIP_INDEX_URL=
+ARG PIP_TRUSTED_HOST=
+# 🔴 四个成员顺序敏感(依赖方向 common → pipeline → eval/query),与
+#    dfzq-predeploy/scripts/20-install-python.sh:119 一致。
+# 🔴 一律**不带任何 extras** —— [embed] 会拖 FlagEmbedding→torch,[ocr] 会拖 mineru。
+#    mode=endpoint + rerank_backend=api 全程走懒导入分支,永远碰不到它们。
+RUN set -eux; \
+    PIPARGS=""; \
+    [ -n "$PIP_INDEX_URL" ]   && PIPARGS="$PIPARGS --index-url $PIP_INDEX_URL"; \
+    [ -n "$PIP_TRUSTED_HOST" ] && PIPARGS="$PIPARGS --trusted-host $PIP_TRUSTED_HOST"; \
+    python3.11 -m venv /opt/venv; \
+    /opt/venv/bin/pip install $PIPARGS --upgrade pip; \
+    for m in libs/common pipeline eval query; do \
+      /opt/venv/bin/pip install $PIPARGS -e "/opt/audit-ai/$m"; \
+    done; \
+    /opt/venv/bin/pip install $PIPARGS -e "/opt/audit-ai[dev]"
+
+# 🔴 构建期硬门(搬自 20-install-python.sh:157 的运行期扫描)。
+#    "绝不装 torch" 从"装完检查"升级为"装错就构建不出来"。
+#    用 sysconfig 取 purelib,不硬编码 python3.11 路径 —— 换 Python 小版本不会静默失效。
+RUN set -eu; \
+    SP="$(/opt/venv/bin/python -c 'import sysconfig;print(sysconfig.get_paths()["purelib"])')"; \
+    echo "site-packages: $SP"; \
+    for pat in torch flagembed nvidia mineru; do \
+      if ls "$SP" | grep -qi "$pat"; then \
+        echo "✗ 检测到不该出现的包:$pat —— 是不是误装了 [embed]/[ocr] extras?"; \
+        ls "$SP" | grep -i "$pat"; exit 1; \
+      fi; \
+    done; \
+    echo "✓ torch/FlagEmbedding/nvidia/mineru 扫描通过"
+
+# specs/policy-query.json 的 mcpServers[0] 按这三个变量展开;固化进镜像,
+# 不再由 conf/.env 提供(env.example 里的同名项应删除)。
+ENV DFZQ_AUDIT_AI_PYTHON=/opt/venv/bin/python \
+    DFZQ_AUDIT_AI_ROOT=/opt/audit-ai \
+    PIPELINE_CONFIG_DIR=/opt/audit-ai/config \
+    HF_HUB_OFFLINE=1 \
+    PATH=/opt/venv/bin:$PATH

@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# build.sh —— 构建 dfzq-pi 的底座 / 测试 / 交付三种镜像
+#
+# 规格:dfzq-pi开发任务/骨架/规格-容器化与一键部署.md §2.3
+#
+#   build.sh --base       构建底座(需 audit-ai 工作树)
+#   build.sh --test       构建到 test 阶段并跑检查与单测,取回 junit
+#   build.sh              构建 runtime 阶段,tag = 当前 git sha 前 7 位
+#   build.sh --push       构建后推 registry
+#   build.sh --dry-run    只打印将执行的命令
+#
+# 环境变量:
+#   REGISTRY        缺省 jfrog.orientsec.com.cn/dev7-docker-release-local
+#   BASE_TAG        薄层 FROM 的底座 tag;--base 时是要打的 tag
+#   AUDIT_AI_ROOT   audit-ai 工作树,缺省 ../../dfzq-audit-ai
+#   PLATFORM        缺省空(用本机架构);交付内网须显式 linux/amd64
+#   NPM_REGISTRY / PIP_INDEX_URL / PIP_TRUSTED_HOST   内网源,透传给构建
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
+
+REGISTRY="${REGISTRY:-jfrog.orientsec.com.cn/dev7-docker-release-local}"
+AUDIT_AI_ROOT="${AUDIT_AI_ROOT:-$(cd "$REPO_ROOT/../dfzq-audit-ai" 2>/dev/null && pwd || echo "")}"
+PLATFORM="${PLATFORM:-}"
+
+MODE="runtime"; DRY=0; PUSH=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) MODE="base" ;;
+    --test) MODE="test" ;;
+    --push) PUSH=1 ;;
+    --dry-run) DRY=1 ;;
+    --platform) PLATFORM="$2"; shift ;;
+    --audit-ai) AUDIT_AI_ROOT="$2"; shift ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "未知参数:$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+log() { printf '[build] %s\n' "$*"; }
+run() { if [ "$DRY" = 1 ]; then printf '[dry-run] %s\n' "$*"; else "$@"; fi; }
+
+# 🔴 bash 3.2(macOS 自带)在 set -u 下展开**空数组**会报 unbound variable。
+# 全仓统一用 ${arr[@]+"${arr[@]}"} 这个安全习惯用法展开,见 dfzq-predeploy/scripts/lib.sh 顶部。
+PLATFORM_ARGS=()
+[ -n "$PLATFORM" ] && PLATFORM_ARGS=(--platform "$PLATFORM")
+
+# ---- 底座 -----------------------------------------------------------------
+if [ "$MODE" = "base" ]; then
+  [ -n "$AUDIT_AI_ROOT" ] && [ -d "$AUDIT_AI_ROOT" ] \
+    || { echo "✗ 找不到 audit-ai 工作树:${AUDIT_AI_ROOT:-<空>};用 --audit-ai <路径> 指定" >&2; exit 1; }
+
+  # 🔴 架构守卫:交付目标是 amd64(Kylin V10 / x86_64)。在 arm64 机器(Apple Silicon)
+  #    上不指定 --platform 就 build,产出的是 arm64 镜像 —— 推到内网后 pull 得下来、
+  #    但一起就报 `exec format error` 或 `exec /bin/sh: exec format error`,
+  #    而 docker 不会提前告诉你架构不对。这里在**构建前**就拦住。
+  HOST_ARCH="$(uname -m)"
+  if [ -z "$PLATFORM" ] && [ "$HOST_ARCH" != "x86_64" ] && [ "$HOST_ARCH" != "amd64" ]; then
+    echo "✗ 本机是 ${HOST_ARCH},未指定 --platform 会构建出 ${HOST_ARCH} 镜像,内网 x86_64 起不来。" >&2
+    echo "  交付内网请显式指定:  PLATFORM=linux/amd64 $0 --base" >&2
+    echo "  (交叉构建走 QEMU 模拟,pip 装 venv 会慢很多;更快的路子是直接在内网主节点上构建)" >&2
+    echo "  确认只是本机自测、不交付,可以用:  PLATFORM=$(uname -m) $0 --base  跳过本检查" >&2
+    exit 1
+  fi
+
+  AUDIT_SHA="$(git -C "$AUDIT_AI_ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo nogit)"
+  TAG="${BASE_TAG:-$(date +%Y%m%d)-${AUDIT_SHA}}"
+  IMAGE="${REGISTRY}/dfzq-pi-base:${TAG}"
+
+  STAGING="$(mktemp -d)"
+  trap 'rm -rf "$STAGING"' EXIT
+  log "组装构建上下文:$STAGING"
+  # 🔴 .dockerignore 必须在上下文根,deploy/ 里那份对 staging 不生效,复制过去
+  cp "$HERE/.dockerignore" "$STAGING/.dockerignore"
+  cp "$HERE/Dockerfile.base" "$STAGING/Dockerfile.base"
+  mkdir -p "$STAGING/audit-ai"
+  run rsync -a --delete \
+      --exclude '.git' --exclude '.venv' --exclude 'tests' --exclude '__pycache__' \
+      --exclude '*.egg-info' --exclude 'docs' \
+      "$AUDIT_AI_ROOT/" "$STAGING/audit-ai/"
+
+  log "构建底座:$IMAGE  (audit-ai@${AUDIT_SHA}${PLATFORM:+, $PLATFORM})"
+  run docker build ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} \
+      -f "$STAGING/Dockerfile.base" \
+      --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-}" \
+      --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-}" \
+      ${APT_MIRROR:+--build-arg "APT_MIRROR=$APT_MIRROR"} \
+      ${NODE_BASE:+--build-arg "NODE_BASE=$NODE_BASE"} \
+      -t "$IMAGE" "$STAGING"
+
+  [ "$PUSH" = 1 ] && run docker push "$IMAGE"
+  log "完成:$IMAGE"
+  log "⚠ 薄层的 BASE_TAG 要跟着改成:$TAG"
+  exit 0
+fi
+
+# ---- 薄层(test / runtime)-------------------------------------------------
+[ -n "${BASE_TAG:-}" ] || { echo "✗ 需要 BASE_TAG=<底座 tag>" >&2; exit 1; }
+GIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD)"
+
+BUILD_ARGS=(
+  --build-arg "BASE_TAG=${BASE_TAG}"
+  --build-arg "REGISTRY=${REGISTRY}"
+  --build-arg "NPM_REGISTRY=${NPM_REGISTRY:-}"
+)
+
+if [ "$MODE" = "test" ]; then
+  IMAGE="dfzq-pi-test:${GIT_SHA}"
+  log "构建 test 阶段:$IMAGE"
+  run docker build ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} --target test \
+      -f "$HERE/Dockerfile" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t "$IMAGE" "$REPO_ROOT"
+  # 报告在镜像里的 /out,起一个临时容器拷出来
+  log "取回 junit 报告 → $REPO_ROOT/.ci/"
+  run mkdir -p "$REPO_ROOT/.ci"
+  if [ "$DRY" = 0 ]; then
+    cid="$(docker create "$IMAGE")"
+    docker cp "$cid:/out/." "$REPO_ROOT/.ci/"
+    docker rm -f "$cid" >/dev/null
+  fi
+  log "完成:$IMAGE"
+  exit 0
+fi
+
+IMAGE="${REGISTRY}/dfzq-pi:${GIT_SHA}"
+log "构建交付镜像:$IMAGE"
+run docker build ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} --target runtime \
+    -f "$HERE/Dockerfile" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} -t "$IMAGE" "$REPO_ROOT"
+[ "$PUSH" = 1 ] && run docker push "$IMAGE"
+log "完成:$IMAGE"

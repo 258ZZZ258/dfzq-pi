@@ -1,0 +1,177 @@
+# 五 service 栈:数据层 pg / etcd / minio / milvus + 应用容器 pi。
+# 规格:dfzq-pi开发任务/骨架/规格-容器化与一键部署.md §3.1
+# 底稿是 ~/dfzq-predeploy/conf/compose.yml 的四个 service,本文做三处改动 + 新增 pi:
+#   1. pg 补 security_opt: seccomp:unconfined(现场报告 §4.2,现场已手改,这里固化)
+#   2. 四个数据层镜像去掉 @sha256: digest,改用不可变 tag,registry 前缀走变量(D-11)
+#   3. 新增 pi service,volumes 段新增 runtime_data
+#
+# ── 🔴 顶层不许出现 `name:` 键 ────────────────────────────────────────────────
+# 目标机是 Docker 19.03.15 + docker-compose 1.29.2 独立二进制。1.29.2 自带的
+# compose/config/compose_spec.json 顶层是 additionalProperties:false,允许的顶层键只有
+# version / services / networks / volumes / secrets / configs(外加 ^x- 前缀),**没有 name**。
+# 顶层多这一行,v1 在**解析阶段**整份文件拒绝,报一条不带锚点、文档里查不到的错:
+#   ERROR: The Compose file './compose.yml' is invalid because:
+#   'name' does not match any of the regexes: '^x-'
+# 项目名走 COMPOSE_PROJECT_NAME 环境变量(v1/v2 都认),不会因此丢。
+# 🔴 本文件也**刻意不写 `version:`**:1.29.2 的 ConfigFile.version 对没有 version 键的文件
+# 返回 COMPOSE_SPEC,走的正是上面那份 schema —— depends_on 的 condition 形态由它支持。
+# 🔴 新增任何键之前先跑 ./check-compose-keys.sh(白名单出自 1.29.2 真二进制的 schema)。
+#
+# ── 🔴 .env 有两条互不相干的通路,调用方必须两条都接上 ──────────────────────
+#   通路 1 变量插值(${PG_PASSWORD} / ${PI_IMAGE} / ${IMAGE_PREFIX} …):1.29.2 从
+#     **项目目录**找 .env,而项目目录缺省是 **cwd**,不是本文件所在目录。运维四脚本按
+#     §1 用绝对路径传 `-f <deploy>/compose.yml` 且不依赖 cwd ⇒ 必须同时传
+#     `--project-directory <deploy>`(或 `--env-file <deploy>/.env`,1.28+ 才有),
+#     否则 PG_PASSWORD 解析不到,`${PG_PASSWORD:?}` 当场把整条命令打红。
+#   通路 2 pi 的 `env_file: ./.env`:这条**是**相对本文件所在目录解析的,与 cwd 无关,
+#     负责把六项 requireEnv + LLM_API_KEY 注进容器。两条通路读同一份文件,但一条都不能少。
+#
+# ── 镜像前缀:一个变量管四个数据层镜像 ──────────────────────────────────────
+#   不设 IMAGE_PREFIX  → 走内网 JFrog(生产缺省,与 build.sh 的 REGISTRY 缺省同一个仓)
+#   IMAGE_PREFIX=(显式空)→ 退回镜像自己的官方全名(开发机本地起栈用)
+#   IMAGE_PREFIX=my.reg/path/ → 换任意 registry
+# 🔴 写成 ${IMAGE_PREFIX-默认} 而**不是** ${IMAGE_PREFIX:-默认}:带冒号那种把"显式设成
+#    空字符串"也当成"没设",`IMAGE_PREFIX= docker-compose up` 会被替换回 JFrog,本地
+#    根本退不回官方名。不带冒号的 `-` 只在**变量未定义**时才用默认值(1.29.2 的
+#    compose/config/interpolation.py:`'-' == sep → mapping.get(var, default)`)。
+# 🔴 末尾那个 `/` 是变量值的一部分。写成 ${IMAGE_PREFIX-...}/postgres 的话,空前缀会剩
+#    一个开头的 `/`,镜像名非法。
+# 🔴 etcd 比另外三个多一个变量:它的上游在 quay.io 而不是 Docker Hub,空前缀时必须带上
+#    quay.io/ 才拉得到 —— 本地测试用 ETCD_REPO=quay.io/coreos/etcd。JFrog 上按
+#    coreos/etcd 这个路径存(§0.3-6 待现场确认,若现场是别的路径改这一个变量的缺省值)。
+
+services:
+  pg:
+    image: ${IMAGE_PREFIX-jfrog.orientsec.com.cn/dev7-docker-release-local/}postgres:16.14-bookworm
+    # 🔴 现场报告 §4.2:Docker 19.03 的 runc 让 allowlist 外的 clone3 返 EPERM,
+    #    postgres:16.14 是 glibc 2.36,initdb 的 popen() 中招,报错伪装成
+    #    "Cannot allocate memory" —— 关掉 seccomp 过滤规避。
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      POSTGRES_USER: pipeline
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?PG_PASSWORD 未设置}
+      POSTGRES_DB: audit_pipeline
+    ports:
+      - "127.0.0.1:${PG_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline -d audit_pipeline"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  etcd:
+    image: ${IMAGE_PREFIX-jfrog.orientsec.com.cn/dev7-docker-release-local/}${ETCD_REPO:-coreos/etcd}:v3.5.30
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    image: ${IMAGE_PREFIX-jfrog.orientsec.com.cn/dev7-docker-release-local/}minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    image: ${IMAGE_PREFIX-jfrog.orientsec.com.cn/dev7-docker-release-local/}milvusdb/milvus:v2.5.27
+    command: ["milvus", "run", "standalone"]
+    # 同 pg:19.03 的 runc rc10 让 allowlist 外的 clone3 返 EPERM,milvus 启动会崩。
+    # 关 seccomp 过滤不是放宽本环境的整体安全基线(本环境本就不做鉴权/TLS)。
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "127.0.0.1:${MILVUS_PORT:-19530}:19530"
+      - "127.0.0.1:${MILVUS_HEALTH_PORT:-9091}:9091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      start_period: 90s
+      timeout: 20s
+      retries: 12
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  pi:
+    # 全 ref(含 registry 与 tag),由 .env 的 PI_IMAGE 给,deploy.sh --tag <sha> 覆盖。
+    # 不走 IMAGE_PREFIX:回滚就是把它指向旧 tag 重跑,得是一个独立可改的整体。
+    image: ${PI_IMAGE:?PI_IMAGE 未设置}
+    restart: unless-stopped                 # D-9:容器**退出**时自动拉起
+    # 🔴 底座是 node:22-bookworm-slim(glibc 2.36),与 pg 同一条 clone3 约束,见 §0.2
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      pg:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    environment:
+      PIPELINE_MILVUS_HOST: milvus          # 🔴 不再是 127.0.0.1
+      PIPELINE_MILVUS_PORT: "19530"         # 容器网络内固定,不随宿主端口变
+      PG_HOST: pg
+      PG_PORT_INTERNAL: "5432"
+      # 🔴 容器内监听端口**固定 18080**,与下面 ports 的容器侧、healthcheck、
+      #    Dockerfile 的 HEALTHCHECK 逐字一致。
+      #    environment 的优先级高于 env_file ⇒ 这一行会盖掉 .env 里的 TASK_RUNTIME_PORT。
+      #    .env 里那个 TASK_RUNTIME_PORT 的语义是**宿主端口**(承 predeploy 的既有口径,
+      #    那时没有容器、两者本是同一个)。不写这一行的话它会同时改掉容器内的监听端口,
+      #    而 ports 的容器侧仍是 18080 ⇒ 映射打到没人听的端口上,
+      #    症状是 curl 报 `Empty reply from server`,而容器日志里 serve 明明"listening"。
+      #    (本轮集成测试实测撞到,与 TASK_RUNTIME_PROFILE 是同一类 env_file 泄漏问题。)
+      TASK_RUNTIME_PORT: "18080"
+      # 🔴 容器内必须绑 0.0.0.0。serve 缺省绑 127.0.0.1(宿主部署时的纵深防御:
+      #    本服务不做鉴权,禁止 18080 暴露到办公网段),但在容器里绑回环 =
+      #    Docker 的端口转发够不着,宿主 curl 报 `Empty reply from server`,
+      #    而容器日志里明明已经 "listening"(本轮集成测试实测撞到)。
+      #    放宽到 0.0.0.0 不降低边界:容器网络命名空间本身隔离,且上面 ports
+      #    只把宿主端口发布到 127.0.0.1: —— 对外可达性与宿主部署时一致。
+      TASK_RUNTIME_BIND_HOST: "0.0.0.0"
+    ports:
+      - "127.0.0.1:${TASK_RUNTIME_PORT:-18080}:18080"
+    volumes:
+      - runtime_data:/data                  # work root + MCP 审计日志 + 渲染出的 config
+    # 🔴 restart: unless-stopped 只覆盖"容器退出"。"容器活着但 /healthz 不绿"时 Docker
+    #    只把容器标 unhealthy、**不会重启**(自动重启不健康容器是 Swarm 能力)。
+    #    D-9 本轮不自动处置,靠 status.sh 把 unhealthy 报得显眼。
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:18080/healthz | grep -q '\"ok\"[[:space:]]*:[[:space:]]*true'"]
+      interval: 15s
+      start_period: 60s
+      timeout: 5s
+      retries: 4
+
+volumes:
+  pg_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  runtime_data:

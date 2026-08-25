@@ -1,0 +1,39 @@
+# 排练栈 override —— 规格 §3.3 / §6.1 stage 5。
+# 用法(端口与下面逐条一致,原因见"追加语义"那段):
+#   COMPOSE_PROJECT_NAME=dfzq-rehearsal \
+#   PG_PORT=15432 MILVUS_PORT=29530 MILVUS_HEALTH_PORT=29091 TASK_RUNTIME_PORT=28080 \
+#   docker-compose -f <deploy>/compose.yml -f <deploy>/compose.rehearsal.yml up -d
+#
+# COMPOSE_PROJECT_NAME=dfzq-rehearsal ⇒ 容器名与卷名自动带前缀,与生产 dfzq-policy
+# 天然隔离;排练结束 `down -v` 删卷(生产栈**永远不许** down -v)。
+#
+# 🔴 ports 在多文件合并时是**追加**语义,不是覆盖 —— compose 把 base 与 override 两份
+#    ports 合到一起,按 (宿主 IP, 宿主端口, 容器端口, 协议) 去重。
+#    实测于 Docker Compose v5.1.4(开发机;排练栈按 D-10 跑在 Jenkins 主节点,同属新版
+#    compose 这一侧,所以这就是排练栈真正会遇到的语义;生产栈的 1.29.2 不吃 override
+#    文件,合并语义与它无关,未在 1.29.2 上验证)。也就是说只写这份
+#    override **挡不住** compose.yml 里那几个缺省端口(5432 / 19530 / 9091 / 18080)
+#    照样被发布到宿主,排练栈会跟本机常驻的演示栈抢端口。
+#    ⇒ 调用方必须同时把上面四个端口环境变量设成与本文件**逐字相同**的值,让两边解析出
+#      同一条映射、被去重合成一条。本文件的价值是把排练端口**钉死在文件里**(环境变量
+#      漏设时能从 config 输出里一眼看出多出来的那条),不是单独就能改掉端口。
+#
+# 🔴 刻意写块式(而不是规格里示意的 `pg: { ports: [...] }` 流式):check-compose-keys.sh
+#    的键抽取按行首缩进走,流式映射里的键抽不出来 —— 写成流式等于这份文件不受键白名单
+#    保护。语义两者完全一样。
+
+services:
+  pg:
+    ports:
+      - "127.0.0.1:15432:5432"
+
+  milvus:
+    ports:
+      - "127.0.0.1:29530:19530"
+      - "127.0.0.1:29091:9091"
+
+  pi:
+    ports:
+      - "127.0.0.1:28080:18080"
+    # 排练栈失败要留现场给 CI 看日志,不要被自动拉起掩盖;也避免 down 之前一直重启。
+    restart: "no"

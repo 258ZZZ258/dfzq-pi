@@ -9,7 +9,8 @@
 //    凭证只留在主节点一处;也避免了非交互 SSH 会话里 git clone 撞认证那类问题。
 //
 // 前置:
-//   插件:SSH Agent
+//   插件:Credentials Binding(Jenkins 建议插件之一,通常自带)
+//         —— 刻意**不用** SSH Agent 插件:内网 Jenkins 连不上更新站、装不了插件。
 //   凭证:"SSH Username with private key",ID = dfzq-build-ssh
 //   全局环境变量:DFZQ_BUILD_HOST 必需;
 //                DFZQ_NODE_HOME / NPM_REGISTRY / DFZQ_BUILD_DIR 可选
@@ -35,8 +36,8 @@ pipeline {
     stages {
         stage('连通性') {
             steps {
-                sshagent(['dfzq-build-ssh']) {
-                    sh 'ssh $SSH_OPTS $BUILD_HOST "hostname && uname -r && df -h /data | tail -1"'
+                withCredentials([sshUserPrivateKey(credentialsId: 'dfzq-build-ssh', keyFileVariable: 'SSH_KEY')]) {
+                    sh 'ssh -i $SSH_KEY $SSH_OPTS $BUILD_HOST "hostname && uname -r && df -h /data | tail -1"'
                 }
             }
         }
@@ -51,15 +52,15 @@ pipeline {
                         > .ci/BUILD_INFO
                     cat .ci/BUILD_INFO
                 '''
-                sshagent(['dfzq-build-ssh']) {
+                withCredentials([sshUserPrivateKey(credentialsId: 'dfzq-build-ssh', keyFileVariable: 'SSH_KEY')]) {
                     // --delete:删掉远端的陈旧文件(等价于旧设计里的 git clean)
                     // --exclude node_modules:既不传也**不删** —— 复用远端已装的依赖,重装一次要几分钟
                     // --exclude .git:构建用不到,省 58M 之外的传输
                     sh '''
-                        ssh $SSH_OPTS $BUILD_HOST "mkdir -p $REMOTE_DIR"
+                        ssh -i $SSH_KEY $SSH_OPTS $BUILD_HOST "mkdir -p $REMOTE_DIR"
                         rsync -az --delete \
                               --exclude='node_modules' --exclude='.git' \
-                              -e "ssh $SSH_OPTS" \
+                              -e "ssh -i $SSH_KEY $SSH_OPTS" \
                               ./ $BUILD_HOST:$REMOTE_DIR/
                     '''
                 }
@@ -70,9 +71,9 @@ pipeline {
             steps {
                 // 把脚本喂给远端 bash,而不是拼进 ssh 的引号里 —— 避免嵌套引号地狱,
                 // 也让 ci/remote-build.sh 能在构建机上单独手工跑一遍排障。
-                sshagent(['dfzq-build-ssh']) {
+                withCredentials([sshUserPrivateKey(credentialsId: 'dfzq-build-ssh', keyFileVariable: 'SSH_KEY')]) {
                     sh '''
-                        ssh $SSH_OPTS $BUILD_HOST \
+                        ssh -i $SSH_KEY $SSH_OPTS $BUILD_HOST \
                           "REMOTE_DIR='$REMOTE_DIR' NODE_HOME='$NODE_HOME' \
                            NPM_REGISTRY='${NPM_REGISTRY:-}' bash -s" \
                           < ci/remote-build.sh
@@ -83,10 +84,10 @@ pipeline {
 
         stage('取回测试报告') {
             steps {
-                sshagent(['dfzq-build-ssh']) {
+                withCredentials([sshUserPrivateKey(credentialsId: 'dfzq-build-ssh', keyFileVariable: 'SSH_KEY')]) {
                     sh '''
                         mkdir -p .ci
-                        scp $SSH_OPTS $BUILD_HOST:$REMOTE_DIR/.ci/junit-*.xml .ci/
+                        scp -i $SSH_KEY $SSH_OPTS $BUILD_HOST:$REMOTE_DIR/.ci/junit-*.xml .ci/
                         ls -l .ci/
                     '''
                 }

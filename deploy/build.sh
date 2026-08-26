@@ -65,7 +65,9 @@ if [ "$MODE" = "base" ]; then
     exit 1
   fi
 
-  AUDIT_SHA="$(git -C "$AUDIT_AI_ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo nogit)"
+  # ⚠ 不用 `git -C`:那是 git 1.8.5 才有的参数,Jenkins 主节点(RHEL 7.4)是
+  #   1.8.3.1,直接报 `Unknown option: -C`(2026-08-26 stage 3 实测)。子 shell cd 全版本通吃。
+  AUDIT_SHA="$( (cd "$AUDIT_AI_ROOT" && git rev-parse --short=7 HEAD) 2>/dev/null || echo nogit)"
   TAG="${BASE_TAG:-$(date +%Y%m%d)-${AUDIT_SHA}}"
   IMAGE="${REGISTRY}/dfzq-pi-base:${TAG}"
 
@@ -98,7 +100,8 @@ fi
 
 # ---- 薄层(test / runtime)-------------------------------------------------
 [ -n "${BASE_TAG:-}" ] || { echo "✗ 需要 BASE_TAG=<底座 tag>" >&2; exit 1; }
-GIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD)"
+# 同上:不用 git -C,兼容主节点的 git 1.8.3.1
+GIT_SHA="$( (cd "$REPO_ROOT" && git rev-parse --short=7 HEAD) )"
 
 BUILD_ARGS=(
   --build-arg "BASE_TAG=${BASE_TAG}"

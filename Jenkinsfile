@@ -80,12 +80,25 @@ pipeline {
                     # 并把版本打进日志记账 —— stage 2 那个静态检查存在的理由就是「主节点
                     # 不一定是 1.29.2」,这一行是判断那个缺口有多大的现场证据。
                     mkdir -p .ci
+                    # 🔴 上一版流水线的旧 junit 报告可能还躺在 workspace 里(2026-08-26 首跑实测:
+                    #    stage 3 被跳过时,post 的 junit 捡到 1 天前的旧文件,报一条
+                    #    "Test reports were found but none of them are new" 的糊涂错)。
+                    #    在这里清掉:早期 stage 失败时 post 只会说"没有报告",不会说胡话。
+                    rm -f .ci/junit-*.xml
+                    # 🔴 探测不能只看退出码:Docker 18.06(master 实测就是它)对
+                    #    `docker compose version` 这种未知命令**打印整页帮助并退出 0**,
+                    #    首跑就是被这个骗过、把 "docker compose" 当可用写了进去,
+                    #    到 post 里才炸出 `unknown shorthand flag: 'f'`。
+                    #    必须验证输出里真有 "Docker Compose" 字样。
                     if command -v docker-compose >/dev/null 2>&1; then
                         echo "docker-compose" > .ci/compose-cmd
-                    elif docker compose version >/dev/null 2>&1; then
+                    elif docker compose version 2>/dev/null | grep -q "Docker Compose"; then
                         echo "docker compose" > .ci/compose-cmd
                     else
-                        echo "✗ 主节点既没有 docker-compose 独立二进制,也没有 docker compose 子命令"
+                        echo "✗ 主节点既没有 docker-compose 独立二进制,也没有真正可用的 docker compose 子命令"
+                        echo "  修法(推荐):从生产机拷 1.29.2 —— 和生产同版本,排练顺带验掉 1.29.2 的解析行为:"
+                        echo "    scp root@<生产机>:/usr/local/bin/docker-compose /usr/local/bin/docker-compose"
+                        echo "    chmod +x /usr/local/bin/docker-compose && docker-compose version"
                         exit 1
                     fi
                     COMPOSE="$(cat .ci/compose-cmd)"
@@ -145,7 +158,15 @@ pipeline {
                     #    check-compose-keys.sh 按 1.29.2 真二进制 compose_spec.json 抽出的
                     #    顶层/服务级/卷级键白名单校验两份 compose 文件,白名单外的键一律翻红。
                     #    (白名单出处与 ~/dfzq-predeploy/tests/test-stack.sh Part 6 同一份)
-                    bash deploy/check-compose-keys.sh
+                    #
+                    # 🔴 在**底座容器里**跑,不在宿主上跑:check-compose-keys.sh 要 python3,
+                    #    而 master 没有(RHEL 7.4,2026-08-26 首跑实测翻红)。底座里有
+                    #    python3,master 本地就有这个镜像(底座就是从这台机 push 的)——
+                    #    这才符合「主节点只要有 Docker 就够」的设计,不给宿主添装机依赖。
+                    #    :ro,z —— 只读挂载;z 兼容 SELinux enforcing 的宿主,disabled 时是空操作。
+                    IMG="${REGISTRY}/dfzq-pi-base:${BASE_TAG}"
+                    docker image inspect "$IMG" >/dev/null 2>&1 || docker pull "$IMG"
+                    docker run --rm -v "$PWD":/w:ro,z -w /w --entrypoint bash "$IMG" deploy/check-compose-keys.sh
                 '''
             }
         }
@@ -379,14 +400,22 @@ REHEARSAL_ENV
             '''
             archiveArtifacts artifacts: '.ci/junit-*.xml,.ci/BUILD_INFO',
                              allowEmptyArchive: true
-            // allowEmptyResults:false —— 没有测试报告本身就该是红的,
-            // 否则「测试其实没跑到」会伪装成绿色构建。
-            junit allowEmptyResults: false, testResults: '.ci/junit-*.xml'
+            // 「没有测试报告就该是红的」这条纪律由 stage 3 自己守(它跑完当场断言
+            // junit-*.xml 真取到了)。post 里的 junit 只在报告存在时喂 —— stage 1/2 就
+            // 失败的构建本来就是红的,这里再抛一条 "no report" 只会把真报错挤下屏
+            // (2026-08-26 首跑实测:stage 2 红,post 的 junit 又叠了一条 AbortException)。
+            script {
+                if (fileExists('.ci/junit-main.xml')) {
+                    junit allowEmptyResults: false, testResults: '.ci/junit-*.xml'
+                } else {
+                    echo '无测试报告(stage 3 未运行到)—— 跳过 junit,红因见上面第一个失败的 stage'
+                }
+            }
         }
         failure {
             echo '''构建失败 —— 看第一个红色 stage:
-  1 环境自检      主节点缺 Docker/compose,或没 docker login JFrog,或 DFZQ_BASE_TAG 没配
-  2 compose 静态检查   compose 文件里出现了 1.29.2 白名单外的键(典型:顶层 name:)
+  1 环境自检      主节点缺 docker-compose(从生产机 scp 1.29.2 过来),或没 docker login JFrog,或 DFZQ_BASE_TAG 没配
+  2 compose 静态检查   compose 文件里出现 1.29.2 白名单外的键(典型:顶层 name:);或底座镜像拉不到(检查在底座容器里跑)
   3 构建 + 单测   六条 check / tsgo / vitest 之一没过,或底座镜像拉不到
   4 构建交付镜像  runtime 阶段的两条构建期断言(postgres 装没装上 / providers/data 在不在)
   5 排练栈        数据层没到 healthy、init.sh 三段之一失败、或 /healthz 120s 没绿

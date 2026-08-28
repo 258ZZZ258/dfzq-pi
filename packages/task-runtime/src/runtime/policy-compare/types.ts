@@ -38,6 +38,9 @@ export interface InlinePolicyDocument {
 	logicalId?: string;
 	title: string;
 	docNo?: string;
+	// 校验层(runtime.ts:75)接受它、构造层(:113)透传它、version-diff 的
+	// versionMetadata 消费它 —— 上游 400d6826 漏在接口上声明,tsgo 因此翻红。
+	issueDate?: string;
 	clauses: ExternalClause[];
 }
 

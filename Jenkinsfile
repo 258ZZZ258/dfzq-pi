@@ -6,7 +6,12 @@
 //
 // 前置(详见交接文档 §2):
 //   · 主节点要有 Docker、docker-compose 1.29.2(从生产机 scp)、已 docker login JFrog
-//   · 全局环境变量 DFZQ_BASE_TAG 必需;DFZQ_REGISTRY / NPM_REGISTRY / DFZQ_PLATFORM 可选
+//   · 全局环境变量(三层改造 2026-08-28 后):
+//       DFZQ_AUDIT_AI_GIT  内网 Git 的 audit-ai 仓地址 —— stage 0 据此自动定/造底座,
+//                          设了它就**不再需要人工维护 DFZQ_BASE_TAG**
+//       PIP_INDEX_URL      内网 pypi(Artifactory),stage 0 现造底座时用
+//       NPM_REGISTRY       内网 npm 源
+//       DFZQ_REGISTRY / DFZQ_PLATFORM / DFZQ_BASE_TAG(过渡期兜底)可选
 //   · 主节点**不需要**:Node、python3、rsync、任何 SSH 凭证
 
 pipeline {
@@ -27,6 +32,7 @@ pipeline {
     }
 
     stages {
+        stage('0 底座')            { steps { sh 'bash ci/00-ensure-base.sh' } }
         stage('1 环境自检')        { steps { sh 'bash ci/01-check-env.sh' } }
         stage('2 compose 静态检查') { steps { sh 'bash ci/02-check-compose.sh' } }
         stage('3 构建 + 单测')      { steps { sh 'bash ci/03-build-test.sh' } }
@@ -67,7 +73,8 @@ pipeline {
         }
         failure {
             echo '''构建失败 —— 看第一个红色 stage(每个脚本的失败提示里带修法):
-  1 ci/01-check-env.sh      缺 docker-compose(从生产机 scp 1.29.2)/ 没 login JFrog / DFZQ_BASE_TAG 没配
+  0 ci/00-ensure-base.sh    audit-ai 拉不到 / L0(dfzq-runtime-base)不在 / 内网 pip 装不出 venv
+  1 ci/01-check-env.sh      缺 docker-compose(从生产机 scp 1.29.2)/ 没 login JFrog
   2 ci/02-check-compose.sh  compose 文件出现 1.29.2 白名单外的键(典型:顶层 name:),或底座镜像拉不到
   3 ci/03-build-test.sh     六条 check / tsgo / vitest 之一没过
   4 ci/04-build-image.sh    runtime 阶段构建期断言(postgres / providers/data)

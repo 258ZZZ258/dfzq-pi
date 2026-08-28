@@ -1,0 +1,31 @@
+# dfzq-runtime-base(L0)—— 三层镜像的最底层:Node 22 + apt 包,不含任何业务内容。
+#
+# 规格:dfzq-pi开发任务/骨架/规格-容器化与一键部署.md(三层改造 2026-08-28)
+#
+# 🔴 为什么单独一层:整个镜像链里**只有 apt 这一步必须在外网做**(内网无 Debian 仓,
+#    而 node:22-bookworm-slim 里 curl/python3/ca-certificates 一个都没有)。
+#    把它剥出来单独成层后,audit-ai 源码 + venv(L1,pip 走内网 Artifactory)与
+#    pi 薄层(L2)都能在内网 Jenkins 构建 —— audit-ai 更新从"重造底座+搬 490MB"
+#    变成"推个 bundle,流水线自动重造 L1"。
+#
+# 本层几乎永不变:只在换 Node 版本或增删 apt 包时重造,tag 由人工递增(node22-r1 →
+# node22-r2 …),写死在 ci/lib.sh 的缺省值里,改 tag 走 git。
+#
+# 构建(外网):PLATFORM=linux/amd64 ./deploy/build.sh --runtime-base
+# 交付:docker save | gzip → 搬入内网 → docker load → docker push(约 100MB 级)
+
+ARG NODE_BASE=node:22-bookworm-slim
+FROM ${NODE_BASE}
+
+# curl:HEALTHCHECK 与 init 用。python3.11-venv:bookworm 自带 3.11,只缺 venv 模块。
+# ARG APT_MIRROR:apt 源可替换(本机开发用就近镜像;这层本来就只在外网构建)。
+# -o Acquire::Retries=3:apt 默认不重试,单个包一次 502 就整条 RUN 失败(实测撞过)。
+ARG APT_MIRROR=deb.debian.org
+RUN set -eux; \
+    if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+      sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    apt-get -o Acquire::Retries=3 update; \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+      ca-certificates curl python3.11-venv; \
+    rm -rf /var/lib/apt/lists/*

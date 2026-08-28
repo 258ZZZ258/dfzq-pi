@@ -22,7 +22,12 @@ die()  { printf '[ci] ✗ %s\n' "$*" >&2; exit 1; }
 
 # ---- 参数(全部可被环境变量覆盖)---------------------------------------------
 REGISTRY="${REGISTRY:-${DFZQ_REGISTRY:-jfrog.orientsec.com.cn/dev7-docker-release-local}}"
+# L0 tag:人工递增(node22-r1 → r2…),改这个缺省值走 git。
+RUNTIME_BASE_TAG="${RUNTIME_BASE_TAG:-${DFZQ_RUNTIME_BASE_TAG:-node22-r1}}"
+# L1 tag 解析顺序:显式 env > ci/00-ensure-base.sh 写的 .ci/BASE_TAG > 空(require 时报错)。
 BASE_TAG="${BASE_TAG:-${DFZQ_BASE_TAG:-}}"
+BASE_TAG_FROM_FILE=0
+if [ -z "$BASE_TAG" ] && [ -f .ci/BASE_TAG ]; then BASE_TAG="$(cat .ci/BASE_TAG)"; BASE_TAG_FROM_FILE=1; fi
 PLATFORM="${PLATFORM:-${DFZQ_PLATFORM:-}}"
 
 # 排练栈:固定 project 名 + 固定端口 ⇒ 必须串行(Jenkins 靠 disableConcurrentBuilds,
@@ -58,7 +63,7 @@ compose_cmd() {
 }
 
 require_base_tag() {
-  [ -n "$BASE_TAG" ] || die "BASE_TAG 未设置 —— 薄层镜像的 FROM 需要底座 tag。
-  Jenkins:在「系统配置 → 全局属性 → 环境变量」加 DFZQ_BASE_TAG(形如 20260825-f566bbe)。
-  手工跑:BASE_TAG=20260825-f566bbe bash ci/$(basename "$0")"
+  [ -n "$BASE_TAG" ] || die "BASE_TAG 未定 —— 正常情况它由 ci/00-ensure-base.sh 算出并写进 .ci/BASE_TAG。
+  先跑:bash ci/00-ensure-base.sh(CI 由 stage 0 自动跑)
+  或显式指定:BASE_TAG=<audit-ai sha7> bash ci/$(basename "$0")"
 }

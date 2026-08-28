@@ -24,6 +24,20 @@ export interface ExternalDocument {
 	uploadId: string;
 	title: string;
 	docNo?: string;
+	issueDate?: string;
+	clauses: ExternalClause[];
+}
+
+/**
+ * A selected document read by Java from the primary business database.
+ * Pi receives the normalized clauses and never needs database credentials or
+ * a second catalogue round trip to resolve this document.
+ */
+export interface InlinePolicyDocument {
+	documentId: string;
+	logicalId?: string;
+	title: string;
+	docNo?: string;
 	clauses: ExternalClause[];
 }
 
@@ -144,10 +158,12 @@ export interface CoveragePayload {
 	direction: "external_to_internal" | "internal_to_external";
 	external?:
 		| { source: "upload"; objectKey: string; uploadId: string; filename: string }
-		| { source: "library"; docVersionId: string };
+		| { source: "library"; docVersionId: string }
+		| { source: "inline"; document: InlinePolicyDocument };
 	internal?:
 		| { source: "upload"; objectKey: string; uploadId: string; filename: string }
-		| { source: "library"; docVersionId: string };
+		| { source: "library"; docVersionId: string }
+		| { source: "inline"; document: InlinePolicyDocument };
 	scope: {
 		organizations?: string[];
 		bizDomains?: string[];
@@ -159,8 +175,9 @@ export interface CoveragePayload {
 
 /** 同一逻辑制度的新旧版本条款差异。此路径不使用模型或 MCP。 */
 export interface VersionDiffPayload {
-	newDocVersionId: string;
-	oldDocVersionId: string;
+	corpusType: "internal" | "external";
+	newDocument: InlinePolicyDocument;
+	oldDocument: InlinePolicyDocument;
 }
 
 export interface VersionDiffDocument {

@@ -31,6 +31,30 @@ describe("parseCoveragePayload", () => {
 		expect(got.external).toEqual({ source: "library", docVersionId: "DV-1" });
 	});
 
+	it("Java 主库读取的外规条款可以 inline 下传，不要求 Pi 再查询制度目录", () => {
+		const got = parseCoveragePayload({
+			...ok,
+			external: {
+				source: "inline",
+				document: {
+					documentId: "DM-EXT-2026",
+					title: "达梦外规",
+					docNo: "证监规〔2026〕1号",
+					clauses: [{ seq: 1, clausePath: "第一条", text: "上市公司应当建立内部控制制度。" }],
+				},
+			},
+		});
+		expect(got.external).toEqual({
+			source: "inline",
+			document: {
+				documentId: "DM-EXT-2026",
+				title: "达梦外规",
+				docNo: "证监规〔2026〕1号",
+				clauses: [{ seq: 1, clausePath: "第一条", text: "上市公司应当建立内部控制制度。" }],
+			},
+		});
+	});
+
 	it("知识库内规 payload 自动切换为内规追踪外规版本", () => {
 		const got = parseCoveragePayload({
 			direction: "internal_to_external",
@@ -537,7 +561,7 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 	 * 四行整个删掉,当时没有任何测试会红。收窄参数丢一个,M1 就按「不限」处理,比对范围会从
 	 * 「费用报销这一个域」悄悄放大到全部内规,而调用方看到的是一次正常完成的 run。
 	 */
-	it("批量候选工具不接收前端业务范围，检索范围由 audit-ai 权限域固定为内规", async () => {
+	it("批量候选工具接收目标内部知识库的有效期范围", async () => {
 		const { runtime, candidateBatchArgs } = await buildRuntime({
 			payloadOverride: {
 				scope: {
@@ -560,6 +584,8 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 				{ clause_path: "第五条", text: "外规第五条正文应当" },
 				{ clause_path: "第十条", text: "外规第十条正文不得" },
 			],
+			effective_from: "2024-01-01",
+			effective_to: "2026-12-31",
 		});
 	});
 

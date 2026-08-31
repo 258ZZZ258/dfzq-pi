@@ -50,6 +50,21 @@ pipeline {
             }
             steps { sh 'bash ci/06-push.sh' }
         }
+        stage('7 部署到生产') {
+            // D-14 全自动 CD:与 stage 6 同一道分支门;暂停用全局变量 DFZQ_NO_PROD_DEPLOY=1。
+            // 74 未完成首次容器化切换时,ci/07 响亮跳过而不是红。
+            when {
+                expression {
+                    def b = env.BRANCH_NAME ?: env.GIT_BRANCH ?: ''
+                    return b == 'dfzq/intranet' || b.endsWith('/dfzq/intranet')
+                }
+            }
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'dfzq-build-ssh', keyFileVariable: 'SSH_KEY')]) {
+                    sh 'bash ci/07-deploy-prod.sh'
+                }
+            }
+        }
     }
 
     post {
@@ -79,7 +94,8 @@ pipeline {
   3 ci/03-build-test.sh     六条 check / tsgo / vitest 之一没过
   4 ci/04-build-image.sh    runtime 阶段构建期断言(postgres / providers/data)
   5 ci/05-rehearse.sh       数据层没 healthy、init 三段之一失败、或 /healthz 120s 没绿
-  6 ci/06-push.sh           push 被 registry 拒(凭证过期?仓路径不对?)'''
+  6 ci/06-push.sh           push 被 registry 拒(凭证过期?仓路径不对?)
+  7 ci/07-deploy-prod.sh    连不上 74(凭证 dfzq-build-ssh?)/ 74 上 deploy.sh 红(看它打印的锚点)'''
         }
     }
 }

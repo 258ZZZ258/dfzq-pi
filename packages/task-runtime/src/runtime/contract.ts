@@ -27,6 +27,16 @@ export interface RunUsage {
 	cost: number;
 }
 
+/**
+ * 任务执行期间已从权威检索源取回的正文。它不是模型生成的 `answer.basis`，
+ * 只供受信下游在展示「查看原文」时复用，避免为同一批结果再发起一次回查。
+ */
+export interface SourceDetail {
+	clause_id: string;
+	text: string;
+	[key: string]: unknown;
+}
+
 export interface RunResult {
 	runId: string;
 	/** 产生本次 run 的 RuntimeSpec.id。与 RuntimeEvent.specId 同源,让结果与事件流对得上;
@@ -69,6 +79,11 @@ export interface RunResult {
 	 * **不在这一层重新校验 schema**:C6 是唯一真相源,再验一遍等于两处定义、必然漂移。
 	 */
 	answer?: unknown;
+	/**
+	 * 与本次结果一起返回的权威条款正文。仅在运行路径已经实际取到正文时存在；
+	 * 不参与模型输出契约，也不改变 `answer.basis` 的八字段约束。
+	 */
+	sourceDetails?: SourceDetail[];
 }
 
 export interface RuntimeSnapshot {

@@ -4,7 +4,7 @@
   "required": ["compareType", "metrics", "rows", "finish_reason"],
   "additionalProperties": false,
   "properties": {
-    "compareType": { "const": "external_to_internal" },
+    "compareType": { "enum": ["external_to_internal", "internal_to_external"] },
     "metrics": {
       "type": "object",
       "required": ["checked", "missing", "conflict", "covered", "unmatched", "linked"],
@@ -28,7 +28,7 @@
           "index": { "type": "integer", "minimum": 1 },
           "tabKey": { "enum": ["missing", "error"] },
           "conflictType": { "type": "string", "minLength": 1 },
-          "externalClause": { "type": "string", "minLength": 1 },
+          "externalClause": { "type": "string" },
           "internalClause": { "type": "string" },
           "judgement": { "type": "string", "minLength": 1 },
           "source": { "type": "string" },
@@ -42,7 +42,12 @@
               "internalSourceCode": { "type": ["string", "null"] },
               "externalClausePath": { "type": ["string", "null"] },
               "externalDocNo": { "type": ["string", "null"] },
-              "matchKind": { "enum": ["exact", "normalized", "doc_level"] }
+              "matchKind": { "enum": ["exact", "normalized", "doc_level", "semantic_retrieval"] },
+              "referenceId": { "type": "string" },
+              "referenceSurface": { "type": "string" },
+              "citedDocVersionId": { "type": ["string", "null"] },
+              "currentDocVersionId": { "type": ["string", "null"] },
+              "changeKind": { "enum": ["unresolved", "version_changed", "clause_changed"] }
             }
           }
         }

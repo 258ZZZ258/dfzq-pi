@@ -31,7 +31,7 @@ const SCHEMA = {
 	},
 } as const;
 
-const body = (o: Record<string, unknown>) => "```json\n" + JSON.stringify(o) + "\n```";
+const body = (o: Record<string, unknown>) => `\`\`\`json\n${JSON.stringify(o)}\n\`\`\``;
 const GOOD = { conclusion: "c", finish_reason: "stop", confidence: "high", basis: [{ clause_id: "A-1" }] };
 
 describe("judgeFastPathOutput", () => {
@@ -396,6 +396,9 @@ describe("createFastPathRuntime", () => {
 
 		expect(got.verdict).toEqual({ accept: true });
 		expect(got.result.status).toBe("completed");
+		expect(got.result.sourceDetails).toEqual(
+			expect.arrayContaining([expect.objectContaining({ clause_id: "C-1", text: "C-1 的正文" })]),
+		);
 		// 抢跑一次 + 改写词一次 + 批量取正文一次
 		expect(calls.map((c) => c.name)).toEqual(["search_policy", "search_policy", "get_clause_detail"]);
 		// 批量:一次调用带上全部 clause_id,不是一条一次

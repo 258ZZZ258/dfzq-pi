@@ -1,3 +1,5 @@
+import type { CoverageResult, VersionDiffResult } from "./types.ts";
+
 /**
  * audit-ai 的 `POST /v1/documents:process` 客户端。
  * 契约主本:dfzq-audit-ai `docs/upload-processing-docs/SPEC-UPLOAD-PROCESSING.md` §5.1。
@@ -21,6 +23,51 @@ export interface ProcessDocumentResponse {
 	pageCount: number | null;
 	chunkCount: number;
 	status: string;
+}
+
+export interface ExternalDocumentCatalogItem {
+	logicalId: string;
+	docVersionId: string;
+	title: string;
+	versionLabel: string;
+	versionStatus: string;
+	versionCode: string | null;
+	versionDisplayName: string | null;
+	revisionNo: number | null;
+	docNumber: string | null;
+	issueDate: string | null;
+	effectiveDate: string | null;
+	supersedesVersionId: string | null;
+	sourceDocId: string | null;
+}
+
+export interface LibraryExternalDocument {
+	uploadId: string;
+	title: string;
+	docNo?: string;
+	clauses: Array<{
+		seq: number;
+		clausePath: string;
+		text: string;
+		pageStart?: number;
+		pageEnd?: number;
+	}>;
+}
+
+export type InternalDocumentCatalogItem = ExternalDocumentCatalogItem;
+export type LibraryInternalDocument = LibraryExternalDocument;
+
+export interface InternalReferenceVersionCheckRequest {
+	docVersionId?: string;
+	clauses?: Array<{ chunkId: string; clausePath: string | null; text: string }>;
+	effectiveDateRange?: [string, string];
+	permTags?: string[];
+}
+
+export interface VersionDiffRequest {
+	newDocVersionId: string;
+	oldDocVersionId: string;
+	permTags?: string[];
 }
 
 /** `documents:process` 的默认超时。该端点同步解析 PDF,给得比常规 HTTP 调用宽。 */
@@ -47,6 +94,12 @@ export interface DocumentsClientOptions {
 
 export interface DocumentsClient {
 	process(req: ProcessDocumentRequest): Promise<ProcessDocumentResponse>;
+	listExternalDocuments?(permTags?: string[], includeHistory?: boolean): Promise<ExternalDocumentCatalogItem[]>;
+	getExternalDocument?(docVersionId: string, permTags?: string[]): Promise<LibraryExternalDocument>;
+	listInternalDocuments?(permTags?: string[], includeHistory?: boolean): Promise<InternalDocumentCatalogItem[]>;
+	getInternalDocument?(docVersionId: string, permTags?: string[]): Promise<LibraryInternalDocument>;
+	checkInternalReferenceVersions?(req: InternalReferenceVersionCheckRequest): Promise<CoverageResult>;
+	compareVersions?(req: VersionDiffRequest): Promise<VersionDiffResult>;
 }
 
 /** 请求体字段名映射。抽成纯函数是因为「corpusHint 缺省时不放这个键」这条契约
@@ -68,8 +121,22 @@ export function createDocumentsClient(options: DocumentsClientOptions): Document
 		throw new Error("createDocumentsClient: internalToken 为空 —— 鉴权未配置,拒绝构造(fail-closed)");
 	}
 	const doFetch = options.fetchImpl ?? fetch;
-	const url = `${options.baseUrl.replace(/\/+$/, "")}/v1/documents:process`;
+	const baseUrl = options.baseUrl.replace(/\/+$/, "");
+	const url = `${baseUrl}/v1/documents:process`;
 	const timeoutMs = options.timeoutMs ?? DEFAULT_PROCESS_TIMEOUT_MS;
+
+	async function getJson(path: string): Promise<unknown> {
+		const res = await doFetch(`${baseUrl}${path}`, {
+			headers: { Accept: "application/json", "X-Internal-Token": options.internalToken },
+		});
+		const text = await res.text().catch(() => "");
+		if (!res.ok) throw new Error(`documents library 返回 ${res.status}:${text.slice(0, 500)}`);
+		try {
+			return JSON.parse(text);
+		} catch {
+			throw new Error(`documents library 响应不是合法 JSON:${text.slice(0, 500)}`);
+		}
+	}
 
 	return {
 		async process(req) {
@@ -120,6 +187,250 @@ export function createDocumentsClient(options: DocumentsClientOptions): Document
 					chunkCount: typeof raw.chunk_count === "number" ? raw.chunk_count : 0,
 					status: String(raw.status ?? ""),
 				};
+			} finally {
+				clearTimeout(timer);
+			}
+		},
+		async listExternalDocuments(permTags = [], includeHistory = false) {
+			const query = new URLSearchParams();
+			for (const tag of permTags) query.append("perm_tag", tag);
+			if (includeHistory) query.set("include_history", "true");
+			const suffix = query.toString() ? `?${query.toString()}` : "";
+			const raw = await getJson(`/v1/library/external-documents${suffix}`);
+			if (!Array.isArray(raw)) throw new Error("documents library 目录响应必须是数组");
+			return raw.map((item) => {
+				const row = item as Record<string, unknown>;
+				return {
+					logicalId: String(row.logical_id ?? ""),
+					docVersionId: String(row.doc_version_id ?? ""),
+					title: String(row.title ?? ""),
+					versionLabel: String(row.version_label ?? "当前有效版本"),
+					versionStatus: String(row.version_status ?? ""),
+					versionCode: typeof row.version_code === "string" ? row.version_code : null,
+					versionDisplayName: typeof row.version_display_name === "string" ? row.version_display_name : null,
+					revisionNo: typeof row.revision_no === "number" ? row.revision_no : null,
+					docNumber: typeof row.doc_number === "string" ? row.doc_number : null,
+					issueDate: typeof row.issue_date === "string" ? row.issue_date : null,
+					effectiveDate: typeof row.effective_date === "string" ? row.effective_date : null,
+					supersedesVersionId: typeof row.supersedes_version_id === "string" ? row.supersedes_version_id : null,
+					sourceDocId: typeof row.source_doc_id === "string" ? row.source_doc_id : null,
+				};
+			});
+		},
+		async getExternalDocument(docVersionId, permTags = []) {
+			const query = new URLSearchParams();
+			for (const tag of permTags) query.append("perm_tag", tag);
+			const suffix = query.toString() ? `?${query.toString()}` : "";
+			const raw = (await getJson(
+				`/v1/library/external-documents/${encodeURIComponent(docVersionId)}${suffix}`,
+			)) as Record<string, unknown>;
+			if (!Array.isArray(raw.clauses)) throw new Error("documents library 文档响应缺少 clauses");
+			return {
+				uploadId: `library:${docVersionId}`,
+				title: String(raw.title ?? docVersionId),
+				docNo: typeof raw.doc_no === "string" ? raw.doc_no : undefined,
+				clauses: raw.clauses.map((item) => {
+					const clause = item as Record<string, unknown>;
+					return {
+						seq: Number(clause.seq ?? 0),
+						clausePath: String(clause.clause_path ?? ""),
+						text: String(clause.text ?? ""),
+						pageStart: typeof clause.page_start === "number" ? clause.page_start : undefined,
+						pageEnd: typeof clause.page_end === "number" ? clause.page_end : undefined,
+					};
+				}),
+			};
+		},
+		async listInternalDocuments(permTags = [], includeHistory = false) {
+			const query = new URLSearchParams();
+			for (const tag of permTags) query.append("perm_tag", tag);
+			if (includeHistory) query.set("include_history", "true");
+			const suffix = query.toString() ? `?${query.toString()}` : "";
+			const raw = await getJson(`/v1/library/internal-documents${suffix}`);
+			if (!Array.isArray(raw)) throw new Error("documents library 内规目录响应必须是数组");
+			return raw.map((item) => {
+				const row = item as Record<string, unknown>;
+				return {
+					logicalId: String(row.logical_id ?? ""),
+					docVersionId: String(row.doc_version_id ?? ""),
+					title: String(row.title ?? ""),
+					versionLabel: String(row.version_label ?? "当前有效版本"),
+					versionStatus: String(row.version_status ?? ""),
+					versionCode: typeof row.version_code === "string" ? row.version_code : null,
+					versionDisplayName: typeof row.version_display_name === "string" ? row.version_display_name : null,
+					revisionNo: typeof row.revision_no === "number" ? row.revision_no : null,
+					docNumber: typeof row.doc_number === "string" ? row.doc_number : null,
+					issueDate: typeof row.issue_date === "string" ? row.issue_date : null,
+					effectiveDate: typeof row.effective_date === "string" ? row.effective_date : null,
+					supersedesVersionId: typeof row.supersedes_version_id === "string" ? row.supersedes_version_id : null,
+					sourceDocId: typeof row.source_doc_id === "string" ? row.source_doc_id : null,
+				};
+			});
+		},
+		async getInternalDocument(docVersionId, permTags = []) {
+			const query = new URLSearchParams();
+			for (const tag of permTags) query.append("perm_tag", tag);
+			const suffix = query.toString() ? `?${query.toString()}` : "";
+			const raw = (await getJson(
+				`/v1/library/internal-documents/${encodeURIComponent(docVersionId)}${suffix}`,
+			)) as Record<string, unknown>;
+			if (!Array.isArray(raw.clauses)) throw new Error("documents library 内规文档响应缺少 clauses");
+			return {
+				uploadId: `library:${docVersionId}`,
+				title: String(raw.title ?? docVersionId),
+				docNo: typeof raw.doc_no === "string" ? raw.doc_no : undefined,
+				clauses: raw.clauses.map((item) => {
+					const clause = item as Record<string, unknown>;
+					return {
+						seq: Number(clause.seq ?? 0),
+						clausePath: String(clause.clause_path ?? ""),
+						text: String(clause.text ?? ""),
+						pageStart: typeof clause.page_start === "number" ? clause.page_start : undefined,
+						pageEnd: typeof clause.page_end === "number" ? clause.page_end : undefined,
+					};
+				}),
+			};
+		},
+		async checkInternalReferenceVersions(req) {
+			const body: Record<string, unknown> = { perm_tags: req.permTags ?? [] };
+			if (req.docVersionId) body.doc_version_id = req.docVersionId;
+			if (req.clauses) {
+				body.clauses = req.clauses.map((clause) => ({
+					chunk_id: clause.chunkId,
+					clause_path: clause.clausePath,
+					text: clause.text,
+				}));
+			}
+			if (req.effectiveDateRange) {
+				body.effective_from = req.effectiveDateRange[0];
+				body.effective_to = req.effectiveDateRange[1];
+			}
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), timeoutMs);
+			try {
+				const res = await doFetch(`${baseUrl}/v1/internal-reference-version-check`, {
+					method: "POST",
+					headers: {
+						Accept: "application/json",
+						"content-type": "application/json",
+						"X-Internal-Token": options.internalToken,
+					},
+					body: JSON.stringify(body),
+					signal: controller.signal,
+				});
+				const text = await res.text();
+				if (!res.ok) throw new Error(`internal reference check 返回 ${res.status}:${text.slice(0, 500)}`);
+				try {
+					return JSON.parse(text) as CoverageResult;
+				} catch {
+					throw new Error(`internal reference check 响应不是合法 JSON:${text.slice(0, 500)}`);
+				}
+			} catch (cause) {
+				if (controller.signal.aborted) {
+					throw new Error(`internal reference check 超时(${timeoutMs}ms)—— 已中断请求`);
+				}
+				throw cause;
+			} finally {
+				clearTimeout(timer);
+			}
+		},
+		async compareVersions(req) {
+			if (!req.newDocVersionId || !req.oldDocVersionId || req.newDocVersionId === req.oldDocVersionId) {
+				throw new Error("版本差异比对需要两个不同的知识库版本");
+			}
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), timeoutMs);
+			try {
+				const res = await doFetch(`${baseUrl}/v1/library/version-diff`, {
+					method: "POST",
+					headers: {
+						Accept: "application/json",
+						"content-type": "application/json",
+						"X-Internal-Token": options.internalToken,
+					},
+					body: JSON.stringify({
+						new_doc_version_id: req.newDocVersionId,
+						old_doc_version_id: req.oldDocVersionId,
+						perm_tags: req.permTags ?? [],
+					}),
+					signal: controller.signal,
+				});
+				const text = await res.text();
+				if (!res.ok) throw new Error(`version diff 返回 ${res.status}:${text.slice(0, 500)}`);
+				let raw: Record<string, unknown>;
+				try {
+					raw = JSON.parse(text) as Record<string, unknown>;
+				} catch {
+					throw new Error(`version diff 响应不是合法 JSON:${text.slice(0, 500)}`);
+				}
+				if (raw.compare_type !== "version_diff" || !Array.isArray(raw.rows)) {
+					throw new Error("version diff 响应不符合版本差异契约");
+				}
+				const document = (value: unknown) => {
+					const item = value as Record<string, unknown>;
+					return {
+						docVersionId: String(item.doc_version_id ?? ""),
+						title: String(item.title ?? ""),
+						versionLabel: String(item.version_label ?? ""),
+						versionStatus: String(item.version_status ?? ""),
+						versionCode: typeof item.version_code === "string" ? item.version_code : null,
+						versionDisplayName: typeof item.version_display_name === "string" ? item.version_display_name : null,
+						revisionNo: typeof item.revision_no === "number" ? item.revision_no : null,
+						issueDate: typeof item.issue_date === "string" ? item.issue_date : null,
+						effectiveDate: typeof item.effective_date === "string" ? item.effective_date : null,
+					};
+				};
+				const metrics = raw.metrics as Record<string, unknown>;
+				return {
+					compareType: "version_diff",
+					corpusType: raw.corpus_type === "internal" ? "internal" : "external",
+					logicalId: String(raw.logical_id ?? ""),
+					newVersion: document(raw.new_version),
+					oldVersion: document(raw.old_version),
+					metrics: {
+						added: Number(metrics?.added ?? 0),
+						removed: Number(metrics?.removed ?? 0),
+						changed: Number(metrics?.changed ?? 0),
+						moved: Number(metrics?.moved ?? 0),
+						total: Number(metrics?.total ?? 0),
+					},
+					rows: raw.rows.map((item, index) => {
+						const row = item as Record<string, unknown>;
+						const tabKey =
+							row.tab_key === "added" || row.tab_key === "removed" || row.tab_key === "moved"
+								? row.tab_key
+								: "changed";
+						return {
+							index: Number(row.index ?? index + 1),
+							tabKey,
+							place: String(row.clause_path ?? "未标注条款"),
+							oldPlace: typeof row.old_clause_path === "string" ? row.old_clause_path : undefined,
+							newPlace: typeof row.new_clause_path === "string" ? row.new_clause_path : undefined,
+							policyA: String(row.new_text ?? ""),
+							policyB: String(row.old_text ?? ""),
+							level:
+								tabKey === "added"
+									? "新增"
+									: tabKey === "removed"
+										? "删除"
+										: tabKey === "moved"
+											? "位置调整"
+											: "修改",
+							description:
+								tabKey === "added"
+									? "新版本新增条款"
+									: tabKey === "removed"
+										? "新版本删除条款"
+										: tabKey === "moved"
+											? `正文未变：${String(row.old_clause_path ?? "旧位置")} → ${String(row.new_clause_path ?? "新位置")}`
+											: "新旧版本条款内容变更",
+						};
+					}),
+					finish_reason: "stop",
+				};
+			} catch (cause) {
+				if (controller.signal.aborted) throw new Error(`version diff 超时(${timeoutMs}ms)—— 已中断请求`);
+				throw cause;
 			} finally {
 				clearTimeout(timer);
 			}

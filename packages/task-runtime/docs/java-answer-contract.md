@@ -123,6 +123,12 @@ export function toWireResult(result: RunResult): RunResult {
 }
 ```
 
+`source_details` 是一个**可选的服务端附加字段**，不属于模型输出契约：当本次运行已经通过
+`get_clause_detail` 取回权威正文时，终态 HTTP 响应会在 `answer` 内附上该数组。每项至少包含
+`clause_id` 与非空 `text`，并可能含 `doc_title`、`clause_path`、`source_code`、`status` 等来自
+权威库的元数据。Java 应按 `clause_id` 将它与 `basis` 对应，直接用于“查看原文”；它缺省时表示本次
+运行没有可复用的正文，不能把缺省误判为条款不存在，也不能用模型生成的 `conclusion` 充当原文。
+
 顶层必填(schema `required`):`conclusion` / `basis` / `confidence` / `finish_reason`。`reasoning` /
 `exhausted_scope` / `gaps` 是可选键。
 

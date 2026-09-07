@@ -666,6 +666,27 @@ describe("Java 应答适配:answer 字段(规格-Java应答适配 §2)", () => {
 		if (extracted.kind === "ok") expect(extracted.value).toEqual(body.answer);
 	});
 
+	it("把本次已取回的权威条款正文随 answer 返回", async () => {
+		const sourceDetails = [
+			{
+				clause_id: "A-1",
+				doc_title: "监管规则",
+				clause_path: "第三条",
+				text: "第三条原文",
+			},
+		];
+		const { hono } = app({ result: { output: STUB_OUTPUT, sourceDetails } });
+		const request = submitBody({ waitMs: 5000 });
+		const res = await hono.request(post(request));
+		const body = (await res.json()) as { answer?: { source_details?: unknown } };
+		expect(body.answer?.source_details).toEqual(sourceDetails);
+
+		// 幂等重放经 SQLite 反序列化，锁住正文不是只在内存同步出口可见。
+		const replay = await hono.request(post(request));
+		const replayBody = (await replay.json()) as { answer?: { source_details?: unknown } };
+		expect(replayBody.answer?.source_details).toEqual(sourceDetails);
+	});
+
 	it("output 不含 JSON 时缺省 answer 而不抛", async () => {
 		// stub 输出纯散文 ⇒ 200 且 "answer" 不出现在响应体里(不是 toBeUndefined,那个对
 		// "键存在但值为 undefined" 也会通过)。

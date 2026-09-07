@@ -1,3 +1,4 @@
+import { createDocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import { createDefaultRuntimeFactory, startServer } from "../server/main.ts";
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
@@ -29,7 +30,7 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 			`TASK_RUNTIME_PORT must be an integer in [0, 65535], got ${JSON.stringify(env.TASK_RUNTIME_PORT)}`,
 		);
 	}
-	const dbPath = requireEnv(env, "TASK_RUNTIME_DB_PATH");
+	const databaseUrl = requireEnv(env, "PIPELINE_DB_DSN");
 	const specsDir = requireEnv(env, "TASK_RUNTIME_SPECS_DIR");
 	const profilePath = requireEnv(env, "TASK_RUNTIME_PROFILE");
 	const workRoot = requireEnv(env, "TASK_RUNTIME_WORK_ROOT");
@@ -47,12 +48,18 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 			? { auditReportSources: { apiBaseUrl: auditApiBaseUrl, operatingWorkbookPath } }
 			: {}),
 	});
+	const auditBaseUrl = env.AUDIT_AI_BASE_URL;
+	const auditToken = env.AUDIT_AI_INTERNAL_TOKEN;
 	return startServer({
 		port,
-		dbPath,
+		databaseUrl,
 		specsDir,
 		internalToken,
 		runtimeFactory,
+		documents:
+			auditBaseUrl && auditToken
+				? createDocumentsClient({ baseUrl: auditBaseUrl, internalToken: auditToken })
+				: undefined,
 		maxConcurrent: optionalNumber(env, "TASK_RUNTIME_MAX_CONCURRENT"),
 		maxQueueDepth: optionalNumber(env, "TASK_RUNTIME_MAX_QUEUE_DEPTH"),
 	});

@@ -25,7 +25,7 @@ function optionsWithBatchSize(batchSize: unknown): RunOptions {
  * 纪律)——判据不是"assemble() 跑到底产出一个能用的 Runtime",而是"两条路径在装配早期就已经
  * 分岔到了不同的失败点",两条路径各自的**第一个**响亮失败点天然互斥、不需要真跑通六阶段:
  *   - policy-compare 分支:main.ts 在调用 createPolicyCompareRuntime() 之前先做
- *     `requireEnv("AUDIT_AI_BASE_URL")` 等 fail-closed 检查 —— SessionRuntime 路径永远不会
+ *     `requireEnv("AUDIT_AI_BASE_URL")` 等必需的 audit-ai 连接检查 —— SessionRuntime 路径永远不会
  *     提到这个 env 变量名,一旦错误信息里出现它,只可能是走了 policy-compare 分支。
  *   - SessionRuntime 分支:走 assemble() 的既有校验(validateSpec / tools 白名单交叉校验),
  *     错误信息不会提 AUDIT_AI_BASE_URL。
@@ -50,15 +50,9 @@ function minimalProfile(): unknown {
 	};
 }
 
-/** 制度比对工作流的 6 个必需 env(port/useSSL 是可选项,不在此列——见 main.ts 的 requireEnv 调用点)。 */
-const REQUIRED_ENV_KEYS = [
-	"AUDIT_AI_BASE_URL",
-	"AUDIT_AI_INTERNAL_TOKEN",
-	"DFZQ_UPLOADS_BUCKET",
-	"DFZQ_MINIO_ENDPOINT",
-	"DFZQ_MINIO_ACCESS_KEY",
-	"DFZQ_MINIO_SECRET_KEY",
-] as const;
+/** 所有制度比对请求都必须具备的 audit-ai 连接环境变量。
+ * MinIO 只服务上传件，知识库选文档不应因其未配置而被阻塞，故不在此列。 */
+const REQUIRED_ENV_KEYS = ["AUDIT_AI_BASE_URL", "AUDIT_AI_INTERNAL_TOKEN"] as const;
 
 let root: string;
 let savedEnv: Record<string, string | undefined>;
@@ -163,7 +157,7 @@ describe("createDefaultRuntimeFactory — workflow 分派真的生效(Task 12)",
 	});
 });
 
-describe("createDefaultRuntimeFactory — policy-compare 工作流的必需 env,缺一即 fail-closed", () => {
+describe("createDefaultRuntimeFactory — policy-compare 工作流的 audit-ai 必需 env,缺一即 fail-closed", () => {
 	for (const key of REQUIRED_ENV_KEYS) {
 		it(`缺 ${key} 时拒绝启动,不静默继续`, async () => {
 			await writeSpec("pc", pcSpec());
@@ -177,7 +171,7 @@ describe("createDefaultRuntimeFactory — policy-compare 工作流的必需 env,
 		});
 	}
 
-	it("6 个 env 全部配好后,requireEnv 阶段不再拦截(错误来自更深处的真实装配,而不是 fail-closed 检查)", async () => {
+	it("audit-ai 连接 env 全部配好后，知识库场景不再被 MinIO 配置预先拦截", async () => {
 		await writeSpec("pc", pcSpec());
 		const factory = await buildFactory();
 		for (const key of REQUIRED_ENV_KEYS) process.env[key] = "test-value";

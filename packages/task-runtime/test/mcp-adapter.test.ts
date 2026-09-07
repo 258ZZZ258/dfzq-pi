@@ -60,6 +60,24 @@ describe("createMcpToolset", () => {
 		expect(result?.content).toMatchObject([{ type: "text", text: "round trip" }]);
 	});
 
+	it("forwards a server-specific MCP request timeout", async () => {
+		const spawnSpy = vi.spyOn(McpClient, "spawn");
+		try {
+			const registry = new ToolsetRegistry();
+			registry.register(
+				"slow-mcp",
+				createMcpToolset(
+					[{ id: "echo", command: process.execPath, args: [SERVER], env: {}, requestTimeoutMs: 120_000 }],
+					null,
+				),
+			);
+			await resolve(registry, "slow-mcp");
+			expect(spawnSpy).toHaveBeenCalledWith(expect.objectContaining({ requestTimeoutMs: 120_000 }));
+		} finally {
+			spawnSpy.mockRestore();
+		}
+	});
+
 	// fix round 1/5:execute() 必须 throw 才能让 pi 的 agent-loop(executePreparedToolCall 自己
 	// catch,见 packages/agent/src/agent-loop.ts:665-702)生成 wire 层 isError:true 的结果 ——
 	// 之前把 isError 塞进 details 完全到不了 ToolResultMessage.isError / tool_execution_end 事件 /

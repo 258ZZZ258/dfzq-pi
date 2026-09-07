@@ -18,6 +18,7 @@
           "source_code": { "type": ["string", "null"] },
           "source_doc_id": { "type": ["string", "null"] },
           "clause_path": { "type": ["string", "null"] },
+          "text": { "type": ["string", "null"] },
           "doc_title": { "type": ["string", "null"] },
           "status": { "enum": ["effective", "superseded", "abolished"] },
           "corpus_type": { "enum": ["internal", "external", "qa", "case"] }

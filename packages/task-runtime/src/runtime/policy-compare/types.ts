@@ -24,6 +24,21 @@ export interface ExternalDocument {
 	uploadId: string;
 	title: string;
 	docNo?: string;
+	issueDate?: string;
+	clauses: ExternalClause[];
+}
+
+/**
+ * A selected document read by Java from the primary business database.
+ * Pi receives the normalized clauses and never needs database credentials or
+ * a second catalogue round trip to resolve this document.
+ */
+export interface InlinePolicyDocument {
+	documentId: string;
+	logicalId?: string;
+	title: string;
+	docNo?: string;
+	issueDate?: string;
 	clauses: ExternalClause[];
 }
 
@@ -56,7 +71,7 @@ export interface SourceLawResolution {
 export interface ClausePair {
 	externalClause: ExternalClause;
 	internalObligation: InternalObligation;
-	matchKind: "exact" | "normalized" | "doc_level";
+	matchKind: "exact" | "normalized" | "doc_level" | "semantic_retrieval";
 }
 
 export interface UnmatchedObligation {
@@ -67,6 +82,18 @@ export interface UnmatchedObligation {
 export interface AlignmentResult {
 	pairs: ClausePair[];
 	unmatched: UnmatchedObligation[];
+	/** 批量检索路径以外规条款为核查单位；空候选和单条检索失败不能静默丢失。 */
+	uncoveredExternalClauses?: Array<{
+		externalClause: ExternalClause;
+		reason: "no_internal_candidate" | "retrieval_failed";
+	}>;
+	/** 内规→外规批量检索中没有外规候选的待核查内规条款。
+	 * 不能只留 chunkId：结果页需要展示真实内规原文，且必须明确说明外规侧未命中。 */
+	uncoveredInternalClauses?: Array<{
+		internalObligation: InternalObligation;
+		reason: "no_external_candidate" | "external_retrieval_failed";
+	}>;
+	countBy?: "internal" | "external";
 }
 
 /** 阶段 5:模型对一对的判定。**模型只产这四个字段**,正文一概不产。 */
@@ -93,7 +120,12 @@ export interface CoverageRow {
 		internalSourceCode: string | null;
 		externalClausePath: string | null;
 		externalDocNo: string | null;
-		matchKind: "exact" | "normalized" | "doc_level";
+		matchKind: "exact" | "normalized" | "doc_level" | "semantic_retrieval";
+		referenceId?: string;
+		referenceSurface?: string;
+		citedDocVersionId?: string | null;
+		currentDocVersionId?: string | null;
+		changeKind?: "unresolved" | "version_changed" | "clause_changed";
 	};
 }
 
@@ -114,7 +146,7 @@ export interface LinkedDetailItem {
 }
 
 export interface CoverageResult {
-	compareType: "external_to_internal";
+	compareType: "external_to_internal" | "internal_to_external";
 	metrics: CoverageMetrics;
 	rows: CoverageRow[];
 	linkedDetail?: LinkedDetailItem[];
@@ -124,7 +156,15 @@ export interface CoverageResult {
 
 /** `POST /runs` 的 `payload`(覆盖度引擎)。形状校验见 runtime.ts 的 parsePayload。 */
 export interface CoveragePayload {
-	external: { objectKey: string; uploadId: string; filename: string };
+	direction: "external_to_internal" | "internal_to_external";
+	external?:
+		| { source: "upload"; objectKey: string; uploadId: string; filename: string }
+		| { source: "library"; docVersionId: string }
+		| { source: "inline"; document: InlinePolicyDocument };
+	internal?:
+		| { source: "upload"; objectKey: string; uploadId: string; filename: string }
+		| { source: "library"; docVersionId: string }
+		| { source: "inline"; document: InlinePolicyDocument };
 	scope: {
 		organizations?: string[];
 		bizDomains?: string[];
@@ -132,4 +172,46 @@ export interface CoveragePayload {
 		effectiveDateRange?: [string, string];
 	};
 	outputTypes?: string[];
+}
+
+/** 同一逻辑制度的新旧版本条款差异。此路径不使用模型或 MCP。 */
+export interface VersionDiffPayload {
+	corpusType: "internal" | "external";
+	newDocument: InlinePolicyDocument;
+	oldDocument: InlinePolicyDocument;
+}
+
+export interface VersionDiffDocument {
+	docVersionId: string;
+	title: string;
+	versionLabel: string;
+	versionStatus: string;
+	versionCode?: string | null;
+	versionDisplayName?: string | null;
+	revisionNo?: number | null;
+	issueDate?: string | null;
+	effectiveDate?: string | null;
+}
+
+export interface VersionDiffRow {
+	index: number;
+	tabKey: "added" | "removed" | "changed" | "moved";
+	place: string;
+	oldPlace?: string;
+	newPlace?: string;
+	policyA: string;
+	policyB: string;
+	level: "新增" | "删除" | "修改" | "位置调整";
+	description: string;
+}
+
+export interface VersionDiffResult {
+	compareType: "version_diff";
+	corpusType: "internal" | "external";
+	logicalId: string;
+	newVersion: VersionDiffDocument;
+	oldVersion: VersionDiffDocument;
+	metrics: { added: number; removed: number; changed: number; moved: number; total: number };
+	rows: VersionDiffRow[];
+	finish_reason: "stop";
 }

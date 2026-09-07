@@ -28,6 +28,12 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(systemMd).toContain("取证顺序"); // 其余内容还在,不是把文件删空了
 	});
 
+	it("caps ordinary policy queries at one search and one detail lookup", () => {
+		const systemMd = readFileSync(`${specDir}policy-query/system.md`, "utf8");
+		expect(systemMd).toContain("只调用一次 `search_policy`");
+		expect(systemMd).toContain("一次 `get_clause_detail`");
+	});
+
 	/**
 	 * basis[] 的八个合法键 —— 契约正文(output-format.md)与出厂 schema
 	 * (output-contract.schema.json 的 basis.items.properties)必须逐字一致,这是下面用例
@@ -51,15 +57,15 @@ describe("出厂 spec: policy-query.json", () => {
 		"source_doc_id",
 		"corpus_type",
 		"score",
+		"text",
 	] as const;
+	const FAST_BASIS_KEYS = BASIS_KEYS.filter((key) => key !== "text");
 
-	it("keeps the eight basis keys in lockstep between output-format.md's contract text and the schema's key set", () => {
+	it("keeps the nine basis keys in lockstep between output-format.md's contract text and the schema's key set", () => {
 		const contract = readFileSync(`${specDir}policy-query/output-format.md`, "utf8");
 		for (const key of ["conclusion", "basis", "confidence", "finish_reason"]) {
 			expect(contract).toContain(key);
 		}
-		// basis[] 不得含条款原文 —— 既是权限红线也防篡改(规格 §4.1)。
-		expect(contract).toContain("不要");
 		expect(contract).toContain("text");
 
 		// 断言 1:八个 basis 键必须逐个真的出现在契约正文里 —— 不是只在无关散句里侥幸命中。
@@ -83,9 +89,9 @@ describe("出厂 spec: policy-query.json", () => {
 	// toContain("finish_reason"),八个 basis 键里其余七个(尤其 source_code —— 缺了它
 	// 下游按 source_code 回查权威库装配条款正文的那一步会断)完全没人守。这里把同一个
 	// BASIS_KEYS 循环也跑一遍 fast-answer.md —— 今天全中,是纯加固,不改变现状。
-	it("keeps the eight basis keys present in fast-answer.md's contract text too", () => {
+	it("keeps the eight fast-path basis keys present in fast-answer.md's contract text", () => {
 		const contract = readFileSync(`${specDir}policy-query/fast-answer.md`, "utf8");
-		for (const key of BASIS_KEYS) {
+		for (const key of FAST_BASIS_KEYS) {
 			expect(contract).toContain(key);
 		}
 	});
@@ -158,9 +164,15 @@ describe("出厂 spec: policy-query.json", () => {
 		expect(options.maxChars.default).toBe(3000);
 	});
 
-	it("ships fastPath disabled by default", () => {
+	it("forwards the selected sparse backend to the isolated MCP process", () => {
+		const servers = spec.mcpServers as Array<{ id: string; env: Record<string, string> }>;
+		const policyQuery = servers.find((server) => server.id === "policy-query");
+		expect(policyQuery?.env.PIPELINE_SPARSE_BACKEND).toBe(`\${PIPELINE_SPARSE_BACKEND}`);
+	});
+
+	it("ships fastPath enabled by default", () => {
 		const fastPath = spec.fastPath as { enabled?: boolean } | undefined;
-		expect(fastPath?.enabled).toBe(false);
+		expect(fastPath?.enabled).toBe(true);
 	});
 
 	it("points fastPath at three prompt files that exist", async () => {
@@ -318,7 +330,7 @@ describe("出厂 spec 的 prompt 路径真的会被解析(不是字面字符串)
 		try {
 			// brief 建议的锚点 "basis[] 的元素只能有" 里那个 "]" 后面紧跟着 Markdown 的反引号
 			// (源文件是 "`basis[]` 的元素只能有"),不是连续子串 —— 换一句不含反引号断点的话。
-			expect(assembled.session.systemPrompt).toContain("的元素只能有上面列出的这八个键");
+			expect(assembled.session.systemPrompt).toContain("的元素只能有上面列出的这九个键");
 			expect(assembled.session.systemPrompt).not.toContain("policy-query/output-format.md");
 		} finally {
 			await cleanup();

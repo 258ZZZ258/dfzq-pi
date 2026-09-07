@@ -67,6 +67,7 @@ export {
 export type { RuntimeSpec } from "./spec/types.ts";
 export { validateSpec } from "./spec/validate.ts";
 export type { RunRecord, RunStore, StoredRunStatus } from "./store/contract.ts";
+export { createPostgresRunStore } from "./store/postgres.ts";
 export { createSqliteRunStore } from "./store/sqlite.ts";
 export { type AuditReportToolsetOptions, createAuditReportToolset } from "./toolsets/audit-report.ts";
 export { createMcpToolset } from "./toolsets/mcp/adapter.ts";

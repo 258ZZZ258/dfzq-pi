@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import type { SpecRouter } from "../router/router.ts";
 import type { RunResult } from "../runtime/contract.ts";
+import type { DocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import type { RunStore } from "../store/contract.ts";
 import { checkInternalToken, INTERNAL_TOKEN_HEADER } from "./middleware/auth.ts";
 import { clampWaitMs, validateSubmitBody } from "./middleware/validate.ts";
@@ -11,10 +12,11 @@ import type { RunManager, RunOptions } from "./run-manager.ts";
 export interface AppOptions {
 	manager: RunManager;
 	router: SpecRouter;
-	store: RunStore;
+	store: RunStore<boolean>;
 	/** 未配置 = 边界关闭(fail-closed)。 */
 	internalToken: string | undefined;
 	newSessionId?: () => string;
+	documents?: DocumentsClient;
 }
 
 function errorBody(code: string, message: string) {
@@ -59,6 +61,26 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			return c.json(errorBody("unauthorized", "invalid internal token"), 401);
 		}
 		await next();
+	});
+
+	app.get("/library/external-documents", async (c) => {
+		if (!options.documents?.listExternalDocuments)
+			return c.json(errorBody("not_configured", "document library is not configured"), 503);
+		const items = await options.documents.listExternalDocuments(
+			c.req.queries("permTag") ?? [],
+			c.req.query("includeHistory") === "true",
+		);
+		return c.json(items);
+	});
+
+	app.get("/library/internal-documents", async (c) => {
+		if (!options.documents?.listInternalDocuments)
+			return c.json(errorBody("not_configured", "document library is not configured"), 503);
+		const items = await options.documents.listInternalDocuments(
+			c.req.queries("permTag") ?? [],
+			c.req.query("includeHistory") === "true",
+		);
+		return c.json(items);
 	});
 
 	app.post("/runs", async (c) => {
@@ -111,7 +133,7 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			return c.json(errorBody("queue_full", "server is at capacity"), 503);
 		}
 		if (outcome.kind === "idempotent") {
-			const row = store.findByRunId(outcome.runId);
+			const row = await store.findByRunId(outcome.runId);
 			if (row && isTerminal(row.status)) return c.json(toWireResult(recordToRunResult(row)), 200);
 			// row?.status 而不是 outcome.status(创建时的快照):markError/markRunning 等落库
 			// 写入若失败,drive() 的 finally 仍会无条件 live.delete,行却可能停在非终态 ——
@@ -139,15 +161,15 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			// timeout 信号,而此时行已落库为 error(终态)。以 store 当前状态为准 ——
 			// 终态直接回 200 结果(含 error),非终态回 202 并如实报 queued/running
 			// (排队中的 run 不许谎称 running,RunManager 的 queued 语义就是为此服务的)。
-			const row = store.findByRunId(outcome.runId);
+			const row = await store.findByRunId(outcome.runId);
 			if (row && isTerminal(row.status)) return c.json(toWireResult(recordToRunResult(row)), 200);
 			return c.json({ runId: outcome.runId, status: row?.status ?? "running" }, 202);
 		}
 		return c.json(toWireResult(raced as RunResult), 200);
 	});
 
-	app.get("/runs/:runId", (c) => {
-		const row = store.findByRunId(c.req.param("runId"));
+	app.get("/runs/:runId", async (c) => {
+		const row = await store.findByRunId(c.req.param("runId"));
 		if (!row) return c.json(errorBody("not_found", "run not found"), 404);
 		// isTerminal 判定必须先于 progress —— 一个已经落库为终态的行不该再挂 progress 字段
 		// (规格 §7.2:progress 只描述「正在跑」这件事;终态的真相是下面的 RunResult)。

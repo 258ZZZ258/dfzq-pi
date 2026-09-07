@@ -6,7 +6,6 @@ import { createDefaultPluginRegistry } from "../src/runtime/default-plugins.ts";
 import {
 	createPolicyCompareRuntime,
 	DEFAULT_BATCH_SIZE,
-	MAX_OBLIGATIONS,
 	MAX_PAIRS,
 	type PolicyCompareRuntimeOptions,
 	parseCoveragePayload,
@@ -23,7 +22,62 @@ const ok = {
 
 describe("parseCoveragePayload", () => {
 	it("合法 payload 通过", () => {
-		expect(parseCoveragePayload(ok).external.uploadId).toBe("U1");
+		const external = parseCoveragePayload(ok).external!;
+		expect(external.source === "upload" ? external.uploadId : "").toBe("U1");
+	});
+
+	it("知识库外规版本 payload 通过", () => {
+		const got = parseCoveragePayload({ ...ok, external: { source: "library", docVersionId: "DV-1" } });
+		expect(got.external).toEqual({ source: "library", docVersionId: "DV-1" });
+	});
+
+	it("Java 主库读取的外规条款可以 inline 下传，不要求 Pi 再查询制度目录", () => {
+		const got = parseCoveragePayload({
+			...ok,
+			external: {
+				source: "inline",
+				document: {
+					documentId: "DM-EXT-2026",
+					title: "达梦外规",
+					docNo: "证监规〔2026〕1号",
+					clauses: [{ seq: 1, clausePath: "第一条", text: "上市公司应当建立内部控制制度。" }],
+				},
+			},
+		});
+		expect(got.external).toEqual({
+			source: "inline",
+			document: {
+				documentId: "DM-EXT-2026",
+				title: "达梦外规",
+				docNo: "证监规〔2026〕1号",
+				clauses: [{ seq: 1, clausePath: "第一条", text: "上市公司应当建立内部控制制度。" }],
+			},
+		});
+	});
+
+	it("知识库内规 payload 自动切换为内规追踪外规版本", () => {
+		const got = parseCoveragePayload({
+			direction: "internal_to_external",
+			internal: { source: "library", docVersionId: "INT-DV-1" },
+			scope: { effectiveDateRange: ["2024-01-01", "2026-12-31"] },
+		});
+		expect(got.direction).toBe("internal_to_external");
+		expect(got.internal).toEqual({ source: "library", docVersionId: "INT-DV-1" });
+		expect(got.external).toBeUndefined();
+	});
+
+	it("上传内规 payload 通过", () => {
+		const got = parseCoveragePayload({
+			direction: "internal_to_external",
+			internal: { objectKey: "upload/I1/a.docx", uploadId: "I1", filename: "a.docx" },
+			scope: {},
+		});
+		expect(got.internal).toEqual({
+			source: "upload",
+			objectKey: "upload/I1/a.docx",
+			uploadId: "I1",
+			filename: "a.docx",
+		});
 	});
 
 	it("缺 external.objectKey → 抛错", () => {
@@ -140,6 +194,118 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1)
 }
 
 describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
+	it("知识库内规通过引用版本核查接口完成，不再走全库外规候选检索", async () => {
+		const checkRequests: unknown[] = [];
+		const { runtime, toolCalls, externalCandidateBatchArgs, faux } = await buildRuntime({
+			modelReplies: [],
+			payloadOverride: {
+				direction: "internal_to_external",
+				internal: { source: "library", docVersionId: "INT-DV-1" },
+				scope: { effectiveDateRange: ["2024-01-01", "2026-12-31"] },
+			},
+			documents: {
+				process: async () => {
+					throw new Error("知识库内规不应重新解析");
+				},
+				getInternalDocument: async () => ({
+					uploadId: "library:INT-DV-1",
+					title: "知识库内规",
+					clauses: [
+						{ seq: 0, clausePath: "第一条", text: "内规第一条用于说明适用范围" },
+						{ seq: 1, clausePath: "第二条", text: "内规第二条不得违反规定" },
+					],
+				}),
+				checkInternalReferenceVersions: async (req) => {
+					checkRequests.push(req);
+					return {
+						compareType: "internal_to_external",
+						metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
+						rows: [],
+						gaps: ["当前内规没有可解析的显式外规引用"],
+						finish_reason: "stop",
+					};
+				},
+			},
+		});
+		const result = await runtime.run("核查内规覆盖情况");
+		expect(result.status).toBe("completed");
+		expect(result.turns).toBe(0);
+		expect(toolCalls).toEqual([]);
+		expect(faux.state.callCount).toBe(0);
+		expect(checkRequests).toEqual([
+			{
+				docVersionId: "INT-DV-1",
+				effectiveDateRange: ["2024-01-01", "2026-12-31"],
+				permTags: [],
+			},
+		]);
+		expect(externalCandidateBatchArgs).toEqual([]);
+		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
+		expect(body.compareType).toBe("internal_to_external");
+		expect(body.metrics).toMatchObject({ checked: 0, covered: 0, missing: 0, conflict: 0 });
+		expect(body.rows).toHaveLength(0);
+	});
+
+	it("上传内规先按 internal 解析，再把条款交给引用版本核查接口", async () => {
+		const processRequests: unknown[] = [];
+		const checkRequests: unknown[] = [];
+		const { runtime, toolCalls } = await buildRuntime({
+			modelReplies: [],
+			payloadOverride: {
+				direction: "internal_to_external",
+				internal: {
+					source: "upload",
+					objectKey: "upload/I1/internal.pdf",
+					uploadId: "I1",
+					filename: "internal.pdf",
+				},
+			},
+			documents: {
+				process: async (req) => {
+					processRequests.push(req);
+					return {
+						uploadId: "I1",
+						artifactKey: "artifact/I1.json",
+						title: "上传内规",
+						pageCount: 1,
+						chunkCount: 2,
+						status: "ok",
+					};
+				},
+				checkInternalReferenceVersions: async (req) => {
+					checkRequests.push(req);
+					return {
+						compareType: "internal_to_external",
+						metrics: { checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0, linked: 0 },
+						rows: [],
+						gaps: [],
+						finish_reason: "stop",
+					};
+				},
+			},
+		});
+		const result = await runtime.run("核查上传内规");
+		expect(result.status).toBe("completed");
+		expect(processRequests).toEqual([
+			{
+				objectKey: "upload/I1/internal.pdf",
+				uploadId: "I1",
+				filename: "internal.pdf",
+				corpusHint: "internal",
+			},
+		]);
+		expect(toolCalls).toEqual([]);
+		expect(checkRequests).toEqual([
+			{
+				clauses: [
+					{ chunkId: "I1:0", clausePath: "第五条", text: "外规第五条正文应当" },
+					{ chunkId: "I1:1", clausePath: "第十条", text: "外规第十条正文不得" },
+				],
+				permTags: [],
+			},
+		]);
+	});
+
 	it("跑完六阶段并产出合规行表", async () => {
 		const { runtime, toolCalls } = await buildRuntime({
 			modelReplies: [
@@ -151,11 +317,11 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("completed");
-		expect(toolCalls).toEqual(["list_internal_obligations", "resolve_source_law"]);
+		expect(toolCalls).toEqual(["retrieve_internal_candidates_batch"]);
 		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
 		expect(body.compareType).toBe("external_to_internal");
 		expect(body.rows).toHaveLength(1);
-		expect(body.rows[0].externalClause).toBe("外规第五条正文");
+		expect(body.rows[0].externalClause).toBe("外规第五条正文应当");
 		expect(body.metrics.checked).toBe(2);
 		// 评审 Finding 4:completed 路径此前硬编码 usage 全 0 —— 一个真打了模型调用的 run 在
 		// 账面上显示成免费。faux provider 的 withUsageEstimate 按字符数估算 token,只要真的发生
@@ -251,28 +417,60 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		expect(stages.at(-1)).toBe("assembling");
 	});
 
-	it("A6:unresolved 同时进 metrics.unmatched 与 gaps", async () => {
+	it("批量检索空候选必须落为明确的缺失项，不能静默跳过", async () => {
 		const { runtime } = await buildRuntime({
-			obligationCount: 2,
-			unresolvedIds: ["C-1"],
+			candidateBatchRawOverride: {
+				items: [
+					{
+						query_index: 0,
+						candidates: [
+							{
+								chunk_id: "C-0",
+								clause_path: "内第一条",
+								doc_title: "内规",
+								doc_no: null,
+								text: "内规第一条正文",
+								source_code: "SC-0",
+								score: 0.9,
+							},
+						],
+						error: null,
+					},
+					{ query_index: 1, candidates: [], error: null },
+				],
+				total: 2,
+			},
 			modelReplies: [verdictReply([{ pairIndex: 0, state: "covered" }])],
 		});
 		const result = await runtime.run("比对");
 		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
-		expect(body.metrics.unmatched).toBe(1);
-		// ⚠ 评审 Finding 3:不能只断言 gaps 里含 "C-1" —— align.ts 会独立地把同一个 chunk id
-		// 因为 source_law_unresolved 推进 alignment.unmatched,assemble.ts 再把它变成一条也含
-		// "C-1" 的 gap("内规条款 C-1 未对齐到上传外规:...")。那条路径与 runtime.ts 这里
-		// `resolutions.unresolved.map(...)` 写进 extraGaps 的那句是两回事,只查子串
-		// "C-1"会被前者悄悄顶住,删掉 runtime.ts 里 unresolved 那一行也不会有任何测试翻红。
-		// 断言 runtime.ts 自己那句消息的确切文案,才是真的在守这条线。
-		expect(body.gaps.join("\n")).toContain("内规条款 C-1 在源库中没有外规映射");
+		expect(body.metrics.missing).toBe(1);
+		expect(body.rows[0]).toMatchObject({ conflictType: "未命中内部制度条款", externalClause: "外规第十条正文不得" });
 	});
 
-	it("A6b:rejected 也进 gaps(与 unresolved 是两个不同字段,都不静默丢)", async () => {
+	it("批量检索单条失败必须落为明确的缺失项", async () => {
 		const { runtime } = await buildRuntime({
-			obligationCount: 2,
-			rejectedIds: ["C-9"],
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates: [], error: "embedding failed" },
+					{ query_index: 1, candidates: [], error: null },
+				],
+				total: 2,
+			},
+			modelReplies: [verdictReply([])],
+		});
+		const result = await runtime.run("比对");
+		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
+		expect(body.metrics.missing).toBe(2);
+		expect(body.rows.map((row: { conflictType: string }) => row.conflictType)).toEqual([
+			"检索失败",
+			"未命中内部制度条款",
+		]);
+	});
+
+	it("守恒:checkedCount 按待核查外规条款数统计，不受候选内规条数影响", async () => {
+		const { runtime } = await buildRuntime({
+			obligationCount: 9,
 			modelReplies: [
 				verdictReply([
 					{ pairIndex: 0, state: "covered" },
@@ -282,30 +480,13 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		});
 		const result = await runtime.run("比对");
 		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
-		expect(body.gaps.join("\n")).toContain("C-9");
-	});
-
-	it("守恒:checkedCount 用实际处理条数(items.length),不是库内 total(被截断时两者不同)", async () => {
-		const { runtime } = await buildRuntime({
-			obligationCount: 2,
-			truncated: true,
-			libraryTotal: 999,
-			modelReplies: [
-				verdictReply([
-					{ pairIndex: 0, state: "covered" },
-					{ pairIndex: 1, state: "covered" },
-				]),
-			],
-		});
-		const result = await runtime.run("比对");
-		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
-		// items.length=2,不是 libraryTotal=999 —— 这是 2026-08-06 控制端裁定的那条口径。
 		expect(body.metrics.checked).toBe(2);
-		expect(body.gaps.some((g: string) => g.includes("999"))).toBe(true);
+		expect(body.metrics.covered).toBe(1);
+		expect(body.metrics.unmatched).toBe(1);
 	});
 
-	it("阶段 2 请求参数:limit 封顶在 MAX_OBLIGATIONS(500,规格 §3.5 护栏定值)", async () => {
-		const { runtime, obligationsArgs } = await buildRuntime({
+	it("阶段 2 请求参数:整份外规条款一次传入批量候选工具", async () => {
+		const { runtime, candidateBatchArgs } = await buildRuntime({
 			modelReplies: [
 				verdictReply([
 					{ pairIndex: 0, state: "covered" },
@@ -314,7 +495,65 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 			],
 		});
 		await runtime.run("比对");
-		expect(obligationsArgs[0]?.limit).toBe(MAX_OBLIGATIONS);
+		expect(candidateBatchArgs).toEqual([
+			{
+				clauses: [
+					{ clause_path: "第五条", text: "外规第五条正文应当" },
+					{ clause_path: "第十条", text: "外规第十条正文不得" },
+				],
+			},
+		]);
+	});
+
+	it("上传与知识库外规都只将规范性义务条款送入内规语义检索", async () => {
+		const clauses = [
+			{ seq: 0, clausePath: "第一条", text: "本规则适用于相关主体。" },
+			{ seq: 1, clausePath: "第二条", text: "相关主体应当保存完整记录。" },
+		];
+		const modelReplies = [verdictReply([{ pairIndex: 0, state: "covered" }])];
+
+		const upload = await buildRuntime({
+			modelReplies,
+			artifacts: { fetch: async () => ({ uploadId: "U-filter", title: "上传外规", clauses }) },
+		});
+		await upload.runtime.run("比对");
+		expect(upload.candidateBatchArgs).toEqual([
+			{ clauses: [{ clause_path: "第二条", text: "相关主体应当保存完整记录。" }] },
+		]);
+
+		const library = await buildRuntime({
+			modelReplies,
+			payloadOverride: { external: { source: "library", docVersionId: "EXT-V1" } },
+			documents: {
+				process: async () => {
+					throw new Error("知识库外规不应调用 process");
+				},
+				getExternalDocument: async () => ({ uploadId: "EXT-V1", title: "知识库外规", clauses }),
+			},
+		});
+		await library.runtime.run("比对");
+		expect(library.candidateBatchArgs).toEqual([
+			{ clauses: [{ clause_path: "第二条", text: "相关主体应当保存完整记录。" }] },
+		]);
+	});
+
+	it("没有规范性义务词的外规不触发内规语义检索", async () => {
+		const { runtime, candidateBatchArgs } = await buildRuntime({
+			modelReplies: [],
+			artifacts: {
+				fetch: async () => ({
+					uploadId: "U-no-obligation",
+					title: "说明性外规",
+					clauses: [{ seq: 0, clausePath: "第一条", text: "本办法适用于上市公司。" }],
+				}),
+			},
+		});
+		const result = await runtime.run("比对");
+		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
+		expect(candidateBatchArgs).toEqual([]);
+		expect(result.turns).toBe(0);
+		expect(body.metrics).toMatchObject({ checked: 0, missing: 0, conflict: 0, covered: 0, unmatched: 0 });
+		expect(body.gaps).toContain("未识别到含应当、必须、不得、禁止等规范性义务词的外规条款，本次未执行内规语义检索。");
 	});
 
 	/**
@@ -322,8 +561,8 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 	 * 四行整个删掉,当时没有任何测试会红。收窄参数丢一个,M1 就按「不限」处理,比对范围会从
 	 * 「费用报销这一个域」悄悄放大到全部内规,而调用方看到的是一次正常完成的 run。
 	 */
-	it("阶段 2 请求参数:scope 的三个收窄参数逐字下传给 M1(biz_domains/chapters/effective_from/effective_to)", async () => {
-		const { runtime, obligationsArgs } = await buildRuntime({
+	it("批量候选工具接收目标内部知识库的有效期范围", async () => {
+		const { runtime, candidateBatchArgs } = await buildRuntime({
 			payloadOverride: {
 				scope: {
 					bizDomains: ["费用报销", "差旅费用报销"],
@@ -340,26 +579,14 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("completed");
-		expect(obligationsArgs[0]?.biz_domains).toEqual(["费用报销", "差旅费用报销"]);
-		expect(obligationsArgs[0]?.chapters).toEqual(["第二章 报销原则", "第三章 审批规则"]);
-		expect(obligationsArgs[0]?.effective_from).toBe("2024-01-01");
-		expect(obligationsArgs[0]?.effective_to).toBe("2026-12-31");
-	});
-
-	it("阶段 2 请求参数:scope 全缺省时下传空数组(= 不限),日期两端不传键", async () => {
-		const { runtime, obligationsArgs } = await buildRuntime({
-			modelReplies: [
-				verdictReply([
-					{ pairIndex: 0, state: "covered" },
-					{ pairIndex: 1, state: "covered" },
-				]),
+		expect(candidateBatchArgs[0]).toEqual({
+			clauses: [
+				{ clause_path: "第五条", text: "外规第五条正文应当" },
+				{ clause_path: "第十条", text: "外规第十条正文不得" },
 			],
+			effective_from: "2024-01-01",
+			effective_to: "2026-12-31",
 		});
-		await runtime.run("比对");
-		expect(obligationsArgs[0]?.biz_domains).toEqual([]);
-		expect(obligationsArgs[0]?.chapters).toEqual([]);
-		expect(obligationsArgs[0]?.effective_from).toBeUndefined();
-		expect(obligationsArgs[0]?.effective_to).toBeUndefined();
 	});
 
 	it("模型不产正文:即使模型回了 externalClause,行表里也是原文", async () => {
@@ -373,7 +600,7 @@ describe("PolicyCompareRuntime 端到端(fake 工具 + faux 模型)", () => {
 		});
 		const result = await runtime.run("比对");
 		const body = JSON.parse(result.output!.replace(/```json\n|\n```/g, ""));
-		expect(body.rows[0].externalClause).toBe("外规第五条正文");
+		expect(body.rows[0].externalClause).toBe("外规第五条正文应当");
 	});
 
 	it("steer / followUp 抛错", async () => {
@@ -556,74 +783,68 @@ describe("PolicyCompareRuntime fail-closed(各条路径都不产出结果,不只
 		expect(result.errorMessage).toContain("以实际解析条数为准");
 	});
 
-	/**
-	 * 终审 I1:阶段 5 的批数是 `ceil(pairs.length / batchSize)`,而 `doc_level` 降级让一条内规与
-	 * 上传件全部条款成对 —— pairs 是乘积,阶段 2 那道 500 条上限完全管不住它。没有 MAX_PAIRS 时
-	 * 这个 run 会一路跑到撞 maxTurns/maxCostUsd,两者都是 fail-closed 丢弃整个 output:钱烧完、
-	 * 零产出。
-	 */
-	it("终审 I1:doc_level 扇出超过 MAX_PAIRS → 不产出结果,且一次模型调用都没发出", async () => {
-		// 251 条内规 × 上传件 2 条条款 = 502 对 > MAX_PAIRS(500)。
-		// 251 本身没超 MAX_OBLIGATIONS(500)—— 确保这条不是被阶段 2 那道护栏抢先拦下的。
-		const n = 251;
+	it("终审 I1:批量候选总对数超过 MAX_PAIRS → 不产出结果,且一次模型调用都没发出", async () => {
+		const candidates = Array.from({ length: MAX_PAIRS + 1 }, (_, i) => ({
+			chunk_id: `C-${i}`,
+			clause_path: `内第${i}条`,
+			doc_title: "内规",
+			doc_no: null,
+			text: `内规第${i}条正文`,
+			source_code: `SC-${i}`,
+			score: 0.9,
+		}));
 		const { runtime } = await buildRuntime({
-			obligationCount: n,
 			modelReplies: [verdictReply([])],
-			resolutionsRawOverride: {
-				items: Array.from({ length: n }, (_, i) => ({
-					chunk_id: `C-${i}`,
-					// clause_path 为 null = M2 的映射粒度是文档级(规格 §5.2 的降级形态)
-					source_laws: [{ doc_no: null, doc_title: "基准外规", clause_path: null, source_code: "X" }],
-				})),
-				rejected: [],
-				unresolved: [],
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates, error: null },
+					{ query_index: 1, candidates: [], error: null },
+				],
+				total: 2,
 			},
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
-		expect(result.errorMessage).toContain("502");
+		expect(result.errorMessage).toContain(String(MAX_PAIRS + 1));
 		expect(result.errorMessage).toContain(`超过上限 ${MAX_PAIRS}`);
-		// message 要指明病因是 doc_level 扇出,否则值班的人会去查阶段 2 的条数上限
-		expect(result.errorMessage).toContain("doc_level");
 		// 护栏在阶段 5 之前停下 —— 一次模型调用都没发生(这才是「不烧预算」那半边)
 		expect(result.turns).toBe(0);
 	});
 
-	/**
-	 * 终审 I3:`checkedCount` 取 `items.length`(按行数),而 metrics 按 `chunkId` 分组累加
-	 * (按去重后的条数)—— 重复 chunk_id 会让守恒判负,而那条信息的文档写着「判负 = 代码 bug」,
-	 * 值班的人会去查 TS 组装代码,病因却在 M1 的 JOIN。
-	 */
-	it("终审 I3:M1 返回重复 chunk_id → 点名 M1,不让它退化成一条误导性的「metrics 不自洽」", async () => {
-		const row = (deonticType: string) => ({
+	it("终审 I3:批量候选返回重复 chunk_id → 点名上游,不让它退化成 metrics 错误", async () => {
+		const row = () => ({
 			chunk_id: "C-0",
 			clause_path: "内第0条",
 			doc_title: "内规",
 			doc_no: "内〔2026〕1号",
-			deontic_type: deonticType,
-			evidence: "应当",
 			text: "内规第0条正文",
 			source_code: "SC-0",
+			score: 0.9,
 		});
 		const { runtime } = await buildRuntime({
 			modelReplies: [verdictReply([])],
-			// 同一 chunk 挂了两条 is_obligation 标签(不同 deontic_type)—— 规格 §5.1 的 M1 SQL
-			// 是 chunks JOIN clause_tags,这种情况会出重复行
-			obligationsRawOverride: { items: [row("obligation"), row("prohibition")], total: 2, truncated: false },
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates: [row(), row()], error: null },
+					{ query_index: 1, candidates: [], error: null },
+				],
+				total: 2,
+			},
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
-		expect(result.errorMessage).toContain("list_internal_obligations 返回了重复 chunk_id");
-		expect(result.errorMessage).toContain("C-0");
+		expect(result.errorMessage).toContain(
+			"retrieve_internal_candidates_batch 返回候选缺少正文、chunk_id 或有重复候选",
+		);
 		// 🔴 判别力就在这条:病因指向 M1,不是笼统的守恒判负
 		expect(result.errorMessage).not.toContain("metrics 不自洽");
 	});
 
-	it("list_internal_obligations 返回形状不对(缺 items 数组)→ 不产出结果", async () => {
+	it("批量候选工具返回形状不对(缺 items 数组)→ 不产出结果", async () => {
 		const { runtime } = await buildRuntime({
-			obligationsRawOverride: { notItems: true },
+			candidateBatchRawOverride: { notItems: true },
 			modelReplies: [verdictReply([])],
 		});
 		const result = await runtime.run("比对");
@@ -632,39 +853,32 @@ describe("PolicyCompareRuntime fail-closed(各条路径都不产出结果,不只
 		expect(result.errorMessage).toContain("items");
 	});
 
-	it("resolve_source_law 返回形状不对(缺 items 数组)→ 不产出结果", async () => {
+	it("批量候选工具抛上游错误→ 不产出结果", async () => {
 		const { runtime } = await buildRuntime({
-			resolutionsRawOverride: { notItems: true },
+			candidateBatchThrows: "audit-ai MCP unavailable",
 			modelReplies: [verdictReply([])],
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
-		expect(result.errorMessage).toContain("items");
+		expect(result.errorMessage).toContain("audit-ai MCP unavailable");
 	});
 
-	it("Minor:list_internal_obligations 返回条数超过 MAX_OBLIGATIONS(500)→ 不产出结果(M1 未遵守 limit 参数)", async () => {
-		// `limit: MAX_OBLIGATIONS` 只是请求里的一个字段,请求参数本身已经被上面「阶段 2 请求
-		// 参数」那条测试锁住了 —— 这条测的是另一半:M1 完全可以无视这个参数、想回多少条就回多少
-		// 条,runtime.ts 必须自己核实**返回值**,不能只信任"我传过 limit 了"。
-		const items = Array.from({ length: MAX_OBLIGATIONS + 1 }, (_, i) => ({
-			chunk_id: `C-${i}`,
-			clause_path: `内第${i}条`,
-			doc_title: "内规",
-			doc_no: "内〔2026〕1号",
-			deontic_type: "obligation",
-			evidence: "应当",
-			text: `内规第${i}条正文`,
-			source_code: `SC-${i}`,
-		}));
+	it("批量候选响应索引重复→ 不产出结果", async () => {
 		const { runtime } = await buildRuntime({
-			obligationsRawOverride: { items, total: items.length, truncated: false },
+			candidateBatchRawOverride: {
+				items: [
+					{ query_index: 0, candidates: [], error: null },
+					{ query_index: 0, candidates: [], error: null },
+				],
+				total: 2,
+			},
 			modelReplies: [verdictReply([])],
 		});
 		const result = await runtime.run("比对");
 		expect(result.status).toBe("error");
 		expect(result.output).toBeUndefined();
-		expect(result.errorMessage).toContain(String(MAX_OBLIGATIONS));
+		expect(result.errorMessage).toContain("非法或重复 query_index");
 	});
 
 	it("外规解析失败(artifacts.fetch 抛错)→ 不产出结果", async () => {
@@ -759,15 +973,13 @@ describe("PolicyCompareRuntime · limits(评审 Finding 1:limitState.tripped 接
 		expect(result.status).toBe("limit_exceeded");
 		expect(result.limit).toBe("runTimeout");
 		expect(result.output).toBeUndefined();
-		// 卡住的那次 list_internal_obligations 调用本身在放行后确实完成了(工具执行不受
-		// session.abort() 影响),但 resolve_source_law 从未被调用 —— 下一个 checkPreempted()
-		// (阶段 2→3 边界)在它之前拦下。
-		expect(toolCalls).toEqual(["list_internal_obligations"]);
+		// 直接批量检索调用在放行后完成，但下一处 checkPreempted() 会阻止进入模型判定。
+		expect(toolCalls).toEqual(["retrieve_internal_candidates_batch"]);
 	});
 });
 
 describe("PolicyCompareRuntime · checkPreempted 判别力(评审 Finding 2:6 个检查点此前只有 1 个有测试守护)", () => {
-	it("阶段 2→3 边界:abort 落在 list_internal_obligations 挂起期间,resolve_source_law 从未被调用", async () => {
+	it("批量候选检索返回后的边界:abort 不得进入模型判定", async () => {
 		let releaseGate: () => void = () => {};
 		const gate = new Promise<void>((resolve) => {
 			releaseGate = resolve;
@@ -777,56 +989,14 @@ describe("PolicyCompareRuntime · checkPreempted 判别力(评审 Finding 2:6 �
 			gateObligations: gate,
 		});
 		const runPromise = runtime.run("比对");
-		// `!runtime.isIdle` 在 run() 一开始(甚至阶段 1 之前)就会变 true —— 不能拿它当"已经
-		// 进了阶段 2"的信号,那样 abort() 可能在 checkPreempted() 读到阶段 2 之前就已经生效,
-		// 测出来的其实是阶段 1→2 边界(已经被另一条用例覆盖),不是这条要测的阶段 2→3 边界。
-		// toolCalls.push("list_internal_obligations") 在 execute() 里 await gate 之前就先执行,
-		// 所以等它出现,才说明代码真的已经过了阶段 2 的 checkPreempted()、正卡在工具调用本身。
+		// tool call 在 await gate 之前已记录，出现即说明已进入实际批量检索调用。
 		await waitUntil(() => toolCalls.length === 1);
 		await runtime.abort();
 		releaseGate();
 		const result = await runPromise;
 		expect(result.status).toBe("aborted");
 		expect(result.output).toBeUndefined();
-		expect(toolCalls).toEqual(["list_internal_obligations"]);
-	});
-
-	it("阶段 3→4 边界:abort 落在 resolve_source_law 挂起期间,alignClauses 从未跑、阶段 5 从未发起模型调用", async () => {
-		let releaseGate: () => void = () => {};
-		const gate = new Promise<void>((resolve) => {
-			releaseGate = resolve;
-		});
-		const { runtime, toolCalls, faux } = await buildRuntime({
-			modelReplies: [verdictReply([])],
-			gateResolutions: gate,
-		});
-		// ⚠ 只看 toolCalls/faux.state.callCount 不够判别力:就算把「阶段 3→4」这一处
-		// checkPreempted() 单独删掉,alignClauses() 与它后面那句 stage("matching", 55, ...)
-		// 也照样会先跑完,紧接着「阶段 5 循环内」那处 checkPreempted()(第一批开头)会替它把
-		// abort 拦下来——toolCalls / faux.state.callCount 在两种情况下长得一模一样,测不出区别
-		// (探针实测过:注释掉「阶段 3→4」那一处,这条用例原来的断言组合确实不会翻红)。
-		// percent:55 那次 stage 事件只有在 alignClauses 真的跑过之后才会发出,拿它当判别信号:
-		// 「阶段 3→4」的检查点存在 ⇒ abort 必须在 alignClauses 之前就被拦下 ⇒ percent:55 永远
-		// 不会被发出。
-		const events: RuntimeEvent[] = [];
-		runtime.subscribe((e) => {
-			if (e.type === "compare_stage") events.push(e);
-		});
-		const runPromise = runtime.run("比对");
-		// 等 resolve_source_law 真的已经开始执行(toolCalls 里出现第二项)再 abort,才是在测
-		// 阶段 3→4 边界,不是提前撞上阶段 2→3 边界。
-		await waitUntil(() => toolCalls.length === 2);
-		await runtime.abort();
-		releaseGate();
-		const result = await runPromise;
-		expect(result.status).toBe("aborted");
-		expect(result.output).toBeUndefined();
-		expect(toolCalls).toEqual(["list_internal_obligations", "resolve_source_law"]);
-		// alignClauses 是纯代码、阶段 4→5 之间没有可挂的 await 点 —— 唯一能验证"阶段 5 真的没跑"
-		// 的办法是看模型压根没被调用过(faux 自己的调用计数,独立于 runtime.ts 的 modelCalls)。
-		expect(faux.state.callCount).toBe(0);
-		const percents = events.map((e) => (e.payload as { percent: number }).percent);
-		expect(percents).not.toContain(55);
+		expect(toolCalls).toEqual(["retrieve_internal_candidates_batch"]);
 	});
 
 	it("阶段 5 循环内边界:abort 落在两批之间(第一批已完整返回、第二批还没发起)", async () => {
@@ -886,9 +1056,9 @@ describe("PolicyCompareRuntime · checkPreempted 判别力(评审 Finding 2:6 �
 			],
 		});
 		const runPromise = runtime.run("比对");
-		// 两次工具调用都已完成 ⇒ 已经过了阶段 3→4 边界、进入阶段 5,batch 1 的 prompt() 正被
+		// 批量工具调用已完成 ⇒ 已进入阶段 5,batch 1 的 prompt() 正被
 		// gate 卡住(gate 在我们主动 releasePrompt() 之前永远不 resolve,不依赖任何计时窗口)。
-		await waitUntil(() => toolCalls.length === 2);
+		await waitUntil(() => toolCalls.length === 1);
 		await runtime.abort();
 		releasePrompt();
 		const result = await runPromise;
@@ -1013,11 +1183,11 @@ describe("PolicyCompareRuntime · 终审 C1(跨批 pairIndex 覆盖:判定挂到
 		expect(discarded.join("\n")).toContain("[2, 4)");
 
 		// ③ 第 2 批那两对因此没有判定 → 计入 unmatched,并各自写一条 gap
-		expect(body.metrics.unmatched).toBe(2);
-		expect(body.gaps.join("\n")).toContain("C-2 未获模型判定");
+		expect(body.metrics.unmatched).toBe(1);
+		expect(body.gaps.join("\n")).toContain("C-1 未获模型判定");
 		expect(body.gaps.join("\n")).toContain("C-3 未获模型判定");
-		// 守恒仍然成立(阶段 6 的校验独立再判一次):1 missing + 0 conflict + 1 covered + 2 unmatched = 4
-		expect(body.metrics.checked).toBe(4);
-		expect(body.metrics.missing + body.metrics.conflict + body.metrics.covered + body.metrics.unmatched).toBe(4);
+		// 指标按两条外规条款汇总，守恒不受同一条下多个内规候选影响。
+		expect(body.metrics.checked).toBe(2);
+		expect(body.metrics.missing + body.metrics.conflict + body.metrics.covered + body.metrics.unmatched).toBe(2);
 	});
 });

@@ -154,3 +154,87 @@ export function alignClauses(
 
 	return { pairs, unmatched };
 }
+
+/**
+ * 外规→内规覆盖比对的批量检索对齐。
+ *
+ * 每条外规只能与它自己的检索候选成对：这与旧的「内规显式引用外规」映射完全不同。
+ * 候选为空或该条检索失败都保留为显式缺失，由组装层生成可审计的结果行。
+ */
+export function alignBatchCandidates(
+	doc: ExternalDocument,
+	items: ReadonlyArray<{ queryIndex: number; candidates: readonly InternalObligation[]; error: string | null }>,
+): AlignmentResult {
+	const byIndex = new Map(items.map((item) => [item.queryIndex, item]));
+	const pairs: ClausePair[] = [];
+	const uncoveredExternalClauses: NonNullable<AlignmentResult["uncoveredExternalClauses"]> = [];
+
+	for (const [index, externalClause] of doc.clauses.entries()) {
+		const item = byIndex.get(index);
+		if (!item || item.error || item.candidates.length === 0) {
+			uncoveredExternalClauses.push({
+				externalClause,
+				reason: item?.error ? "retrieval_failed" : "no_internal_candidate",
+			});
+			continue;
+		}
+		for (const internalObligation of item.candidates) {
+			pairs.push(pairOf(externalClause, internalObligation, "semantic_retrieval"));
+		}
+	}
+	return { pairs, unmatched: [], uncoveredExternalClauses, countBy: "external" };
+}
+
+/**
+ * 内规→外规覆盖比对的对称批量检索对齐。
+ *
+ * 这里的输入条款是待核查内规，MCP 返回的是语义相关的外规候选。它不读取也不假定
+ * 「内规条款 → 外规条款」关系表；每个待核查内规条款与其检索得到的外规候选直接成对，
+ * 后续仍由模型按同一覆盖判定契约判定。
+ */
+export function alignInternalToExternalBatchCandidates(
+	internalClauses: readonly ExternalClause[],
+	items: ReadonlyArray<{ queryIndex: number; candidates: readonly InternalObligation[]; error: string | null }>,
+	internalTitle: string,
+	internalDocNo?: string,
+): AlignmentResult {
+	const byIndex = new Map(items.map((item) => [item.queryIndex, item]));
+	const pairs: ClausePair[] = [];
+	const unmatched: UnmatchedObligation[] = [];
+	const uncoveredInternalClauses: NonNullable<AlignmentResult["uncoveredInternalClauses"]> = [];
+
+	for (const [index, internalClause] of internalClauses.entries()) {
+		const item = byIndex.get(index);
+		const sourceInternal: InternalObligation = {
+			chunkId: `source-internal:${index}:${internalClause.seq}`,
+			clausePath: internalClause.clausePath || null,
+			docTitle: internalTitle,
+			docNo: internalDocNo ?? null,
+			deonticType: "obligation",
+			evidence: null,
+			text: internalClause.text,
+			sourceCode: null,
+		};
+		if (!item || item.error || item.candidates.length === 0) {
+			const reason = item?.error ? "external_retrieval_failed" : "no_external_candidate";
+			unmatched.push({ internalChunkId: sourceInternal.chunkId, reason });
+			uncoveredInternalClauses.push({ internalObligation: sourceInternal, reason });
+			continue;
+		}
+		for (const candidate of item.candidates) {
+			pairs.push(
+				pairOf(
+					{
+						seq: index,
+						clausePath: candidate.clausePath ?? "",
+						text: candidate.text,
+					},
+					sourceInternal,
+					"semantic_retrieval",
+				),
+			);
+		}
+	}
+	// 一个待核查内规条款可能检索到多条外规候选，但结论必须归集回该内规条款。
+	return { pairs, unmatched, uncoveredInternalClauses, countBy: "internal" };
+}

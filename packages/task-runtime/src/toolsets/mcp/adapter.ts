@@ -10,6 +10,11 @@ export interface McpServerSpec {
 	/** 白名单 env(安全方案 L1(a))。eval 模式下在此注入 EVAL_TASK_LOG。 */
 	env: Record<string, string>;
 	cwd?: string;
+	/**
+	 * 单次 MCP 请求的硬超时。默认由 McpClient 采用 30s；检索/模型类工具可在 spec 中
+	 * 显式放宽，避免首次加载模型时被通用超时误杀。
+	 */
+	requestTimeoutMs?: number;
 }
 
 /** 多 server 同名工具时的前缀分隔符。 */
@@ -38,6 +43,27 @@ function assertScope(scope: McpRunScope): void {
 	}
 	if (!Array.isArray(scope.corpusTypes) || scope.corpusTypes.length === 0) {
 		throw new Error("MCP toolset scope has empty corpusTypes; refusing to serve without an authorization scope");
+	}
+}
+
+/**
+ * `get_clause_detail` 的正文已经由受信 MCP 返回；把通过最小形状校验的正文放进工具私有 details，
+ * 供运行时在最终响应中复用。details 不会进入模型上下文，避免正文因展示需求重复占用 prompt。
+ */
+function sourceDetails(text: string): Array<Record<string, unknown>> {
+	try {
+		const parsed = JSON.parse(text) as { items?: unknown };
+		if (!Array.isArray(parsed.items)) return [];
+		return parsed.items.filter(
+			(item): item is Record<string, unknown> =>
+				typeof item === "object" &&
+				item !== null &&
+				typeof (item as { clause_id?: unknown }).clause_id === "string" &&
+				typeof (item as { text?: unknown }).text === "string" &&
+				(item as { text: string }).text.trim().length > 0,
+		);
+	} catch {
+		return [];
 	}
 }
 
@@ -167,7 +193,7 @@ function toToolDefinition(
 			}
 			return {
 				content: [{ type: "text", text: result.text }],
-				details: undefined,
+				details: info.name === "get_clause_detail" ? { source_details: sourceDetails(result.text) } : undefined,
 			};
 		},
 	};

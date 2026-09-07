@@ -7,11 +7,14 @@ import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createEscalatingRuntime } from "../runtime/escalating-runtime.ts";
 import { createFastPathRuntime } from "../runtime/fast-path-runtime.ts";
 import { createArtifactStore, createMinioObjectGetter } from "../runtime/policy-compare/artifact-store.ts";
+import type { DocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import { createDocumentsClient } from "../runtime/policy-compare/documents-client.ts";
 import { createPolicyCompareRuntime } from "../runtime/policy-compare/runtime.ts";
+import { createVersionDiffRuntime } from "../runtime/policy-compare/version-diff-runtime.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
+import { createPostgresRunStore } from "../store/postgres.ts";
 import { createSqliteRunStore } from "../store/sqlite.ts";
 import { createAuditReportToolset } from "../toolsets/audit-report.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
@@ -23,7 +26,10 @@ import { RunManager } from "./run-manager.ts";
 
 export interface ServeOptions {
 	port: number;
-	dbPath: string;
+	/** audit-ai pipeline PostgreSQL DSN；任务历史唯一持久化位置。 */
+	databaseUrl?: string;
+	/** @deprecated 仅兼容旧测试配置；生产服务不再读取 SQLite。 */
+	dbPath?: string;
 	specsDir: string;
 	internalToken: string | undefined;
 	// 必填注入点(不是可选):真实装配要么起 MCP 子进程要么要真实模型,两者都超出 S1a
@@ -32,12 +38,20 @@ export interface ServeOptions {
 	runtimeFactory: RuntimeFactory;
 	maxConcurrent?: number;
 	maxQueueDepth?: number;
+	documents?: DocumentsClient;
 }
 
 export async function startServer(options: ServeOptions): Promise<{ port: number; close: () => Promise<void> }> {
-	const store = createSqliteRunStore(options.dbPath);
+	// `dbPath` 仅供已有单测注入同步 fake-store 行为；CLI 生产路径只传 databaseUrl，缺失即拒绝启动。
+	const store = options.databaseUrl
+		? await createPostgresRunStore(options.databaseUrl)
+		: options.dbPath
+			? createSqliteRunStore(options.dbPath)
+			: (() => {
+					throw new Error("PIPELINE_DB_DSN is required; SQLite task storage has been removed");
+				})();
 	// 必须在开始接请求之前跑:否则 Java 会永远等一个不会完成的 run(设计文档 §5.7)。
-	const recovered = store.recoverStaleRuns(Date.now());
+	const recovered = await store.recoverStaleRuns(Date.now());
 	if (recovered > 0) {
 		console.error(`[task-runtime] startup recovery marked ${recovered} stale run(s) as error`);
 	}
@@ -46,7 +60,13 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 	const gate = new Gate({ maxConcurrent: options.maxConcurrent, maxQueueDepth: options.maxQueueDepth });
 	const manager = new RunManager({ store, gate, runtimeFactory: options.runtimeFactory });
 
-	const app = createApp({ manager, router, store, internalToken: options.internalToken });
+	const app = createApp({
+		manager,
+		router,
+		store,
+		internalToken: options.internalToken,
+		documents: options.documents,
+	});
 	// `server.listen()`(hono 内部调用)是异步绑定的:serve() 同步返回时,底层 socket
 	// 大概率还没 bind 完成 —— 此刻 server.address() 恒为 null,若不等 "listening" 就
 	// 返回,close() 在真正开始监听前被调用会直接抛 ERR_SERVER_NOT_RUNNING(而不是把
@@ -88,7 +108,7 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 		// session-runtime.ts)。这里若不吞掉,会用一个面目全非的次生报错替换掉本该抛出的
 		// error(比如 EADDRINUSE),让「端口被占用」变成一个毫不相关的 store 关闭失败。
 		try {
-			store.close();
+			await store.close();
 		} catch (closeError) {
 			console.error("[task-runtime] failed to close the store after a bind failure", closeError);
 		}
@@ -119,7 +139,7 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 			await new Promise<void>((resolve, reject) => {
 				server.close((error) => (error ? reject(error) : resolve()));
 			});
-			store.close();
+			await store.close();
 		},
 	};
 }
@@ -246,6 +266,15 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		// 🔴 分派顺序:`workflow` 排在 `fastPath` 之前。前者整条换掉 Runtime 实现(连
 		// SessionRuntime 都不经过),后者是 SessionRuntime 内部把模型调用压成固定 2 次 ——
 		// 外层的先判。两者同时声明已由 validateSpec 在装配期拒掉,这里不会同时命中。
+		if (spec.workflow === "policy-version-diff") {
+			// 版本差异由 Java 主库读取两份条款后 inline 下传；
+			// 不依赖 MinIO、audit-ai 制度目录或模型，避免把确定性 diff 退化为 agent 推理。
+			return createVersionDiffRuntime({
+				spec,
+				payload,
+			});
+		}
+
 		if (spec.workflow === "policy-compare") {
 			// 确定性工作流:模型不编排,工具由代码经 Assembled.callTool 发起。
 			// 三个外部依赖走 env —— 凭证绝不入库,缺任何一个都在这里 fail-closed。
@@ -259,7 +288,24 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			const rawBatchSize = parseBatchSizeOption((runOptions as { batchSize?: unknown }).batchSize);
 			const baseUrl = requireEnv("AUDIT_AI_BASE_URL");
 			const internalToken = requireEnv("AUDIT_AI_INTERNAL_TOKEN");
-			const bucket = requireEnv("DFZQ_UPLOADS_BUCKET");
+			// 知识库选文档的覆盖比对不会读 MinIO。若在这里一次性 require 全部上传配置，
+			// 它会被与上传无关的 library→library 请求错误拦截；把配置读取推迟至真的 fetch 时。
+			// 上传路径仍然 fail-closed：任一 MinIO 配置缺失会在第一次取 artifact 前明确失败。
+			const artifacts = {
+				fetch: async (artifactKey: string) => {
+					const bucket = requireEnv("DFZQ_UPLOADS_BUCKET");
+					return createArtifactStore({
+						bucket,
+						get: createMinioObjectGetter({
+							endPoint: requireEnv("DFZQ_MINIO_ENDPOINT"),
+							port: process.env.DFZQ_MINIO_PORT ? Number(process.env.DFZQ_MINIO_PORT) : undefined,
+							useSSL: process.env.DFZQ_MINIO_USE_SSL === "1",
+							accessKey: requireEnv("DFZQ_MINIO_ACCESS_KEY"),
+							secretKey: requireEnv("DFZQ_MINIO_SECRET_KEY"),
+						}),
+					}).fetch(artifactKey);
+				},
+			};
 			return createPolicyCompareRuntime({
 				spec,
 				profile,
@@ -272,16 +318,8 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 				outputContractSchema: outputContractSchemas.get(specId),
 				payload,
 				documents: createDocumentsClient({ baseUrl, internalToken }),
-				artifacts: createArtifactStore({
-					bucket,
-					get: createMinioObjectGetter({
-						endPoint: requireEnv("DFZQ_MINIO_ENDPOINT"),
-						port: process.env.DFZQ_MINIO_PORT ? Number(process.env.DFZQ_MINIO_PORT) : undefined,
-						useSSL: process.env.DFZQ_MINIO_USE_SSL === "1",
-						accessKey: requireEnv("DFZQ_MINIO_ACCESS_KEY"),
-						secretKey: requireEnv("DFZQ_MINIO_SECRET_KEY"),
-					}),
-				}),
+				permissionTags: filters.permTags ?? [],
+				artifacts,
 				batchSize: rawBatchSize,
 				skillPaths: skillPaths.get(specId),
 			});

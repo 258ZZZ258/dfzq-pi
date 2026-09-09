@@ -1,6 +1,8 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { type ServerType, serve } from "@hono/node-server";
+import { parseReportInput } from "../audit-report/report-input.ts";
+import { createBoundAuditReportTools } from "../audit-report/report-tools.ts";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
@@ -229,12 +231,18 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		const buildToolsets = (): ToolsetRegistry => {
 			const registry = new ToolsetRegistry();
 			if (spec.toolset === "audit-report") {
-				if (!options.auditReportSources) {
-					throw new Error("audit-report source configuration is not available");
-				}
 				if (!runOptions.reportTaskId || !runOptions.reportType) {
 					throw new Error("audit-report requires options.reportTaskId and options.reportType");
 				}
+				if (payload !== undefined) {
+					const dataset = parseReportInput(payload, runOptions.reportTaskId, runOptions.reportType);
+					registry.register(spec.toolset, async () =>
+						createBoundAuditReportTools(dataset, resolve(options.specsDir, "audit-report/skills")),
+					);
+					return registry;
+				}
+				if (!options.auditReportSources)
+					throw new Error("audit-report requires Java input payload or server source configuration");
 				registry.register(
 					spec.toolset,
 					createAuditReportToolset({

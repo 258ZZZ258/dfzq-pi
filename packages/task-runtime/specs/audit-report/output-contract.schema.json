@@ -2,22 +2,20 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["taskId", "reportType", "templateId", "templateVersion", "titleLines", "introduction", "sections", "closingOrganization", "reportDate", "status", "blockers", "warnings", "allEvidenceIds"],
+  "required": ["schemaVersion", "structureHash", "report", "nodes", "citations"],
   "properties": {
-    "taskId": { "type": "string", "minLength": 1 },
-    "reportType": { "enum": ["regular", "turnover", "aml"] },
-    "templateId": { "type": "string", "minLength": 1 },
-    "templateVersion": { "type": "string", "minLength": 1 },
-    "titleLines": { "type": "array", "minItems": 1, "items": { "type": "string" } },
-    "addressee": { "type": "string" },
-    "introduction": { "$ref": "#/definitions/paragraph" },
-    "sections": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/section" } },
-    "closingOrganization": { "type": "string", "minLength": 1 },
-    "reportDate": { "type": "string", "minLength": 1 },
-    "status": { "enum": ["draft", "needs-input", "ready-for-review"] },
-    "blockers": { "type": "array", "items": { "type": "string" } },
-    "warnings": { "type": "array", "items": { "type": "string" } },
-    "allEvidenceIds": { "$ref": "#/definitions/evidenceIds" }
+    "schemaVersion": { "const": "audit-report-document.v1" },
+    "structureHash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "report": { "$ref": "#/definitions/report" },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/node" }
+    },
+    "citations": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/citation" }
+    }
   },
   "definitions": {
     "evidenceIds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
@@ -67,6 +65,96 @@
         "tables": { "type": "array", "items": { "$ref": "#/definitions/table" } },
         "subsections": { "type": "array", "items": { "$ref": "#/definitions/subsection" } },
         "closingParagraphs": { "type": "array", "items": { "$ref": "#/definitions/paragraph" } }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskId", "reportType", "templateId", "templateVersion", "titleLines", "introduction", "sections", "closingOrganization", "reportDate", "status", "blockers", "warnings", "allEvidenceIds"],
+      "properties": {
+        "taskId": { "type": "string", "minLength": 1 },
+        "reportType": { "enum": ["consultation", "regular", "turnover"] },
+        "workflow": {"type":"object", "additionalProperties":false, "required":["mode","matchingCompleted","consultationExists"], "properties": {
+          "mode":{"enum":["independent","linked","consultation","turnover"]},
+          "matchingCompleted":{"type":"boolean"}, "consultationExists":{"type":"boolean"},
+          "sourceReportId":{"type":"string"}, "sourceVersion":{"type":"integer","minimum":1}, "sourceDataVersion":{"type":"string"},
+          "feedbackStatus":{"enum":["pending","completed"]}, "resolutionStatus":{"enum":["pending","completed"]},
+          "feedbackCompletedAt":{"type":"string"}, "feedbackDeadline":{"type":"string"}, "feedbackRequirement":{"type":"string"}
+        }},
+        "templateId": { "type": "string", "minLength": 1 },
+        "templateVersion": { "type": "string", "minLength": 1 },
+        "titleLines": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "addressee": { "type": "string" },
+        "introduction": { "$ref": "#/definitions/paragraph" },
+        "sections": { "type": "array", "minItems": 1, "items": { "$ref": "#/definitions/section" } },
+        "closingOrganization": { "type": "string", "minLength": 1 },
+        "reportDate": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["draft", "needs-input", "ready-for-review"] },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } },
+        "allEvidenceIds": { "$ref": "#/definitions/evidenceIds" }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeId", "nodeType", "order", "text", "styleRef", "textEditable", "citationIds", "requiresHumanReview"],
+      "properties": {
+        "nodeId": { "type": "string", "minLength": 1 },
+        "nodeType": { "enum": ["title", "addressee", "heading", "paragraph", "table", "closing-organization", "report-date"] },
+        "parentId": { "type": "string", "minLength": 1 },
+        "order": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string" },
+        "styleRef": { "type": "string", "minLength": 1 },
+        "textEditable": { "type": "boolean" },
+        "citationIds": { "$ref": "#/definitions/evidenceIds" },
+        "basis": {"$ref":"#/definitions/nodeBasis"},
+        "requiresHumanReview": { "type": "boolean" }
+      }
+    },
+    "nodeBasis": {
+      "type":"object", "additionalProperties":false,
+      "required":["kind","textHash","sourceGroups"],
+      "properties": {
+        "kind":{"enum":["business-record","template","missing"]},
+        "textHash":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},
+        "template":{"type":"object","additionalProperties":false,"required":["templateId","templateVersion","paragraphId"],"properties":{"templateId":{"type":"string"},"templateVersion":{"type":"string"},"paragraphId":{"type":"string"}}},
+        "sourceGroups":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["sourceId","sourceName","sourceRecordId","asOf","dataVersion","citationIds"],"properties":{"sourceId":{"type":"string"},"sourceName":{"type":"string"},"sourceRecordId":{"type":"string"},"asOf":{"type":"string"},"dataVersion":{"type":"string"},"citationIds":{"$ref":"#/definitions/evidenceIds"}}}}
+      }
+    },
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["citationId", "title", "summary", "sourceType", "source", "lineage", "asOf", "dataVersion"],
+      "properties": {
+        "citationId": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" },
+        "sourceType": { "const": "business-record" },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sourceId", "sourceName", "sourceRecordId", "sourceField", "authority", "sourceCatalogRegistered"],
+          "properties": {
+            "sourceId": { "type": "string", "minLength": 1 },
+            "sourceName": { "type": "string", "minLength": 1 },
+            "sourceRecordId": { "type": "string", "minLength": 1 },
+            "sourceField": { "type": "string", "minLength": 1 },
+            "authority": { "enum": ["primary", "supporting", "cross-check", "unknown"] },
+            "sourceCatalogRegistered": { "type": "boolean" }
+          }
+        },
+        "lineage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "evidenceIds"],
+          "properties": {
+            "mode": { "const": "direct-field" },
+            "evidenceIds": { "$ref": "#/definitions/evidenceIds" }
+          }
+        },
+        "asOf": { "type": "string" },
+        "dataVersion": { "type": "string", "minLength": 1 }
       }
     }
   }

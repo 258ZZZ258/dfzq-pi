@@ -11,6 +11,7 @@ import type {
 	AuditFinding,
 	AuditReportDataset,
 	AuditReportType,
+	BusinessCheck,
 	DataSourceDefinition,
 	EvidenceRecord,
 	OperatingMetric,
@@ -20,6 +21,7 @@ import type {
 	PersonnelSnapshot,
 	RectificationRecord,
 	ReportTask,
+	ReportWorkflow,
 	RiskEvent,
 } from "./report-contracts.ts";
 
@@ -122,12 +124,8 @@ function sheetRecords(workbook: XLSX.WorkBook, sheetName: string): FlatRecord[] 
 }
 
 function sanitizeEvidencePart(value: string): string {
-	return (
-		value
-			.replace(/[^A-Za-z0-9_-]+/g, "-")
-			.replace(/^-+|-+$/g, "")
-			.slice(0, 80) || "record"
-	);
+	// Preserve Chinese labels and punctuation without collisions or truncation.
+	return Buffer.from(value, "utf8").toString("hex");
 }
 
 function sourceDefinitions(records: FlatRecord[]): DataSourceDefinition[] {
@@ -278,7 +276,7 @@ async function loadOperatingMetrics(
 	const auditEndYear = Number(task.auditEnd.slice(0, 4));
 	const availablePeriods = metrics[0]?.points.map((point) => point.period) ?? [];
 	const selectedPeriods =
-		task.reportType === "regular"
+		task.reportType !== "turnover"
 			? availablePeriods.filter((period) => {
 					const year = periodYear(period);
 					return year !== undefined && year >= auditStartYear && year <= auditEndYear;
@@ -373,6 +371,44 @@ export async function loadAuditReportDataset(
 			: {}),
 		feedbackCompleted: booleanValue(taskRecord, "feedbackCompleted"),
 	};
+	const workflowEndpoint = `/api/audit/projects/${encodeURIComponent(options.taskId)}/workflow`;
+	const workflowEnvelope = await get("DS-01", workflowEndpoint);
+	const workflowRecord = asRecord(workflowEnvelope.data, workflowEndpoint);
+	task.workflow = {
+		mode: text(workflowRecord, "mode") as ReportWorkflow["mode"],
+		matchingCompleted: booleanValue(workflowRecord, "matchingCompleted"),
+		consultationExists: booleanValue(workflowRecord, "consultationExists"),
+		...(optionalNumber(workflowRecord, "sourceVersion") === undefined
+			? {}
+			: { sourceVersion: optionalNumber(workflowRecord, "sourceVersion") }),
+		...Object.fromEntries(
+			[
+				"sourceReportId",
+				"sourceDataVersion",
+				"feedbackStatus",
+				"resolutionStatus",
+				"feedbackCompletedAt",
+				"feedbackDeadline",
+				"feedbackRequirement",
+			].flatMap((field) =>
+				optionalText(workflowRecord, field) ? [[field, optionalText(workflowRecord, field)]] : [],
+			),
+		),
+	};
+	for (const [field, value] of Object.entries(workflowRecord))
+		addEvidence("DS-01", task.taskId, field, value, workflowEnvelope.meta, workflowEndpoint, task.auditEnd);
+	const checksEndpoint = `/api/audit/projects/${encodeURIComponent(options.taskId)}/checks`;
+	const checksEnvelope = await get("DS-03", checksEndpoint);
+	const checks: BusinessCheck[] = asRecords(checksEnvelope.data, checksEndpoint).map((r) => ({
+		code: text(r, "code"),
+		result: text(r, "result") as BusinessCheck["result"],
+		factText: optionalText(r, "factText"),
+		sampleCount: optionalNumber(r, "sampleCount"),
+		exceptionCount: optionalNumber(r, "exceptionCount"),
+		evidenceIds: [
+			addEvidence("DS-03", text(r, "code"), "result", r.result, checksEnvelope.meta, checksEndpoint, task.auditEnd),
+		],
+	}));
 	for (const field of [
 		"projectId",
 		"reportType",
@@ -515,7 +551,6 @@ export async function loadAuditReportDataset(
 		organizationId: task.organizationId,
 		projectId: task.projectId,
 	});
-	if (task.reportType === "aml") findingsParams.set("category", "反洗钱工作");
 	const findingsEndpoint = `/api/audit/findings?${findingsParams.toString()}`;
 	const findingListEnvelope = await get("DS-03", findingsEndpoint);
 	const currentFindingList = asRecords(findingListEnvelope.data, findingsEndpoint);
@@ -1048,11 +1083,12 @@ export async function loadAuditReportDataset(
 		task,
 		evidence,
 		trace,
-		task.reportType === "aml",
+		false,
 	);
 
 	return {
 		dataset: {
+			checks,
 			caseId: text(taskRecord, "caseId"),
 			description: text(taskRecord, "description"),
 			task,

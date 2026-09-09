@@ -17,7 +17,7 @@ export interface AuditReportRequestContext {
 const reportContext = new AsyncLocalStorage<AuditReportRequestContext>();
 
 export function createAuditReportRequestContext(dataset: AuditReportDataset): AuditReportRequestContext {
-	return { dataset, trace: [] };
+	return { dataset: structuredClone(dataset), trace: [] };
 }
 
 export function withAuditReportRequestContext<T>(

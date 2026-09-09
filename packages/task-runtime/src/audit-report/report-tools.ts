@@ -10,6 +10,7 @@ import {
 	withAuditReportRequestContext,
 } from "./report-context.ts";
 import type { AuditFinding, AuditReportDataset, ReportDraft } from "./report-contracts.ts";
+import { reportDocumentMatches, toAuditReportJavaDocument } from "./report-java-contract.ts";
 import {
 	buildFactPack,
 	comparePreviousAuditFindings,
@@ -398,9 +399,11 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 			const context = requireAuditReportRequestContext();
 			context.factPack ??= buildFactPack(context.dataset);
 			context.draft = generateReportDraft(context.dataset, context.factPack);
+			const document = toAuditReportJavaDocument(context.dataset, context.draft);
 			recordReportToolTrace("generate_report_draft", [context.draft.taskId]);
-			return result(JSON.stringify(context.draft, null, 2), {
+			return result(JSON.stringify(document, null, 2), {
 				draft: context.draft,
+				document,
 			});
 		},
 	});
@@ -520,12 +523,34 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 				return result(`Revision rejected: ${errors.join("; ")}`, { valid: false, errors });
 			}
 			context.draft = draft;
+			const document = toAuditReportJavaDocument(context.dataset, draft);
 			recordReportToolTrace("revise_report_draft", [draft.taskId]);
-			return result(JSON.stringify(draft, null, 2), { valid: true, draft });
+			return result(JSON.stringify(document, null, 2), { valid: true, draft, document });
 		},
 	});
 
 	return [
+		defineTool({
+			name: "validate_report_document",
+			label: "Validate final report consistency",
+			description:
+				"Read-only comparison with the current tool-generated document. Never accepts a replacement baseline.",
+			parameters: Type.Object({ documentJson: Type.String() }),
+			executionMode: "sequential",
+			async execute(_id, params) {
+				const context = requireAuditReportRequestContext();
+				let candidate: unknown;
+				try {
+					candidate = JSON.parse(params.documentJson);
+				} catch {
+					return result('{"valid":false}', { valid: false });
+				}
+				if (!context.draft) return result('{"valid":false}', { valid: false });
+				const expected = toAuditReportJavaDocument(context.dataset, context.draft);
+				const valid = reportDocumentMatches(expected, candidate);
+				return result(JSON.stringify({ valid }), { valid });
+			},
+		}),
 		createAuditReportRestrictedReadTool(skillRoot),
 		getTask,
 		getOrganization,

@@ -1,6 +1,6 @@
 {
   "id": "audit-report",
-  "description": "常规、离任和反洗钱审计报告生成",
+  "description": "审计征求意见书、常规审计报告（含反洗钱附件）和离任审计报告生成",
   "model": { "role": "main" },
   "thinkingLevel": "medium",
   "toolset": "audit-report",
@@ -18,7 +18,8 @@
     "get_aml_facts",
     "prepare_report_fact_pack",
     "generate_report_draft",
-    "revise_report_draft"
+    "revise_report_draft",
+    "validate_report_document"
   ],
   "systemPrompt": "audit-report/system.md",
   "skills": ["audit-report/skills/SKILL.md"],

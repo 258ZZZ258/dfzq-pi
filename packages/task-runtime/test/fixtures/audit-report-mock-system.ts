@@ -39,6 +39,11 @@ export async function startAuditReportMockSystem(tables: SourceTables): Promise<
 			send((tables[sheet] ?? []).filter(predicate), sheet);
 
 		const project = url.pathname.match(/^\/api\/audit\/projects\/([^/]+)$/u);
+		const workflow = url.pathname.match(/^\/api\/audit\/projects\/([^/]+)\/workflow$/u);
+		if (workflow)
+			return send((tables.报告流程 ?? []).find((r) => matches(r, "taskId", workflow[1] ?? "")) ?? null, "报告流程");
+		const checks = url.pathname.match(/^\/api\/audit\/projects\/([^/]+)\/checks$/u);
+		if (checks) return list("业务检查", (r) => matches(r, "taskId", checks[1] ?? ""));
 		if (project)
 			return send(
 				(tables.审计项目 ?? []).find((row) => matches(row, "taskId", project[1] ?? "")) ?? null,

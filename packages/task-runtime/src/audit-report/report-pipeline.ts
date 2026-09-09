@@ -15,6 +15,7 @@ import type {
 	ReportTable,
 	SourceCoverageAssessment,
 } from "./report-contracts.ts";
+import { businessCheckErrors, workflowErrors } from "./report-workflow.ts";
 
 const sourceStatusWeight: Readonly<Record<DataSourceDefinition["implementationStatus"], number>> = {
 	ready: 1,
@@ -81,7 +82,7 @@ const requiredCapabilities: Readonly<Record<AuditReportType, readonly string[]>>
 		"template-slots",
 		"generation-rules",
 	],
-	aml: [
+	consultation: [
 		"audit-project",
 		"audit-period",
 		"organization-id",
@@ -279,7 +280,12 @@ function percentage(numerator: number, denominator: number): number {
 }
 
 export function assessSourceCoverage(dataset: AuditReportDataset): SourceCoverageAssessment {
-	const required = requiredCapabilities[dataset.task.reportType];
+	const required = unique([
+		...requiredCapabilities[dataset.task.reportType],
+		...(dataset.task.reportType !== "turnover"
+			? [...requiredCapabilities.regular, ...requiredCapabilities.consultation]
+			: []),
+	]);
 	const capabilitySource = new Map<string, DataSourceDefinition>();
 	for (const source of dataset.sources) {
 		for (const capability of source.providedCapabilities) {
@@ -376,7 +382,7 @@ function hasCompleteOrganizationOverview(dataset: AuditReportDataset): boolean {
 		dataset.organization.address.trim().length > 0 &&
 		!dataset.organization.address.includes("模拟地址") &&
 		dataset.organization.areaSquareMeters > 0 &&
-		dataset.personnel.employeeCount > 0
+		dataset.personnel.employeeCount >= 0
 	);
 }
 
@@ -395,7 +401,7 @@ function organizationOverviewText(dataset: AuditReportDataset, includeAppointmen
 
 export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 	const organizationMatchesTask = dataset.organization.organizationId === dataset.task.organizationId;
-	const organizationOverviewComplete = dataset.task.reportType === "aml" || hasCompleteOrganizationOverview(dataset);
+	const organizationOverviewComplete = hasCompleteOrganizationOverview(dataset);
 	const items: ReadinessItem[] = [
 		readiness(
 			"common.organization",
@@ -404,9 +410,7 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 			!organizationMatchesTask
 				? "营业部主数据与任务机构不匹配。"
 				: organizationOverviewComplete
-					? dataset.task.reportType === "aml"
-						? "营业部主数据与任务机构匹配；反洗钱报告不使用地址、面积和人员概况字段。"
-						: "营业部主数据与任务机构匹配，地址、面积及人员关键字段完整。"
+					? "营业部主数据与任务机构匹配，地址、面积及人员关键字段完整。"
 					: "营业部地址、面积或人员数量未从权威来源完整取得，禁止使用模拟地址或零值生成机构概况。",
 			unique([...dataset.organization.evidenceIds, ...dataset.personnel.evidenceIds]),
 		),
@@ -420,7 +424,7 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 		readiness(
 			"common.operating_metrics",
 			dataset.operatingMetrics.length > 0 ? "VERIFIED_VALUE" : "MISSING",
-			dataset.task.reportType !== "aml" && dataset.operatingMetrics.length === 0,
+			dataset.operatingMetrics.length === 0,
 			"经营指标用于常规和离任报告。",
 			unique(dataset.operatingMetrics.flatMap((metric) => metric.points.flatMap((point) => point.evidenceIds))),
 		),
@@ -467,7 +471,7 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 		);
 	}
 
-	if (dataset.task.reportType === "aml") {
+	if (dataset.task.reportType !== "turnover") {
 		const expectedDomains = new Set<AmlDomainFact["domain"]>([
 			"internal-control",
 			"customer-identification",
@@ -517,7 +521,7 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 
 	const coverage = assessSourceCoverage(dataset);
 	const blockers = items.filter((item) => item.blocking).map((item) => `${item.fieldId}: ${item.message}`);
-	if (!dataset.task.feedbackCompleted) blockers.push("审计征求意见反馈流程未完成。");
+	blockers.push(...workflowErrors(dataset.task), ...businessCheckErrors(dataset));
 	if (dataset.task.reportType === "turnover") {
 		const previousAuditComparison = comparePreviousAuditFindings(dataset.findings);
 		const narrativeClaimsPreviousAudit = /历次审计发现的问题主要包括|上一次审计发现的问题主要包括/u.test(
@@ -536,11 +540,8 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 	if (coverage.productionReadiness < 80) {
 		warnings.push(`生产数据源接入准备度仅${coverage.productionReadiness}%，模拟数据不能替代接口联调。`);
 	}
-	const disclosedFindings = (
-		dataset.task.reportType === "aml"
-			? dataset.findings.filter((finding) => finding.category === "反洗钱工作")
-			: dataset.findings.filter((finding) => !finding.isHistorical)
-	)
+	const disclosedFindings = dataset.findings
+		.filter((finding) => !finding.isHistorical)
 		.slice()
 		.sort(
 			(left, right) =>
@@ -893,6 +894,7 @@ function amlLetterNarrative(aml: NonNullable<AuditReportDataset["aml"]>): string
 
 function amlSuspiciousNarrative(aml: NonNullable<AuditReportDataset["aml"]>): string {
 	const total = aml.generalSuspiciousTransactionCount + aml.keySuspiciousTransactionCount;
+	if (total === 0) return "审计期内，营业部上报并经总部认定的可疑交易共0笔。";
 	const typeText =
 		aml.generalSuspiciousTransactionCount === total
 			? `共${total}笔，均为一般可疑交易`
@@ -963,6 +965,9 @@ function opinionSubsections(categories: readonly string[]): ReportSubsection[] {
 
 function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraft {
 	const findings = dataset.findings.filter((finding) => pack.disclosedFindingIds.includes(finding.findingId));
+	const hasMajor =
+		findings.some((finding) => finding.severity === "重大" || finding.majorConfirmed) ||
+		dataset.aml?.majorMatters.some((matter) => matter.confirmedMajor);
 	const findingCategories = unique(findings.map((finding) => finding.category));
 	const periods = dataset.operatingMetrics[0]?.points.map((point) => point.period) ?? [];
 	const regularPeriodEnd = (periods.at(-1) ?? "审计期末").replace(/年1[-—]9月/u, "年9月");
@@ -1055,7 +1060,11 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 			paragraphs: [
 				paragraph(
 					"regular-findings-intro",
-					`从本次审计情况看，营业部在${findingCategories.join("、")}等内部控制方面存在一般缺陷，主要包括以下问题：`,
+					findings.length
+						? findings.every((finding) => finding.severity === "一般")
+							? `从本次审计情况看，营业部在${findingCategories.join("、")}等内部控制方面存在一般缺陷，主要包括以下问题：`
+							: `从本次审计情况看，营业部在${findingCategories.join("、")}等方面存在以下问题：`
+						: "在本次审计范围内，未发现需列示的问题。",
 					findings.flatMap((finding) => finding.evidenceIds),
 				),
 			],
@@ -1067,22 +1076,30 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 			paragraphs: [
 				paragraph(
 					"regular-opinion-summary",
-					`经审计，未发现${dataset.organization.fullName}经营活动及内部控制存在重大违法违规事项或重大内控缺陷。本次审计发现的问题反映出营业部在${findingCategories.join("、")}等方面工作中，相关人员对规章制度的理解不到位，操作流程执行不规范，业务管理上应进一步完善。`,
+					findings.length
+						? hasMajor
+							? `本次审计发现${dataset.organization.fullName}在${findingCategories.join("、")}等方面存在问题，应根据上述问题事实及其重要程度采取整改措施，进一步完善业务管理。`
+							: `经审计，未发现${dataset.organization.fullName}经营活动及内部控制存在重大违法违规事项或重大内控缺陷。本次审计发现的问题反映出营业部在${findingCategories.join("、")}等方面工作中，相关人员对规章制度的理解不到位，操作流程执行不规范，业务管理上应进一步完善。`
+						: `在本次审计范围内，未发现${dataset.organization.fullName}需列示的问题。建议持续落实内部控制要求。`,
 					findings.flatMap((finding) => finding.evidenceIds),
 					true,
 				),
-				paragraph("regular-opinion-lead", "针对审计发现的问题，现提出以下审计意见及整改要求：", [], false),
+				...(findings.length
+					? [paragraph("regular-opinion-lead", "针对审计发现的问题，现提出以下审计意见及整改要求：", [], false)]
+					: []),
 			],
 			tables: [],
 			subsections: opinionSubsections(findingCategories),
-			closingParagraphs: [
-				paragraph(
-					"regular-final-rectification",
-					"你单位应认真制定整改计划，明确问题的整改责任人和整改期限，切实采取有效措施落实整改，并能举一反三，杜绝同类问题的反复出现。审计中心将持续跟踪整改情况，并视情况采取后续审计措施。",
-					findings.flatMap((finding) => finding.rectification?.evidenceIds ?? []),
-					true,
-				),
-			],
+			closingParagraphs: findings.length
+				? [
+						paragraph(
+							"regular-final-rectification",
+							"你单位应认真制定整改计划，明确问题的整改责任人和整改期限，切实采取有效措施落实整改，并能举一反三，杜绝同类问题的反复出现。审计中心将持续跟踪整改情况，并视情况采取后续审计措施。",
+							findings.flatMap((finding) => finding.rectification?.evidenceIds ?? []),
+							true,
+						),
+					]
+				: [],
 		},
 	];
 	return {
@@ -1094,12 +1111,12 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 		addressee: `${dataset.organization.fullName}：`,
 		introduction: paragraph(
 			"regular-introduction",
-			`按照审计工作安排，审计中心于${dataset.task.auditGroupEstablishedMonth}成立审计组，对你单位${chineseDateRange(dataset.task.auditStart, dataset.task.auditEnd)}期间（以下简称“审计期”）经营活动和内部控制的适当性、合法性和有效性等情况进行了审计。审计组依据相关监管规定及公司制度要求，${dataset.fixedFacts.auditProcedures}审计工作结束后，审计中心向你单位发出了《审计征求意见书》，并得到了确认和反馈。现出具报告如下：`,
+			`按照审计工作安排，审计中心于${dataset.task.auditGroupEstablishedMonth}成立审计组，对你单位${chineseDateRange(dataset.task.auditStart, dataset.task.auditEnd)}期间（以下简称“审计期”）经营活动和内部控制的适当性、合法性和有效性等情况进行了审计。审计组依据相关监管规定及公司制度要求，${dataset.fixedFacts.auditProcedures}${dataset.task.workflow?.mode === "linked" && workflowErrors(dataset.task).length === 0 ? "审计工作结束后，审计中心向你单位发出了《审计征求意见书》，并得到了确认和反馈。" : ""}现出具报告如下：`,
 			unique([...projectEvidenceIds(dataset), ...sourceFieldEvidenceIds(dataset, "DS-10", "auditProcedures")]),
 		),
 		sections,
 		closingOrganization: dataset.task.closingOrganization,
-		reportDate: dataset.task.reportDate,
+		reportDate: chineseFullDate(dataset.task.reportDate),
 		status: pack.blockers.length > 0 ? "needs-input" : "ready-for-review",
 		blockers: pack.blockers,
 		warnings: pack.warnings,
@@ -1285,7 +1302,7 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 		),
 		sections,
 		closingOrganization: dataset.task.closingOrganization,
-		reportDate: dataset.task.reportDate,
+		reportDate: chineseFullDate(dataset.task.reportDate),
 		status: pack.blockers.length > 0 ? "needs-input" : "ready-for-review",
 		blockers: pack.blockers,
 		warnings: pack.warnings,
@@ -1295,7 +1312,12 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 
 function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraft {
 	const aml = dataset.aml;
-	const findings = dataset.findings.filter((finding) => pack.disclosedFindingIds.includes(finding.findingId));
+	const findings = dataset.findings.filter(
+		(finding) =>
+			!finding.isHistorical &&
+			finding.category === "反洗钱工作" &&
+			pack.disclosedFindingIds.includes(finding.findingId),
+	);
 	const queryComplete = aml?.problemQueryComplete === true && aml?.majorMatterQueryComplete === true;
 	const majorMatters = aml?.majorMatters.filter((matter) => matter.confirmedMajor) ?? [];
 	const hasMajorMatter = majorMatters.length > 0 || findings.some((finding) => finding.majorConfirmed === true);
@@ -1342,7 +1364,7 @@ function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraf
 			paragraphs: [
 				paragraph(
 					"aml-findings-intro",
-					"审计期内，未发现营业部在反洗钱工作方面存在重大或重要的内控缺陷，但是仍存在以下不足：",
+					"审计期内，营业部反洗钱工作存在以下问题：",
 					findings.flatMap((finding) => finding.evidenceIds),
 					true,
 				),
@@ -1365,6 +1387,7 @@ function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraf
 				"aml-opinion-summary",
 				opinionSummary,
 				unique([
+					...(aml?.evidenceIds ?? []),
 					...findings.flatMap((finding) => finding.evidenceIds),
 					...(aml?.majorMatters.flatMap((matter) => matter.evidenceIds) ?? []),
 				]),
@@ -1403,7 +1426,7 @@ function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraf
 	});
 	return {
 		taskId: dataset.task.taskId,
-		reportType: "aml",
+		reportType: "regular",
 		templateId: dataset.task.templateId,
 		templateVersion: dataset.task.templateVersion,
 		titleLines: [dataset.organization.fullName, "反洗钱审计报告"],
@@ -1415,7 +1438,7 @@ function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraf
 		),
 		sections,
 		closingOrganization: dataset.task.closingOrganization,
-		reportDate: dataset.task.reportDate,
+		reportDate: chineseFullDate(dataset.task.reportDate),
 		status: pack.blockers.length > 0 ? "needs-input" : "ready-for-review",
 		blockers: pack.blockers,
 		warnings: pack.warnings,
@@ -1424,9 +1447,66 @@ function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraf
 }
 
 export function generateReportDraft(dataset: AuditReportDataset, pack = buildFactPack(dataset)): ReportDraft {
-	if (dataset.task.reportType === "regular") return regularDraft(dataset, pack);
-	if (dataset.task.reportType === "turnover") return turnoverDraft(dataset, pack);
-	return amlDraft(dataset, pack);
+	if (!["consultation", "regular", "turnover"].includes(dataset.task.reportType))
+		throw new Error("Unsupported report type; AML is an attachment of regular reports");
+	// Never let a caller-provided fact pack bypass current workflow or input checks.
+	const checkedPack = buildFactPack(dataset);
+	pack = { ...pack, blockers: unique([...pack.blockers, ...checkedPack.blockers]) };
+	if (dataset.task.reportType === "turnover")
+		return { ...turnoverDraft(dataset, pack), workflow: dataset.task.workflow };
+	const draft = regularDraft(dataset, pack);
+	if (dataset.task.reportType === "consultation") {
+		const deadline = dataset.task.workflow?.feedbackDeadline;
+		return {
+			...draft,
+			reportType: "consultation",
+			workflow: dataset.task.workflow,
+			titleLines: [dataset.organization.fullName, "审计征求意见书"],
+			introduction: {
+				...draft.introduction,
+				paragraphId: "consultation-introduction",
+				text: draft.introduction.text.replace("现出具报告如下：", "现就以下审计情况征求你单位意见："),
+			},
+			sections: [
+				...draft.sections.slice(0, 2),
+				{
+					heading: "三、反馈及整改计划要求",
+					tables: [],
+					subsections: [],
+					paragraphs: [
+						paragraph(
+							"consultation-feedback",
+							`${dataset.task.workflow?.feedbackRequirement ?? "反馈及整改计划要求待补充。"}${deadline ? `请于${chineseFullDate(deadline)}前反馈书面意见及整改计划。` : "反馈期限待补充。"}`,
+							projectEvidenceIds(dataset),
+						),
+					],
+				},
+			],
+		};
+	}
+	const attachment = amlDraft(dataset, pack);
+	// Reused finding records must have different node IDs in body and attachment.
+	const namespace = (p: ReportParagraph): ReportParagraph => ({ ...p, paragraphId: `attachment-${p.paragraphId}` });
+	const attachmentSections = attachment.sections.map((s) => ({
+		...s,
+		paragraphs: s.paragraphs.map(namespace),
+		subsections: s.subsections.map((sub) => ({ ...sub, paragraphs: sub.paragraphs.map(namespace) })),
+		closingParagraphs: s.closingParagraphs?.map(namespace),
+	}));
+	return {
+		...draft,
+		workflow: dataset.task.workflow,
+		sections: [
+			...draft.sections,
+			{
+				heading: "附件：反洗钱审计情况",
+				paragraphs: [namespace(attachment.introduction)],
+				tables: [],
+				subsections: [],
+			},
+			...attachmentSections,
+		],
+	};
 }
 
 function markdownTable(table: ReportTable): string {

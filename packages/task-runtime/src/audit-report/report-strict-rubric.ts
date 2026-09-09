@@ -199,9 +199,18 @@ function claimCandidates(dataset: AuditReportDataset): ClaimCandidate[] {
 		"source-field",
 		"报告日期",
 		dataset.task.reportDate,
-		[dataset.task.reportDate],
+		[dataset.task.reportDate, chineseFullDate(dataset.task.reportDate)],
 		evidenceForField(dataset, "DS-01", taskRecordId, "reportDate"),
 	);
+	if (dataset.task.workflow?.feedbackDeadline)
+		add(
+			"task.feedback-deadline",
+			"source-field",
+			"反馈期限",
+			dataset.task.workflow.feedbackDeadline,
+			[chineseFullDate(dataset.task.workflow.feedbackDeadline)],
+			evidenceForField(dataset, "DS-01", taskRecordId, "feedbackDeadline"),
+		);
 
 	const organization = dataset.organization;
 	for (const [field, label, value, variants] of [
@@ -654,7 +663,7 @@ function claimCandidates(dataset: AuditReportDataset): ClaimCandidate[] {
 			"source-field",
 			"可疑交易数量",
 			dataset.aml.suspiciousTransactionCount,
-			[`${dataset.aml.suspiciousTransactionCount}笔`],
+			[`共${dataset.aml.suspiciousTransactionCount}笔`],
 			evidenceForField(dataset, "DS-07", recordId, "suspiciousTransactionCount"),
 		);
 		add(
@@ -670,20 +679,16 @@ function claimCandidates(dataset: AuditReportDataset): ClaimCandidate[] {
 			"source-field",
 			"一般可疑交易数量",
 			dataset.aml.generalSuspiciousTransactionCount,
-			[`${dataset.aml.generalSuspiciousTransactionCount}笔`],
-			dataset.evidence
-				.filter((item) => item.sourceId === "DS-07" && item.sourceField === "generalCount")
-				.map((item) => item.evidenceId),
+			[`${dataset.aml.generalSuspiciousTransactionCount}笔为一般可疑交易`],
+			evidenceForField(dataset, "DS-07", recordId, "generalSuspiciousTransactionCount"),
 		);
 		add(
 			"aml.suspiciousTransactionKeyCount",
 			"source-field",
 			"重点可疑交易数量",
 			dataset.aml.keySuspiciousTransactionCount,
-			[`${dataset.aml.keySuspiciousTransactionCount}笔`],
-			dataset.evidence
-				.filter((item) => item.sourceId === "DS-07" && item.sourceField === "keyCount")
-				.map((item) => item.evidenceId),
+			[`${dataset.aml.keySuspiciousTransactionCount}笔为重点可疑交易`],
+			evidenceForField(dataset, "DS-07", recordId, "keySuspiciousTransactionCount"),
 		);
 		const newAccountEvidence = dataset.aml.newAccountRiskRecords.flatMap((record) => record.evidenceIds);
 		const periodicEvidence = dataset.aml.periodicReviewRecords.flatMap((record) => record.evidenceIds);
@@ -796,19 +801,31 @@ function claimCandidates(dataset: AuditReportDataset): ClaimCandidate[] {
 			letterEvidence,
 			false,
 		);
-		const majorEvidence = dataset.aml.majorMatters.flatMap((matter) => matter.evidenceIds);
-		add(
-			"aml.majorMatter.none",
-			"derived-calculation",
-			"重大事项查询结果",
-			dataset.aml.majorMatters.filter((matter) => matter.confirmedMajor).length,
-			[
-				"未发现营业部反洗钱工作存在重大或重要内控缺陷",
-				`未发现${dataset.organization.fullName}反洗钱工作存在重大违法违规事项或重大内控缺陷`,
-			],
-			majorEvidence,
-			false,
-		);
+		const majorEvidence = [
+			...dataset.aml.evidenceIds,
+			...dataset.aml.majorMatters.flatMap((matter) => matter.evidenceIds),
+		];
+		if (
+			dataset.aml.problemQueryComplete &&
+			dataset.aml.majorMatterQueryComplete &&
+			!dataset.aml.majorMatters.some((m) => m.confirmedMajor) &&
+			!dataset.findings.some(
+				(f) => !f.isHistorical && f.category === "反洗钱工作" && (f.majorConfirmed || f.severity === "重大"),
+			)
+		)
+			add(
+				"aml.majorMatter.none",
+				"derived-calculation",
+				"重大事项查询结果",
+				dataset.aml.majorMatters.filter((matter) => matter.confirmedMajor).length,
+				[
+					"未发现营业部反洗钱工作存在重大或重要内控缺陷",
+					`未发现${dataset.organization.fullName}反洗钱工作存在重大违法违规事项或重大内控缺陷`,
+					`未发现${dataset.organization.fullName}在反洗钱工作方面存在重大违法违规事项或重大内控缺陷`,
+				],
+				majorEvidence,
+				false,
+			);
 		if (dataset.findings.some((finding) => finding.category === "反洗钱工作")) {
 			add(
 				"aml.finding-count",

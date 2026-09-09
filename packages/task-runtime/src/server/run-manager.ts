@@ -62,7 +62,7 @@ export interface RunOptions {
 	topK?: number;
 	includeSuperseded?: boolean;
 	reportTaskId?: string;
-	reportType?: "regular" | "turnover" | "aml";
+	reportType?: "consultation" | "regular" | "turnover";
 }
 
 export type RuntimeFactory = (input: {

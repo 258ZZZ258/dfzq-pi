@@ -95,8 +95,8 @@ async function main(): Promise<void> {
 	const toolsets = new ToolsetRegistry();
 	if (spec.toolset === "audit-report") {
 		const reportType = values["report-type"];
-		if (reportType !== "regular" && reportType !== "turnover" && reportType !== "aml") {
-			throw new Error("--report-type must be regular, turnover, or aml");
+		if (reportType !== "regular" && reportType !== "turnover" && reportType !== "consultation") {
+			throw new Error("--report-type must be consultation, regular, or turnover");
 		}
 		for (const key of ["report-task-id", "audit-api-base-url", "operating-workbook"] as const) {
 			if (!values[key]) throw new Error(`--${key} is required for audit-report`);

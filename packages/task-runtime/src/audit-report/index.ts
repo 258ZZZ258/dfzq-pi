@@ -16,6 +16,17 @@ export {
 	type SourceReadTrace,
 } from "./report-data-source.ts";
 export {
+	type AuditReportJavaDocument,
+	type ReportCitation,
+	type ReportDocumentNode,
+	type ReportDocumentNodeType,
+	type ReportNodeBasis,
+	reportBasisNeedsRecheck,
+	reportDocumentMatches,
+	reportTextHash,
+	toAuditReportJavaDocument,
+} from "./report-java-contract.ts";
+export {
 	assessSourceCoverage,
 	buildFactPack,
 	comparePreviousAuditFindings,

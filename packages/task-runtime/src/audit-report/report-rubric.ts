@@ -8,6 +8,7 @@ import type {
 } from "./report-contracts.ts";
 import { comparePreviousAuditFindings, findAdjacentRepeatedPhrase } from "./report-pipeline.ts";
 import { scoreStrictReportClaims } from "./report-strict-rubric.ts";
+import { workflowErrors } from "./report-workflow.ts";
 
 interface RubricDefinition {
 	id: string;
@@ -107,7 +108,7 @@ for (const [id, description, critical] of [
 	["RULE-001", "使用任务指定的模板版本", true],
 	["RULE-002", "所有适用必填章节均存在", true],
 	["RULE-003", "不适用章节按规则删除", false],
-	["RULE-004", "章节编号连续且无重复", false],
+	["RULE-004", "正文及附件段落标识唯一", false],
 	["RULE-005", "无事项使用否定性模板而非静默删除", true],
 	["RULE-006", "未确认事项显示待补充且不形成确定性结论", true],
 	["RULE-007", "问题标题、事实、依据、影响和建议均可区分", false],
@@ -174,17 +175,17 @@ for (const [id, description, critical] of [
 	["AML-014", "基本情况与问题章节不存在及时或超期矛盾", true],
 	["AML-015", "个别或部分等数量词符合配置阈值", false],
 ] as const) {
-	define(id, "AML", description, critical, ["aml"]);
+	define(id, "AML", description, critical, ["regular"]);
 }
 
 for (const [id, description, critical] of [
-	["OPIN-001", "使用与常规报告相同版本的事实包", true],
-	["OPIN-002", "问题ID集合与对应常规报告一致", true],
-	["OPIN-003", "整改计划附表逐项关联问题ID", true],
-	["OPIN-004", "反馈期限按工作日历正确计算", false],
+	["OPIN-001", "生成方式及复用来源版本与输入一致", true],
+	["OPIN-002", "问题集合与本次生效数据一致", true],
+	["OPIN-003", "征求意见书保留反馈及整改计划要求", true],
+	["OPIN-004", "业务填写的反馈期限有效", false],
 	["OPIN-005", "正式报告生成前已检查反馈流程状态", true],
 ] as const) {
-	define(id, "OPINION", description, critical, []);
+	define(id, "OPINION", description, critical, ["consultation", "regular"]);
 }
 
 for (const [id, description, critical] of [
@@ -254,7 +255,7 @@ function expectedSectionHeadings(reportType: AuditReportType, subjectName?: stri
 			"四、审计结论",
 		];
 	}
-	return ["一、基本情况", "二、审计发现的主要问题", "三、审计意见及整改要求"];
+	return ["一、基本情况", "二、审计发现的主要问题", "三、反馈及整改计划要求"];
 }
 
 function expectedFindingIds(dataset: AuditReportDataset, pack: ReportFactPack): string[] {
@@ -520,7 +521,7 @@ function evaluateItem(
 				"期间核对",
 			);
 		case "FACT-005":
-			return pass(dataset.task.feedbackCompleted, "反馈流程与日期核对");
+			return pass(workflowErrors(dataset.task).length === 0, "按生成方式核对反馈流程与日期");
 		case "FACT-006":
 			return pass(
 				dataset.task.reportType !== "regular" || text.includes(`正式员工${dataset.personnel.employeeCount}名`),
@@ -535,19 +536,17 @@ function evaluateItem(
 				"经纪人数核对",
 			);
 		case "FACT-008":
-			return pass(dataset.task.reportType === "aml" || hasAllMetricValues(dataset, draft), "经营金额逐项核对");
+			return pass(hasAllMetricValues(dataset, draft), "经营金额逐项核对");
 		case "FACT-009":
-			return pass(dataset.task.reportType === "aml" || hasAllRanks(dataset, draft), "经营排名逐项核对");
+			return pass(hasAllRanks(dataset, draft), "经营排名逐项核对");
 		case "FACT-010":
 			return pass(
-				dataset.task.reportType === "aml" ||
-					tables.every(
-						(table) => table.tableId === "ranking" || table.unit === "万元" || table.tableId === "performance",
-					),
+				tables.every(
+					(table) => table.tableId === "ranking" || table.unit === "万元" || table.tableId === "performance",
+				),
 				"指标单位核对",
 			);
 		case "FACT-011":
-			if (dataset.task.reportType === "aml") return pass(true, "趋势核对");
 			if (dataset.task.reportType === "turnover") {
 				const performanceMetrics = dataset.operatingMetrics.filter((metric) => metric.table === "performance");
 				const hasFullYearFluctuation = performanceMetrics.some((metric) => {
@@ -569,10 +568,7 @@ function evaluateItem(
 				);
 			}
 		case "FACT-012":
-			return pass(
-				dataset.task.reportType === "aml" || text.includes(expectedOperatingNarrative(dataset, pack).bandText),
-				"五档排名文字核对",
-			);
+			return pass(text.includes(expectedOperatingNarrative(dataset, pack).bandText), "五档排名文字核对");
 		case "FACT-013":
 			return pass(
 				reportFindings.length === generatedFindings.length &&
@@ -615,16 +611,20 @@ function evaluateItem(
 				"必填章节核对",
 			);
 		case "RULE-003":
-			return pass(dataset.task.reportType !== "aml" || !text.includes("经营情况详见下表"), "不适用章节核对");
+			return pass(
+				dataset.task.reportType === "regular"
+					? text.includes("附件：反洗钱审计情况")
+					: !text.includes("附件：反洗钱审计情况"),
+				"附件适用范围核对",
+			);
 		case "RULE-004":
 			return pass(
-				new Set(draft.sections.map((section) => section.heading)).size === draft.sections.length,
+				new Set(allParagraphs(draft).map((p) => p.paragraphId)).size === allParagraphs(draft).length,
 				"章节编号核对",
 			);
 		case "RULE-005":
 			return pass(
-				dataset.task.reportType === "aml" ||
-					!dataset.riskEvents.some((event) => event.state === "VERIFIED_NONE") ||
+				!dataset.riskEvents.some((event) => event.state === "VERIFIED_NONE") ||
 					text.includes("未发生重大信息安全事故"),
 				"无事项否定性模板核对",
 			);
@@ -677,7 +677,12 @@ function evaluateItem(
 		case "RULE-015":
 			return pass(run.renderQa?.fontsAndTablesMatchTemplate === true, "DOCX字体和表格核对");
 		case "RULE-016":
-			return pass(draft.introduction.text.includes("现出具报告如下"), "固定文本核对");
+			return pass(
+				draft.introduction.text.includes(
+					dataset.task.reportType === "consultation" ? "现就以下审计情况征求" : "现出具报告如下",
+				),
+				"固定文本核对",
+			);
 		case "RULE-017": {
 			const repeatedParagraph = allParagraphs(draft).find((paragraph) => findAdjacentRepeatedPhrase(paragraph.text));
 			return pass(
@@ -895,6 +900,36 @@ function evaluateItem(
 					return true;
 				}),
 				"数量词阈值核对",
+			);
+		case "OPIN-001":
+			return pass(
+				JSON.stringify(draft.workflow) === JSON.stringify(dataset.task.workflow),
+				"生成方式和复用来源版本一致",
+			);
+		case "OPIN-002":
+			return pass(
+				reportFindings.length === generatedFindings.length &&
+					reportFindings.every((id) => generatedFindings.includes(id)),
+				"有效问题版本集合一致",
+			);
+		case "OPIN-003":
+			return pass(
+				dataset.task.reportType !== "consultation" ||
+					text.includes(dataset.task.workflow?.feedbackRequirement ?? "缺少整改计划要求"),
+				"整改计划要求保留",
+			);
+		case "OPIN-004":
+			return pass(
+				dataset.task.reportType !== "consultation" || workflowErrors(dataset.task).length === 0,
+				"业务填写的反馈期限有效；不自动猜测工作日",
+			);
+		case "OPIN-005":
+			return pass(
+				workflowErrors(dataset.task).length === 0 &&
+					(dataset.task.workflow?.mode === "independent"
+						? !draft.introduction.text.includes("得到了确认和反馈")
+						: true),
+				"独立与关联生成流程核对",
 			);
 		case "SAFE-001":
 			return pass(dataset.task.organizationId === dataset.organization.organizationId, "机构权限核对");

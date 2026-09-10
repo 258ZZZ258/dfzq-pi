@@ -89,11 +89,18 @@
           "citationStatus": {
             "enum": [
               "LINKED",
+              "RECHECK_REQUIRED",
               "NO_SOURCE"
             ]
           },
           "requiresHumanReview": {
             "type": "boolean"
+          },
+          "editedByUser": {
+            "type": "boolean"
+          },
+          "citationReviewReason": {
+            "type": "string"
           }
         }
       }

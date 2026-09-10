@@ -98,6 +98,7 @@ export type IssueConfirmationStatus = "AUTO_CONFIRMED" | "HUMAN_CONFIRMED" | "PE
 export type IssueSeverity = "low" | "medium" | "high" | "critical" | "unknown";
 
 export interface SupervisionIssue extends DocumentVersionLinkedRecord {
+	reviewReasons?: readonly string[];
 	issueId: string;
 	/** Business discovery date; defaults to the source material's fileDate. */
 	discoveredDate?: string;
@@ -120,6 +121,7 @@ export interface SupervisionIssue extends DocumentVersionLinkedRecord {
 }
 
 interface LinkedRecordBase extends EvidenceLinkedRecord {
+	reviewReasons?: readonly string[];
 	confirmationStatus?: IssueConfirmationStatus;
 	recordId: string;
 	sourceDocumentId: string;

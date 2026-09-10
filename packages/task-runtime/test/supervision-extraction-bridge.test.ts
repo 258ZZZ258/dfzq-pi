@@ -154,6 +154,7 @@ it("rejects unsupported values locally and honors remote rejection even for verb
 	);
 	const verified = await verifyAndConvertExtractions([extraction()], [{ categoryCode: "C", sourceType: "risk" }]);
 	expect(verified.issues[0].confirmationStatus).toBe("PENDING_REVIEW");
+	expect(verified.issues[0].reviewReasons).toContain("issueDescription: 证据核对");
 	const factoryResult = await createSupervisionAnalysisToolset(payload())();
 	expect(Array.isArray(factoryResult)).toBe(true);
 	expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith("/v1/supervision/verify-fields"))).toBe(

@@ -14,6 +14,8 @@ import type {
 } from "../src/supervision-analysis/contracts.ts";
 import {
 	buildSupervisionReportDocument,
+	editSupervisionReportDocument,
+	recheckSupervisionReportDocument,
 	type SupervisionParagraphSources,
 	type SupervisionReportDocument,
 	type SupervisionReportRecords,
@@ -205,6 +207,79 @@ function fixture() {
 }
 
 describe("supervision paragraph citations", () => {
+	it("rechecks edited text using original evidence and retains unsupported conclusions", async () => {
+		const original = await buildSupervisionReportDocument(fixture());
+		const edited = editSupervisionReportDocument(original, original.contentHash, [
+			{ nodeId: "executiveSummary", text: "整改已全部完成" },
+		]);
+		const evidence = new Map(
+			edited.lineage.flatMap((lineage) =>
+				lineage.evidenceIds.map(
+					(id) =>
+						[
+							id,
+							{
+								documentVersionId: id.split(":")[0]!,
+								text: "整改尚未全部完成",
+							},
+						] as const,
+				),
+			),
+		);
+		vi.stubEnv("AUDIT_AI_BASE_URL", "http://audit.test");
+		vi.stubEnv("AUDIT_AI_INTERNAL_TOKEN", "test");
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_url: string, init: RequestInit) => {
+				const body = JSON.parse(String(init.body)) as { claims: { id: string; evidence: string }[] };
+				expect(body.claims[0]!.evidence).toContain("尚未");
+				return Response.json({
+					verdicts: body.claims.map((c) => ({ id: c.id, supported: false, reason: "原文尚未完成" })),
+				});
+			}),
+		);
+		try {
+			const checked = await recheckSupervisionReportDocument(edited, edited.contentHash, evidence);
+			expect(checked.nodes.find((n) => n.nodeId === "executiveSummary")).toMatchObject({
+				citationStatus: "RECHECK_REQUIRED",
+				citationReviewReason: "原文尚未完成",
+				editedByUser: true,
+			});
+			await expect(recheckSupervisionReportDocument(edited, edited.contentHash, new Map())).rejects.toThrow(
+				"evidence",
+			);
+		} finally {
+			vi.unstubAllEnvs();
+			vi.unstubAllGlobals();
+		}
+	});
+	it("guards user edits, rejects stale revisions and invalidates citation status", async () => {
+		const before = await buildSupervisionReportDocument(fixture());
+		const edits = [{ nodeId: "regulatoryOverview", text: "用户调整后的结论" }];
+		const after = editSupervisionReportDocument(before, before.contentHash, edits);
+		expect(after.structureHash).toBe(before.structureHash);
+		expect(after.contentHash).not.toBe(before.contentHash);
+		expect(after.citations).toEqual(before.citations);
+		expect(after.nodes.find((n) => n.nodeId === edits[0].nodeId)).toMatchObject({
+			text: edits[0].text,
+			citationStatus: "RECHECK_REQUIRED",
+			editedByUser: true,
+			requiresHumanReview: true,
+		});
+		expect(before.nodes.find((n) => n.nodeId === edits[0].nodeId)?.text).not.toBe(edits[0].text);
+		expect(() => editSupervisionReportDocument(after, before.contentHash, edits)).toThrow("conflict");
+		expect(() => editSupervisionReportDocument(after, after.contentHash, edits, "REGENERATION")).toThrow(
+			"user-edited",
+		);
+		expect(() =>
+			editSupervisionReportDocument(before, before.contentHash, [{ nodeId: "title", text: "改标题" }]),
+		).toThrow();
+		expect(editSupervisionReportDocument(after, after.contentHash, edits).contentHash).toBe(after.contentHash);
+		const schema = JSON.parse(
+			await readFile(join(packageRoot, "specs/supervision-analysis/report-document.schema.json"), "utf8"),
+		) as TSchema;
+		expect(Value.Check(schema, after)).toBe(true);
+	});
 	it.each([true, false])(
 		"validates model output before writing narrative and document (complete sources: %s)",
 		async (valid) => {

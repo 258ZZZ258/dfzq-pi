@@ -10,6 +10,7 @@ import type {
 import { isBusinessDate } from "./dates.ts";
 import { createMaterialSnapshot } from "./snapshot.ts";
 import { parseSupervisionTask } from "./task.ts";
+import { verifySupervisionFields } from "./verify-fields.ts";
 
 export interface SupervisionParagraphSources {
 	documentVersionIds: string[];
@@ -42,7 +43,11 @@ export interface SupervisionReportDocument {
 	snapshotAt: string;
 	structureHash: string;
 	contentHash: string;
-	nodes: (ReportDocumentNode & { citationStatus?: "LINKED" | "NO_SOURCE" })[];
+	nodes: (ReportDocumentNode & {
+		citationStatus?: "LINKED" | "NO_SOURCE" | "RECHECK_REQUIRED";
+		editedByUser?: boolean;
+		citationReviewReason?: string;
+	})[];
 	citations: SupervisionReportCitation[];
 	lineage: SupervisionParagraphLineage[];
 }
@@ -84,6 +89,89 @@ function keyed<T>(items: readonly T[], key: (item: T) => string): Map<string, T>
 
 function hash(value: unknown): string {
 	return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+/** Apply text-only edits to a server-owned document, with optimistic concurrency. */
+export function editSupervisionReportDocument(
+	document: SupervisionReportDocument,
+	expectedContentHash: string,
+	edits: readonly { nodeId: string; text: string }[],
+	origin: "USER" | "REGENERATION" = "USER",
+): SupervisionReportDocument {
+	if (expectedContentHash !== document.contentHash) throw new Error("Report version conflict");
+	const changes = new Map<string, string>();
+	for (const edit of edits) {
+		const node = document.nodes.find((item) => item.nodeId === edit.nodeId);
+		if (!node?.textEditable || changes.has(edit.nodeId)) throw new Error("Invalid or duplicate editable paragraph");
+		if (origin === "REGENERATION" && node.editedByUser) throw new Error("Cannot regenerate a user-edited paragraph");
+		changes.set(edit.nodeId, text(edit.text, "paragraph text"));
+	}
+	const result = structuredClone(document);
+	for (const node of result.nodes) {
+		const changed = changes.get(node.nodeId);
+		if (changed === undefined || changed === node.text) continue;
+		node.text = changed;
+		node.editedByUser = origin === "USER";
+		node.citationStatus = node.citationIds.length ? "RECHECK_REQUIRED" : "NO_SOURCE";
+		node.requiresHumanReview = true;
+		delete node.citationReviewReason;
+	}
+	result.contentHash = hash({
+		taskId: result.taskId,
+		snapshotAt: result.snapshotAt,
+		nodes: result.nodes,
+		citations: result.citations,
+		lineage: result.lineage,
+	});
+	return result;
+}
+
+/** Evidence must be resolved by the caller from the authorized frozen snapshot. */
+export async function recheckSupervisionReportDocument(
+	document: SupervisionReportDocument,
+	expectedContentHash: string,
+	evidence: ReadonlyMap<string, { documentVersionId: string; text: string }>,
+): Promise<SupervisionReportDocument> {
+	if (document.contentHash !== expectedContentHash) throw new Error("Report version conflict");
+	const result = structuredClone(document);
+	const checks = [];
+	for (const node of result.nodes.filter((n) => n.citationStatus === "RECHECK_REQUIRED")) {
+		const lineage = result.lineage.find((item) => item.nodeId === node.nodeId);
+		if (!lineage?.evidenceIds.length) {
+			node.citationReviewReason = "缺少段落原文证据，无法自动复核";
+			continue;
+		}
+		const contexts = lineage.evidenceIds.map((id) => {
+			const source = evidence.get(id);
+			if (!source || !lineage.documentVersionIds.includes(source.documentVersionId))
+				throw new Error("Missing or wrong-version paragraph evidence");
+			return text(source.text, "paragraph evidence");
+		});
+		checks.push({
+			id: hash([expectedContentHash, node.nodeId]),
+			field: "reportParagraph",
+			value: node.text,
+			evidence: contexts.join("\n\n"),
+			nodeId: node.nodeId,
+		});
+	}
+	const { verified, reasons } = await verifySupervisionFields(checks.map(({ nodeId: _nodeId, ...claim }) => claim));
+	for (const check of checks) {
+		const node = result.nodes.find((item) => item.nodeId === check.nodeId)!;
+		node.citationReviewReason = reasons.get(check.id);
+		if (verified.get(check.id)) {
+			node.citationStatus = "LINKED";
+			node.requiresHumanReview = false;
+		}
+	}
+	result.contentHash = hash({
+		taskId: result.taskId,
+		snapshotAt: result.snapshotAt,
+		nodes: result.nodes,
+		citations: result.citations,
+		lineage: result.lineage,
+	});
+	return result;
 }
 
 /** Builds display references only from identifiers explicitly supplied for each prose block. */

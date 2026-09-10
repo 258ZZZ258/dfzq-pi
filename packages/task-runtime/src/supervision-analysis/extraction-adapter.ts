@@ -43,6 +43,7 @@ export function convertSupervisionExtractions(
 	mappings: unknown,
 	verified?: ReadonlyMap<string, boolean>,
 	checks?: FieldCheck[],
+	verificationReasons?: ReadonlyMap<string, string>,
 ): Pick<SupervisionAnalysisPayload, "materials" | "issues" | "rectifications" | "accountabilities"> {
 	const outputs = array(results).map(object);
 	const uploads = outputs.map((output) => parseSupervisionUploadedMaterial(output.uploadedMaterial));
@@ -85,6 +86,7 @@ export function convertSupervisionExtractions(
 			const values: Record<string, string> = {};
 			const evidenceIds = new Set<string>();
 			const supported = new Set<string>();
+			const reviewReasons: string[] = [];
 			for (const [key, rawValue] of Object.entries(object(fact.values))) {
 				if (!rule.extractFields.some((field) => field.key === key)) throw new Error("Unknown extraction field");
 				const value = object(rawValue);
@@ -115,6 +117,7 @@ export function convertSupervisionExtractions(
 					if (verified !== undefined) {
 						supported.delete(key);
 						if (verified.get(id) === true) supported.add(key);
+						else reviewReasons.push(`${key}: ${verificationReasons?.get(id) ?? "原文证据不足"}`);
 					}
 				}
 			}
@@ -133,6 +136,8 @@ export function convertSupervisionExtractions(
 			);
 			const grounded = Object.keys(values).every((key) => key === "evidenceLocation" || supported.has(key));
 			const confirmed = missing.length === 0 && Boolean(description) && dateValid && !dateWarning && grounded;
+			if (!dateValid || dateWarning) reviewReasons.push("发文日期缺失、无效或与资料不一致");
+			if (!grounded && verified === undefined) reviewReasons.push("字段尚未完成语义核验");
 			const explicitType = fact.factType ?? "UNSPECIFIED";
 			if (
 				!["FINDING", "RECTIFICATION", "ACCOUNTABILITY", "LITIGATION", "UNSPECIFIED"].includes(String(explicitType))
@@ -161,10 +166,12 @@ export function convertSupervisionExtractions(
 				responsibleDepartmentIds: [],
 				evidenceIds: [...evidenceIds],
 				dataOrigin: material.dataOrigin,
+				reviewReasons,
 			};
 			if (type !== "RECTIFICATION" && type !== "ACCOUNTABILITY")
 				issues.push({
 					...base,
+					reviewReasons: [...reviewReasons, ...missing.map((field) => `缺少必填字段: ${field.label}`)],
 					issueId,
 					extractionRuleId: rule.ruleId,
 					reportSection: rule.reportSection,
@@ -187,6 +194,7 @@ export function convertSupervisionExtractions(
 			};
 			const recordValid =
 				grounded && !dateWarning && isBusinessDate(material.fileDate) && (!values.documentDate || dateValid);
+			if (!isBusinessDate(material.fileDate)) reviewReasons.push("资料缺少有效发文日期");
 			if (progress) {
 				rectifications.push({
 					...linked,
@@ -207,7 +215,7 @@ export function convertSupervisionExtractions(
 				accountabilities.push({
 					...linked,
 					recordId: `${issueId}:ACC`,
-					description: `${description}；${values.accountabilityAction}`,
+					description: [description, values.accountabilityAction].filter(Boolean).join("；"),
 					action: values.accountabilityAction,
 					confirmationStatus: recordValid ? "AUTO_CONFIRMED" : "PENDING_REVIEW",
 				});

@@ -60,6 +60,8 @@ export {
 } from "./ocr-fixture-source.ts";
 export {
 	buildSupervisionReportDocument,
+	editSupervisionReportDocument,
+	recheckSupervisionReportDocument,
 	type SupervisionParagraphLineage,
 	type SupervisionParagraphSources,
 	type SupervisionReportCitation,

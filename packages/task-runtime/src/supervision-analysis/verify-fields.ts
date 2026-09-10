@@ -3,8 +3,14 @@ import { convertSupervisionExtractions, type FieldCheck } from "./extraction-ada
 export async function verifyAndConvertExtractions(results: unknown, mappings: unknown) {
 	const checks: FieldCheck[] = [];
 	convertSupervisionExtractions(results, mappings, undefined, checks);
+	const { verified, reasons } = await verifySupervisionFields(checks);
+	return convertSupervisionExtractions(results, mappings, verified, undefined, reasons);
+}
+
+export async function verifySupervisionFields(checks: readonly FieldCheck[]) {
 	const verified = new Map<string, boolean>();
-	if (!checks.length) return convertSupervisionExtractions(results, mappings, verified);
+	const reasons = new Map<string, string>();
+	if (!checks.length) return { verified, reasons };
 	const base = process.env.AUDIT_AI_BASE_URL;
 	const token = process.env.AUDIT_AI_INTERNAL_TOKEN;
 	if (!base || !token) throw new Error("Supervision field verification requires audit-ai configuration");
@@ -36,8 +42,9 @@ export async function verifyAndConvertExtractions(results: unknown, mappings: un
 			)
 				throw new Error("Invalid field verification verdict");
 			verified.set(raw.id, raw.supported);
+			reasons.set(raw.id, raw.reason);
 		}
 		if (expected.size) throw new Error("Incomplete field verification response");
 	}
-	return convertSupervisionExtractions(results, mappings, verified);
+	return { verified, reasons };
 }

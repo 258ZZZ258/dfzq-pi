@@ -89,4 +89,4 @@ npm run export:supervision-document -- \
 `structureHash` 标识节点结构；`contentHash` 同时覆盖任务、快照时间、正文、引用和追溯关系。
 Java 以后实现逐段保存时，需要用保存版本号或 `contentHash` 做并发校验，不能只用结构哈希。
 人工修改涉及事实或结论时应标记引用待核验；引用绑定不应由前端任意回传覆盖。
-当前生成的文档包不是修改请求接口，也不负责保存、权限、重新核验或用户编辑后的 Word 导出。
+Pi 已提供内容版本校验的文字修改函数和引用复核函数，见 `docs/supervision-optimization.md`。这不等于 Java 修改接口已经实现；保存、权限、最终并发写入和用户编辑后的 Word 导出仍由业务服务接入。

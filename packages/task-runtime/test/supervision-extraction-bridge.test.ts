@@ -83,6 +83,20 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 });
 
+it.each([
+	["已全部完成。", "COMPLETED"],
+	["正在整改", "IN_PROGRESS"],
+	["部分已完成", "PARTIALLY_COMPLETED"],
+	["尚未完成", "PENDING_REVIEW"],
+	["预计下月全部完成", "PENDING_REVIEW"],
+	["已完成，但验收未通过", "PENDING_REVIEW"],
+])("maps only unambiguous status %s to %s", (value, expected) => {
+	const result = parseSupervisionAnalysisPayload(
+		payload([extraction("internal-risk-inspection", "V1", { rectificationStatus: value })]),
+	);
+	expect(result.rectifications[0]!.status).toBe(expected);
+});
+
 it("keeps a follow-up report as a standalone record and matches it to the original finding", () => {
 	const original = extraction("internal-risk-inspection", "V1");
 	delete original.facts[0].values.rectificationMeasure;

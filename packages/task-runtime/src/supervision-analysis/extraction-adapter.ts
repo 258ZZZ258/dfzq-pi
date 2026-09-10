@@ -25,6 +25,13 @@ const statuses: Readonly<Record<string, RectificationStatus>> = {
 	部分完成: "PARTIALLY_COMPLETED",
 	完成: "COMPLETED",
 	已完成: "COMPLETED",
+	全部完成: "COMPLETED",
+	已全部完成: "COMPLETED",
+	全部整改完成: "COMPLETED",
+	整改已全部完成: "COMPLETED",
+	正在整改: "IN_PROGRESS",
+	部分已完成: "PARTIALLY_COMPLETED",
+	已完成部分整改: "PARTIALLY_COMPLETED",
 	持续整改: "CONTINUOUS",
 	逾期: "OVERDUE",
 	无法整改: "UNABLE",
@@ -207,7 +214,7 @@ export function convertSupervisionExtractions(
 					]
 						.filter(Boolean)
 						.join("；"),
-					status: statuses[values.rectificationStatus ?? ""] ?? "PENDING_REVIEW",
+					status: statuses[(values.rectificationStatus ?? "").trim().replace(/[。；]+$/u, "")] ?? "PENDING_REVIEW",
 					confirmationStatus: recordValid ? "AUTO_CONFIRMED" : "PENDING_REVIEW",
 				});
 			}

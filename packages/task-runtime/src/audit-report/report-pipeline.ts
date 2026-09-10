@@ -186,11 +186,24 @@ function textSimilarity(left: string, right: string): number {
 
 function findingReviewSimilarity(previous: AuditFinding, current: AuditFinding): number {
 	if (normalizeFindingMatchText(previous.category) !== normalizeFindingMatchText(current.category)) return 0;
+	// Recover only an exact leading policy already present in the other record.
+	// This is a comparison view, not an inferred policy or a mutation of source facts.
+	const comparisonView = (finding: AuditFinding, other: AuditFinding) => {
+		const explicitPolicy = finding.policyBasis.trim();
+		const otherPolicy = other.policyBasis.trim();
+		const fact = finding.factText.trimStart();
+		if (!explicitPolicy && otherPolicy.length > 0 && fact.startsWith(otherPolicy)) {
+			return { policy: otherPolicy, fact: fact.slice(otherPolicy.length).trimStart() };
+		}
+		return { policy: explicitPolicy, fact };
+	};
+	const previousView = comparisonView(previous, current);
+	const currentView = comparisonView(current, previous);
 	return (
 		textSimilarity(previous.subcategory, current.subcategory) * 0.4 +
 		textSimilarity(previous.title, current.title) * 0.3 +
-		textSimilarity(previous.policyBasis, current.policyBasis) * 0.2 +
-		textSimilarity(previous.factText, current.factText) * 0.1
+		textSimilarity(previousView.policy, currentView.policy) * 0.2 +
+		textSimilarity(previousView.fact, currentView.fact) * 0.1
 	);
 }
 

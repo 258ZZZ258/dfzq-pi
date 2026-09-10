@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "taskId",
+    "snapshotAt",
+    "structureHash",
+    "contentHash",
+    "nodes",
+    "citations",
+    "lineage"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "supervision-report-document.v1"
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "snapshotAt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "structureHash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "contentHash": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "nodeId",
+          "nodeType",
+          "order",
+          "text",
+          "styleRef",
+          "textEditable",
+          "citationIds",
+          "requiresHumanReview"
+        ],
+        "properties": {
+          "nodeId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "nodeType": {
+            "enum": [
+              "title",
+              "heading",
+              "paragraph"
+            ]
+          },
+          "parentId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "order": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "styleRef": {
+            "type": "string",
+            "minLength": 1
+          },
+          "textEditable": {
+            "type": "boolean"
+          },
+          "citationIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "citationStatus": {
+            "enum": [
+              "LINKED",
+              "NO_SOURCE"
+            ]
+          },
+          "requiresHumanReview": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "citations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "citationId",
+          "title",
+          "sourceType",
+          "documentId",
+          "documentVersionId"
+        ],
+        "properties": {
+          "citationId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sourceType": {
+            "enum": [
+              "regulatory",
+              "external-audit",
+              "internal-audit",
+              "compliance",
+              "risk",
+              "accountability",
+              "routine-supervision",
+              "litigation"
+            ]
+          },
+          "documentId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "documentVersionId": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "lineage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "nodeId",
+          "documentVersionIds",
+          "issueIds",
+          "rectificationRecordIds",
+          "accountabilityRecordIds",
+          "evidenceIds"
+        ],
+        "properties": {
+          "nodeId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "documentVersionIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "issueIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "rectificationRecordIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "accountabilityRecordIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "evidenceIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          }
+        }
+      }
+    }
+  }
+}

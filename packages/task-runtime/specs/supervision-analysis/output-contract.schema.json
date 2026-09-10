@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "supervision-analysis.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "extractionRuleVersion",
+    "task",
+    "snapshot",
+    "issues",
+    "relations",
+    "statistics",
+    "readiness",
+    "reportOutline"
+  ],
+  "properties": {
+    "rectifications": { "type": "array", "items": { "$ref": "#/$defs/linkedRecord" } },
+    "accountabilities": { "type": "array", "items": { "$ref": "#/$defs/linkedRecord" } },
+    "schemaVersion": { "const": "supervision-analysis.v1" },
+    "extractionRuleVersion": { "type": "string", "minLength": 1 },
+    "task": { "$ref": "#/$defs/task" },
+    "snapshot": { "$ref": "#/$defs/snapshot" },
+    "issues": { "type": "array", "items": { "$ref": "#/$defs/issue" } },
+    "relations": { "type": "array", "items": { "$ref": "#/$defs/relation" } },
+    "statistics": { "$ref": "#/$defs/statistics" },
+    "readiness": { "$ref": "#/$defs/readiness" },
+    "reportOutline": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  },
+  "$defs": {
+    "linkedRecord": {
+      "type": "object", "additionalProperties": false,
+      "required": ["recordId", "sourceDocumentId", "organizationIds", "responsibleDepartmentIds", "evidenceIds", "description", "referencedIssueIds", "referencedDocumentNumbers"],
+      "properties": {
+        "recordId": { "type": "string" }, "sourceDocumentId": { "type": "string" }, "sourceDocumentVersionId": { "type": "string" },
+        "organizationIds": { "type": "array", "items": { "type": "string" } },
+        "responsibleDepartmentIds": { "type": "array", "items": { "type": "string" } },
+        "evidenceIds": { "type": "array", "items": { "type": "string" } },
+        "referencedIssueIds": { "type": "array", "items": { "type": "string" } },
+        "referencedDocumentNumbers": { "type": "array", "items": { "type": "string" } },
+        "description": { "type": "string" }, "asOfDate": { "type": "string" },
+        "dataOrigin": { "type": "string" }, "sourceUrl": { "type": "string" }, "semanticScore": { "type": "number" },
+        "confirmationStatus": { "enum": ["AUTO_CONFIRMED", "HUMAN_CONFIRMED", "PENDING_REVIEW"] },
+        "status": { "enum": ["NOT_STARTED", "IN_PROGRESS", "PARTIALLY_COMPLETED", "COMPLETED", "CONTINUOUS", "OVERDUE", "UNABLE", "PENDING_REVIEW"] },
+        "action": { "type": "string" }
+      }
+    },
+    "sourceType": {
+      "enum": [
+        "regulatory",
+        "external-audit",
+        "internal-audit",
+        "compliance",
+        "risk",
+        "accountability",
+        "routine-supervision",
+        "litigation"
+      ]
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskId", "analysisStart", "analysisEnd", "organizationId"],
+      "properties": {
+        "taskId": { "type": "string", "minLength": 1 },
+        "analysisStart": { "type": "string", "minLength": 1 },
+        "analysisEnd": { "type": "string", "minLength": 1 },
+        "organizationId": { "type": "string", "minLength": 1 },
+        "analysisDescription": { "type": "string" }
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentId",
+        "documentVersionId",
+        "parseVersion",
+        "indexVersion",
+        "title",
+        "sourceType",
+        "uploadEntry",
+        "processingStatus",
+        "organizationIds"
+      ],
+      "properties": {
+        "documentId": { "type": "string", "minLength": 1 },
+        "documentVersionId": { "type": "string", "minLength": 1 },
+        "parseVersion": { "type": "string", "minLength": 1 },
+        "indexVersion": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "sourceType": { "$ref": "#/$defs/sourceType" },
+        "uploadEntry": { "enum": ["file-center", "supervision"] },
+        "processingStatus": { "enum": ["indexed", "processing", "failed", "needs-metadata", "disabled"] },
+        "dataOrigin": { "enum": ["internal", "official-public", "synthetic"] },
+        "sourceUrl": { "type": "string", "format": "uri" },
+        "fileDate": { "type": "string" },
+        "organizationIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "excludedMaterial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documentId", "documentVersionId", "reason"],
+      "properties": {
+        "documentId": { "type": "string", "minLength": 1 },
+        "documentVersionId": { "type": "string", "minLength": 1 },
+        "reason": {
+          "enum": [
+            "processing",
+            "failed",
+            "needs-metadata",
+            "disabled",
+            "MISSING_FILE_DATE",
+            "INVALID_FILE_DATE",
+            "OUTSIDE_ANALYSIS_PERIOD",
+            "ORGANIZATION_NOT_MATCHED"
+          ]
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["taskId", "snapshotAt", "included", "excluded"],
+      "properties": {
+        "taskId": { "type": "string", "minLength": 1 },
+        "snapshotAt": { "type": "string", "minLength": 1 },
+        "included": { "type": "array", "items": { "$ref": "#/$defs/material" } },
+        "excluded": { "type": "array", "items": { "$ref": "#/$defs/excludedMaterial" } }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issueId",
+        "extractionRuleId",
+        "reportSection",
+        "sourceDocumentId",
+        "sourceDocumentVersionId",
+        "sourceType",
+        "title",
+        "description",
+        "organizationIds",
+        "responsibleDepartmentIds",
+        "category",
+        "severity",
+        "confirmationStatus",
+        "requiresRectification",
+        "requiresAccountability",
+        "fieldValues",
+        "evidenceIds"
+      ],
+      "properties": {
+        "issueId": { "type": "string", "minLength": 1 },
+        "discoveredDate": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "extractionRuleId": { "type": "string", "minLength": 1 },
+        "reportSection": {
+          "enum": [
+            "external.regulatory",
+            "external.audit",
+            "internal.audit",
+            "internal.compliance",
+            "internal.risk",
+            "internal.accountability",
+            "internal.daily.compliance",
+            "internal.daily.risk",
+            "internal.daily.litigation"
+          ]
+        },
+        "sourceDocumentId": { "type": "string", "minLength": 1 },
+        "sourceDocumentVersionId": { "type": "string", "minLength": 1 },
+        "sourceType": { "$ref": "#/$defs/sourceType" },
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 },
+        "organizationIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "responsibleDepartmentIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "category": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["low", "medium", "high", "critical", "unknown"] },
+        "confirmationStatus": { "enum": ["AUTO_CONFIRMED", "HUMAN_CONFIRMED", "PENDING_REVIEW"] },
+        "dataOrigin": { "enum": ["internal", "official-public", "synthetic"] },
+        "sourceUrl": { "type": "string", "format": "uri" },
+        "requiresRectification": { "type": "boolean" },
+        "requiresAccountability": { "type": "boolean" },
+        "documentNumber": { "type": "string" },
+        "fieldValues": {
+          "type": "object",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "number" },
+              { "type": "boolean" },
+              { "type": "array", "items": { "type": "string" } }
+            ]
+          }
+        },
+        "evidenceIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relationId",
+        "issueId",
+        "relationType",
+        "status",
+        "matchMethod",
+        "matchScore",
+        "candidateRecordIds",
+        "evidenceIds"
+      ],
+      "properties": {
+        "relationId": { "type": "string", "minLength": 1 },
+        "issueId": { "type": "string", "minLength": 1 },
+        "relationType": { "enum": ["RECTIFICATION", "ACCOUNTABILITY"] },
+        "status": {
+          "enum": [
+            "AUTO_CONFIRMED",
+            "HUMAN_CONFIRMED",
+            "PENDING_REVIEW",
+            "MULTIPLE_CANDIDATES",
+            "STATUS_CONFLICT",
+            "UNMATCHED",
+            "REJECTED"
+          ]
+        },
+        "matchMethod": { "enum": ["EXACT_ISSUE_ID", "EXACT_DOCUMENT_NUMBER", "COMPOSITE", "NONE"] },
+        "matchScore": { "type": "number", "minimum": 0, "maximum": 1 },
+        "candidateRecordIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "selectedRecordId": { "type": "string", "minLength": 1 },
+        "evidenceIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "countMap": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issueTotal",
+        "pendingIssueReviewTotal",
+        "pendingRelationReviewTotal",
+        "bySourceType",
+        "byCategory",
+        "byOrganization",
+        "rectification",
+        "accountability"
+      ],
+      "properties": {
+        "issueTotal": { "type": "integer", "minimum": 0 },
+        "pendingIssueReviewTotal": { "type": "integer", "minimum": 0 },
+        "pendingRelationReviewTotal": { "type": "integer", "minimum": 0 },
+        "bySourceType": { "$ref": "#/$defs/countMap" },
+        "byCategory": { "$ref": "#/$defs/countMap" },
+        "byOrganization": { "$ref": "#/$defs/countMap" },
+        "rectification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["confirmedTotal", "completedTotal", "completionRate", "byStatus", "requiredTotal", "unmatchedTotal", "coverageRate", "matchedCompletionRate"],
+          "properties": {
+            "requiredTotal": { "type": "integer", "minimum": 0 },
+            "unmatchedTotal": { "type": "integer", "minimum": 0 },
+            "coverageRate": { "type": "number", "minimum": 0, "maximum": 1 },
+            "matchedCompletionRate": { "type": "number", "minimum": 0, "maximum": 1 },
+            "confirmedTotal": { "type": "integer", "minimum": 0 },
+            "completedTotal": { "type": "integer", "minimum": 0 },
+            "completionRate": { "type": "number", "minimum": 0, "maximum": 1 },
+            "byStatus": { "$ref": "#/$defs/countMap" }
+          }
+        },
+        "accountability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["confirmedTotal"],
+          "properties": {
+            "confirmedTotal": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "readiness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "blockers", "warnings"],
+      "properties": {
+        "status": { "enum": ["READY", "READY_WITH_WARNINGS", "BLOCKED"] },
+        "blockers": { "type": "array", "items": { "type": "string" } },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

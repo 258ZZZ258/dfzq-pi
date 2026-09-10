@@ -1,0 +1,15 @@
+# Supervision association
+
+The runtime scopes records before scoring. For each same-organization issue/record pair without explicit issue references, it calls audit-ai `/v1/supervision/similarity` using `AUDIT_AI_BASE_URL` and `AUDIT_AI_INTERNAL_TOKEN`. It validates a complete, unique set of finite pair scores. Backend errors propagate; they are not treated as zero matches. Exact-reference-only runs require no embedding call.
+
+The synchronous association function accepts a separately computed score map for deterministic evaluation; task-payload `semanticScore` is ignored. The map is keyed by the issue and record IDs, never by the record alone. Scores rank candidates; they are not calibrated probabilities.
+
+An exact issue ID can establish automatic association. An explicit reference to another issue never falls back to similarity. A shared document number only supplies a candidate, even with a high semantic score. Different states on records that share only a document number do not prove a status conflict on the same issue. This does not add a user confirmation step to material selection.
+
+Candidates meeting the existing review threshold (default 0.65 composite score, not cosine probability) are sent to audit-ai `/v1/supervision/associate`, at most eight pairs per request. MATCH requires concrete object/action correspondence and verbatim quotations from both supplied descriptions. NO_MATCH removes that candidate; UNCERTAIN cannot auto-confirm. A unique MATCH can auto-confirm without issue/document numbers. Multiple MATCH records with conflicting rectification states produce STATUS_CONFLICT; multiple plausible matches remain unconfirmed. One record matching multiple issues is conservatively downgraded to unconfirmed. Explicit-reference progress-history handling is unchanged.
+
+The input texts are the extracted business descriptions already carried by the scoped payload, not a fresh full-PDF read. Poor/incomplete extraction can limit matching. No new source text is fabricated. The model verdict, reason and checked quotations are retained in tool details as `associationDecisions` (including when building the final result directly); relation evidence IDs include both sides. Existing matchMethod/matchScore describe candidate retrieval, not model confidence. Rectification status is never changed by association. A Java database persistence contract for these tool details is not introduced here.
+
+audit-ai must explicitly enable the supervision gateway backend; disabled models, failed requests, invalid quotes, duplicate/unknown IDs or missing decisions fail the operation instead of producing confirmed results. Caller-supplied decisions are not accepted in the task payload. Model errors are not silently converted to NO_MATCH.
+
+Verification: pair-specific HTTP scoring contract, missing-score rejection, ignoring externally supplied scores, multiple issues per document, unchanged explicit issue-reference behavior, and an actual local BGE-M3 related-versus-unrelated comparison. Production Java upload-to-report integration remains separate.

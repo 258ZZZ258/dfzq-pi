@@ -30,7 +30,7 @@ export {
 	scoreReport,
 	scoreStrictReportClaims,
 } from "./audit-report/index.ts";
-
+export * from "./business-data/index.ts";
 export type { ProviderProfile, RoleBinding } from "./env/provider-profile.ts";
 export { reconcile, reconcileRunEvents } from "./observability/reconcile.ts";
 export { attachTrajectory, readTrajectory } from "./observability/trajectory.ts";
@@ -69,7 +69,9 @@ export { validateSpec } from "./spec/validate.ts";
 export type { RunRecord, RunStore, StoredRunStatus } from "./store/contract.ts";
 export { createPostgresRunStore } from "./store/postgres.ts";
 export { createSqliteRunStore } from "./store/sqlite.ts";
+export * from "./supervision-analysis/index.ts";
 export { type AuditReportToolsetOptions, createAuditReportToolset } from "./toolsets/audit-report.ts";
 export { createMcpToolset } from "./toolsets/mcp/adapter.ts";
 export { McpClient } from "./toolsets/mcp/client.ts";
 export { ToolsetRegistry } from "./toolsets/registry.ts";
+export { createSupervisionAnalysisToolset, parseSupervisionAnalysisPayload } from "./toolsets/supervision-analysis.ts";

@@ -1,0 +1,261 @@
+import type {
+	SupervisionExtractionField,
+	SupervisionExtractionRule,
+	SupervisionReportSection,
+	SupervisionSourceType,
+} from "./contracts.ts";
+
+export const SUPERVISION_EXTRACTION_RULE_VERSION = "2026-09-10.2";
+
+const field = (key: string, label: string, required: boolean, description: string): SupervisionExtractionField => ({
+	key,
+	label,
+	required,
+	description,
+});
+
+const commonIssueFields = [
+	field("documentTitle", "文件名称", true, "问题所在文件的正式标题"),
+	field(
+		"documentNumber",
+		"文号",
+		false,
+		"正式发文字号或报告编号；记录编号、问题编号、台账序号不得作为文号，无正式编号时不填",
+	),
+	field("documentDate", "文件日期", true, "落款、出具或正式发布日期"),
+	field("organization", "涉及单位", true, "被检查、被审计或被监督单位，使用单位标准名"),
+	field("responsibleDepartment", "责任部门", false, "文件明确指出的责任部门或责任条线"),
+	field("issueDescription", "问题事实", true, "保留问题事实、行为、对象和影响，不自行补充结论"),
+	field("recommendation", "意见或建议", false, "文件提出的整改意见、管理建议或工作要求"),
+	field("evidenceLocation", "证据定位", true, "页码、段落、表格行或原文块标识"),
+] as const;
+
+const rectificationFields = [
+	field("rectificationRequirement", "整改要求", false, "整改事项、要求或目标"),
+	field("rectificationMeasure", "整改措施", false, "责任单位已采取或计划采取的措施"),
+	field("rectificationStatus", "整改状态", false, "未开始、进行中、部分完成、完成、持续整改、逾期等"),
+	field("rectificationDeadline", "整改期限", false, "明确日期、时间区间或持续整改表述"),
+	field("rectificationResult", "整改结果", false, "整改完成情况及可验证结果"),
+] as const;
+
+const rules: readonly SupervisionExtractionRule[] = [
+	{
+		ruleId: "external-regulatory-letter",
+		reportSection: "external.regulatory",
+		title: "监管检查、函件指出问题及整改",
+		sourceTypes: ["regulatory"],
+		documentTypeHints: ["监管检查报告", "监管函", "警示函", "关注函", "问询函", "检查意见书"],
+		searchKeywords: [
+			"监管检查",
+			"现场检查",
+			"非现场监管",
+			"监管函",
+			"问题",
+			"意见",
+			"要求",
+			"整改",
+			"责令改正",
+			"整改期限",
+		],
+		priorityContent: ["监管机构明确指出的问题", "监管依据与整改要求", "整改资料、整改状态及结果"],
+		extractFields: [
+			...commonIssueFields,
+			field("issuingAuthority", "发文监管机构", true, "证监局、证券业协会、证券交易所等发文主体"),
+			field("regulatoryBasis", "监管依据", false, "引用的法律、法规、规则或条款"),
+			...rectificationFields,
+		],
+		sourceNotes: [
+			"风险条线整改材料重点检索《风险管理月报》中含“整改”的内容",
+			"合规条线使用监管函件整改资料进行回溯关联",
+		],
+		issueCategoryHints: [],
+	},
+	{
+		ruleId: "external-audit-rectification",
+		reportSection: "external.audit",
+		title: "外部审计、检查、调查指出问题及整改",
+		sourceTypes: ["external-audit"],
+		documentTypeHints: ["外部审计报告", "检查报告", "调查报告", "审计整改结果报告"],
+		searchKeywords: ["审计发现", "检查发现", "调查发现", "问题", "建议", "整改结果", "整改完成"],
+		priorityContent: ["外部审计或上级单位指出的问题", "审计建议或处理意见", "整改结果报告第二部分全部问题整改结果"],
+		extractFields: [
+			...commonIssueFields,
+			field("supervisingOrganization", "监督单位", true, "审计署、审计局、国资委、申能集团等"),
+			...rectificationFields,
+		],
+		sourceNotes: ["审计整改结果报告需提取第二部分“审计问题整改结果”的全部内容"],
+		issueCategoryHints: [],
+	},
+	{
+		ruleId: "internal-audit-issue",
+		reportSection: "internal.audit",
+		title: "内部审计发现问题及整改",
+		sourceTypes: ["internal-audit"],
+		documentTypeHints: ["常规审计报告", "专项审计报告", "内部审计问题整改情况表"],
+		searchKeywords: ["审计发现问题", "问题", "建议事项", "整改情况", "整改进展", "整改完成"],
+		priorityContent: ["审计报告的问题及建议事项部分", "总部及子公司整改情况表", "分支机构整改情况表"],
+		extractFields: [...commonIssueFields, ...rectificationFields],
+		sourceNotes: ["总部及子公司、分支机构整改表须分别识别后再按问题关联"],
+		issueCategoryHints: [
+			"制度及内控机制建设",
+			"业务管理",
+			"系统权限管理",
+			"信息隔离墙",
+			"员工执业管理",
+			"采购管理",
+			"合同管理",
+			"授权管理",
+			"财务管理",
+			"反洗钱工作",
+		],
+	},
+	{
+		ruleId: "internal-compliance-inspection",
+		reportSection: "internal.compliance",
+		title: "合规检查发现问题及整改",
+		sourceTypes: ["compliance"],
+		documentTypeHints: ["合规检查报告", "公司合规检查整改情况统计表"],
+		searchKeywords: ["检查发现问题", "建议事项", "整改情况", "责任部门", "整改进度"],
+		priorityContent: ["合规检查报告的问题及建议事项部分", "公司合规检查整改情况统计表"],
+		extractFields: [...commonIssueFields, ...rectificationFields],
+		sourceNotes: [],
+		issueCategoryHints: [
+			"制度及内控机制建设",
+			"业务管理",
+			"系统权限管理",
+			"信息隔离墙",
+			"员工执业管理",
+			"采购管理",
+			"合同管理",
+			"授权管理",
+			"财务管理",
+			"反洗钱工作",
+		],
+	},
+	{
+		ruleId: "internal-risk-inspection",
+		reportSection: "internal.risk",
+		title: "风险检查发现问题及整改",
+		sourceTypes: ["risk"],
+		documentTypeHints: ["风险部检查报告", "风险管理月报"],
+		searchKeywords: ["问题", "建议", "整改", "风险检查", "风险管理月报"],
+		priorityContent: ["风险部检查报告的问题及建议", "风险管理月报中含“整改”的整改进展"],
+		extractFields: [...commonIssueFields, ...rectificationFields],
+		sourceNotes: ["整改信息统一从《风险管理月报》中检索“整改”字样后与问题自动关联"],
+		issueCategoryHints: [
+			"制度及内控机制建设",
+			"业务管理",
+			"系统权限管理",
+			"信息隔离墙",
+			"员工执业管理",
+			"采购管理",
+			"合同管理",
+			"授权管理",
+			"财务管理",
+			"反洗钱工作",
+		],
+	},
+	{
+		ruleId: "internal-accountability",
+		reportSection: "internal.accountability",
+		title: "问责处理情况",
+		sourceTypes: ["accountability"],
+		documentTypeHints: ["合规问责决定", "违规经营投资责任追究决定", "问责处理通报"],
+		searchKeywords: ["问责", "责任追究", "处分", "处理决定", "合规问责", "违规经营投资"],
+		priorityContent: ["合规问责", "违规经营投资责任追究", "对应问题或事项及处理依据"],
+		extractFields: [
+			field("documentTitle", "文件名称", true, "问责决定或处理通报标题"),
+			field("documentDate", "决定日期", true, "问责决定或处理生效日期"),
+			field("accountabilityType", "问责类型", true, "合规问责或违规经营投资责任追究"),
+			field("organization", "涉及单位", true, "责任人员所属单位或部门"),
+			field("responsiblePerson", "责任人员", true, "被问责人员姓名或可展示标识"),
+			field("position", "职务", false, "责任人员当时职务"),
+			field("relatedMatter", "涉及问题或事项", true, "问责所对应的违规事实或监督问题"),
+			field("accountabilityAction", "处理措施", true, "处分、经济处罚、组织处理或其他措施"),
+			field("accountabilityBasis", "处理依据", false, "问责制度或责任追究依据"),
+			field("evidenceLocation", "证据定位", true, "页码、段落或表格行标识"),
+		],
+		sourceNotes: ["问责记录由后端自动与问题关联；无明确关联或多候选时转人工复核"],
+		issueCategoryHints: ["合规问责", "违规经营投资责任追究"],
+	},
+	{
+		ruleId: "daily-compliance-supervision",
+		reportSection: "internal.daily.compliance",
+		title: "合规日常监督",
+		sourceTypes: ["routine-supervision", "compliance"],
+		documentTypeHints: ["合规提示函", "合规警示函", "合规问询函", "合规关注函", "合规管理建议"],
+		searchKeywords: ["提示", "警示", "问询", "关注", "管理建议", "具体事项", "反馈要求"],
+		priorityContent: ["PDF全文", "监督事项", "涉及单位或部门", "办理或反馈要求"],
+		extractFields: [
+			...commonIssueFields,
+			field("noticeType", "函件类型", true, "提示、警示、问询、关注或管理建议"),
+			field("feedbackRequirement", "反馈要求", false, "需要反馈、说明或采取措施的内容与期限"),
+		],
+		sourceNotes: ["上述五类合规函件均按PDF全文识别，不只截取标题或摘要"],
+		issueCategoryHints: ["合规提示", "合规警示", "合规问询", "合规关注", "合规管理建议"],
+	},
+	{
+		ruleId: "daily-risk-supervision",
+		reportSection: "internal.daily.risk",
+		title: "风险日常监督",
+		sourceTypes: ["routine-supervision", "risk"],
+		documentTypeHints: ["风险关注函", "风险提示函", "风险管理建议"],
+		searchKeywords: ["标题栏", "具体事项", "风控专员", "风险关注", "风险提示", "风险管理建议"],
+		priorityContent: ["函件标题栏", "具体事项栏", "风控专员栏"],
+		extractFields: [
+			field("documentTitle", "标题栏", true, "函件标题栏完整内容"),
+			field("documentDate", "文件日期", true, "函件出具日期"),
+			field("noticeType", "函件类型", true, "风险关注、风险提示或风险管理建议"),
+			field("organization", "涉及单位", true, "函件涉及的单位或部门"),
+			field("specificMatter", "具体事项", true, "具体事项栏完整内容"),
+			field("riskOfficer", "风控专员", true, "风控专员栏姓名或岗位标识"),
+			field("evidenceLocation", "证据定位", true, "页码、表格栏位或原文块标识"),
+		],
+		sourceNotes: ["不得用全文摘要替代标题栏、具体事项、风控专员三个指定栏位"],
+		issueCategoryHints: ["风险关注", "风险提示", "风险管理建议"],
+	},
+	{
+		ruleId: "daily-litigation",
+		reportSection: "internal.daily.litigation",
+		title: "法律诉讼案件",
+		sourceTypes: ["litigation"],
+		documentTypeHints: ["诉讼案件统计表", "诉讼案件月报", "法律案件清单"],
+		searchKeywords: ["原告", "被告", "案由", "诉讼请求", "基本案情", "进展情况", "案件状态"],
+		priorityContent: ["分析区间内最新月份的诉讼案件", "按文件中的公司单位或部门名称索引"],
+		extractFields: [
+			field(
+				"reportMonth",
+				"统计月份",
+				true,
+				"逐行提取案件清单或月报对应月份，保留全部月份的案件快照；报告阶段再按分析期间选择最新月份",
+			),
+			field("organization", "涉及单位或部门", true, "按源文件公司单位或部门名称索引"),
+			field("caseNumber", "案号", false, "法院或仲裁机构案号"),
+			field("plaintiff", "原告", true, "原告或申请人"),
+			field("defendant", "被告", true, "被告或被申请人"),
+			field("cause", "案由", true, "案件争议类型或案由"),
+			field("claims", "诉讼请求", true, "诉讼、仲裁请求或争议金额"),
+			field("caseFacts", "基本案情", true, "案件事实摘要"),
+			field("progress", "进展情况", true, "立案、审理、判决、执行或结案进度"),
+			field("evidenceLocation", "证据定位", true, "表格行、页码或原文块标识"),
+		],
+		sourceNotes: [
+			"同一分析区间内按单位和案号逐案选择最新统计月份；缺案号或同月多条记录保留待处理，不按相似案由强行合并",
+		],
+		issueCategoryHints: ["法律诉讼案件"],
+	},
+];
+
+export function getSupervisionExtractionRules(
+	filters: { sourceType?: SupervisionSourceType; reportSection?: SupervisionReportSection } = {},
+): readonly SupervisionExtractionRule[] {
+	return rules.filter(
+		(rule) =>
+			(filters.sourceType === undefined || rule.sourceTypes.includes(filters.sourceType)) &&
+			(filters.reportSection === undefined || rule.reportSection === filters.reportSection),
+	);
+}
+
+export function findSupervisionExtractionRule(ruleId: string): SupervisionExtractionRule | undefined {
+	return rules.find((rule) => rule.ruleId === ruleId);
+}

@@ -21,6 +21,7 @@ import { createSqliteRunStore } from "../store/sqlite.ts";
 import { createAuditReportToolset } from "../toolsets/audit-report.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
+import { createSupervisionAnalysisToolset } from "../toolsets/supervision-analysis.ts";
 import { createApp } from "./app.ts";
 import { Gate } from "./gate.ts";
 import type { RuntimeFactory } from "./run-manager.ts";
@@ -230,7 +231,9 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		// 的实例上再登记一次,直接抛 `Toolset "policy-query" is already registered`。
 		const buildToolsets = (): ToolsetRegistry => {
 			const registry = new ToolsetRegistry();
-			if (spec.toolset === "audit-report") {
+			if (spec.toolset === "supervision-analysis") {
+				registry.register(spec.toolset, createSupervisionAnalysisToolset(payload));
+			} else if (spec.toolset === "audit-report") {
 				if (!runOptions.reportTaskId || !runOptions.reportType) {
 					throw new Error("audit-report requires options.reportTaskId and options.reportType");
 				}

@@ -1,0 +1,38 @@
+{
+  "id": "supervision-analysis",
+  "description": "监督共享资料问题提取、整改问责关联、统计及报告结构化输出",
+  "model": { "role": "main" },
+  "thinkingLevel": "medium",
+  "toolset": "supervision-analysis",
+  "tools": [
+    "get_supervision_task",
+    "get_supervision_material_snapshot",
+    "get_supervision_retrieval_scope",
+    "get_supervision_extraction_rules",
+    "list_supervision_issue_candidates",
+    "associate_supervision_records",
+    "build_supervision_analysis_result"
+  ],
+  "systemPrompt": "supervision-analysis/system.md",
+  "appendSystemPrompt": ["supervision-analysis/output-format.md"],
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 10000,
+    "keepRecentTokens": 16000
+  },
+  "limits": {
+    "maxTurns": 12,
+    "runTimeoutMs": 600000,
+    "maxTotalTokens": 300000,
+    "maxCostUsd": 0.5
+  },
+  "resultPolicy": {
+    "name": "result-budget",
+    "options": { "maxChars": { "default": 80000 } }
+  },
+  "outputContract": {
+    "schema": "supervision-analysis/output-contract.schema.json",
+    "maxRepairAttempts": 2
+  },
+  "observability": { "contextSnapshot": "hash" }
+}

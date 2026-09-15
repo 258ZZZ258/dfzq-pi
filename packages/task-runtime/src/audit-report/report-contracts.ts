@@ -1,6 +1,30 @@
 import { Type } from "typebox";
+import type { OrganizationScopedTask } from "../business-data/contracts.ts";
 
-export type AuditReportType = "regular" | "turnover" | "aml";
+export type AuditReportType = "consultation" | "regular" | "turnover";
+
+export interface ReportWorkflow {
+	mode: "independent" | "linked" | "consultation" | "turnover";
+	matchingCompleted: boolean;
+	consultationExists: boolean;
+	sourceReportId?: string;
+	sourceVersion?: number;
+	sourceDataVersion?: string;
+	feedbackStatus?: "pending" | "completed";
+	resolutionStatus?: "pending" | "completed";
+	feedbackCompletedAt?: string;
+	feedbackDeadline?: string;
+	feedbackRequirement?: string;
+}
+
+export interface BusinessCheck {
+	code: string;
+	result: "conforming" | "exception" | "not-applicable" | "not-checked";
+	sampleCount?: number;
+	exceptionCount?: number;
+	factText?: string;
+	evidenceIds: readonly string[];
+}
 
 export type ReportValueState =
 	| "VERIFIED_VALUE"
@@ -21,11 +45,9 @@ export interface ReportAccessScope {
 	allowedSourceIds: readonly string[];
 }
 
-export interface ReportTask {
-	taskId: string;
+export interface ReportTask extends OrganizationScopedTask {
 	projectId: string;
 	reportType: AuditReportType;
-	organizationId: string;
 	auditStart: string;
 	auditEnd: string;
 	auditGroupEstablishedMonth: string;
@@ -38,6 +60,7 @@ export interface ReportTask {
 	appointmentStart?: string;
 	appointmentEnd?: string;
 	feedbackCompleted: boolean;
+	workflow?: ReportWorkflow;
 }
 
 export interface DataSourceDefinition {
@@ -76,7 +99,8 @@ export interface OrganizationSnapshot {
 export interface PersonnelSnapshot {
 	organizationId: string;
 	employeeCount: number;
-	brokerCount: number;
+	/** Omitted when unknown; zero requires a verified count. */
+	brokerCount?: number;
 	asOf: string;
 	evidenceIds: readonly string[];
 }
@@ -139,7 +163,8 @@ export interface AuditFinding {
 	majorType?: "重大违法违规" | "重大内控缺陷";
 	majorConfirmed?: boolean;
 	sourceOrder?: number;
-	issueCount: number;
+	/** Source-calibre statistic; omitted when unknown, never inferred from subitems or affected objects. */
+	issueCount?: number;
 	foundDate: string;
 	status: "open" | "rectifying" | "closed";
 	isHistorical: boolean;
@@ -151,7 +176,19 @@ export interface AuditFinding {
 
 export interface RiskEvent {
 	eventId: string;
-	type: "regulatory-letter" | "complaint" | "lawsuit" | "accountability" | "security-incident" | "major-emergency";
+	/** Explicit scope of a VERIFIED_NONE declaration; does not describe historical event occurrence. */
+	absenceScope?: "all" | "unresolved-during-period";
+	type:
+		| "regulatory-letter"
+		| "complaint"
+		| "lawsuit"
+		| "accountability"
+		| "security-incident"
+		| "major-emergency"
+		| "regulatory-inspection"
+		| "regulatory-penalty"
+		| "petition"
+		| "case";
 	state: Exclude<ReportValueState, "NOT_APPLICABLE">;
 	description?: string;
 	regularDescription?: string;
@@ -257,6 +294,14 @@ export interface PerformanceRecord {
 	evidenceIds: readonly string[];
 }
 
+export interface PerformanceAvailability {
+	status: "not-published";
+	personId: string;
+	periodStart: string;
+	periodEnd: string;
+	evidenceIds: readonly string[];
+}
+
 export interface ManualDecision {
 	decisionId: string;
 	fieldId: string;
@@ -269,6 +314,7 @@ export interface ManualDecision {
 }
 
 export interface AuditReportDataset {
+	checks?: readonly BusinessCheck[];
 	caseId: string;
 	description: string;
 	task: ReportTask;
@@ -281,6 +327,7 @@ export interface AuditReportDataset {
 	riskEvents: readonly RiskEvent[];
 	aml?: AmlSummary;
 	performance: readonly PerformanceRecord[];
+	performanceAvailability?: PerformanceAvailability;
 	manualDecisions: readonly ManualDecision[];
 	evidence: readonly EvidenceRecord[];
 	fixedFacts: {
@@ -354,6 +401,7 @@ export interface ReportSection {
 }
 
 export interface ReportDraft {
+	workflow?: ReportWorkflow;
 	taskId: string;
 	reportType: AuditReportType;
 	templateId: string;
@@ -415,7 +463,30 @@ const ReportSectionSchema = Type.Object(
 export const ReportDraftSchema = Type.Object(
 	{
 		taskId: Type.String(),
-		reportType: Type.Union([Type.Literal("regular"), Type.Literal("turnover"), Type.Literal("aml")]),
+		reportType: Type.Union([Type.Literal("consultation"), Type.Literal("regular"), Type.Literal("turnover")]),
+		workflow: Type.Optional(
+			Type.Object(
+				{
+					mode: Type.Union([
+						Type.Literal("independent"),
+						Type.Literal("linked"),
+						Type.Literal("consultation"),
+						Type.Literal("turnover"),
+					]),
+					matchingCompleted: Type.Boolean(),
+					consultationExists: Type.Boolean(),
+					sourceReportId: Type.Optional(Type.String()),
+					sourceVersion: Type.Optional(Type.Integer({ minimum: 1 })),
+					sourceDataVersion: Type.Optional(Type.String()),
+					feedbackStatus: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("completed")])),
+					resolutionStatus: Type.Optional(Type.Union([Type.Literal("pending"), Type.Literal("completed")])),
+					feedbackCompletedAt: Type.Optional(Type.String()),
+					feedbackDeadline: Type.Optional(Type.String()),
+					feedbackRequirement: Type.Optional(Type.String()),
+				},
+				{ additionalProperties: false },
+			),
+		),
 		templateId: Type.String(),
 		templateVersion: Type.String(),
 		titleLines: Type.Array(Type.String()),

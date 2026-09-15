@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { AuditReportDataset, ReportDraft, ReportFactPack } from "./report-contracts.ts";
+import type { ReportNarrativeProcessor } from "./report-narrative-processing.ts";
+import type { SemanticState } from "./report-semantic.ts";
 
 export interface ReportToolTrace {
 	toolName: string;
@@ -11,13 +13,17 @@ export interface AuditReportRequestContext {
 	dataset: AuditReportDataset;
 	factPack?: ReportFactPack;
 	draft?: ReportDraft;
+	deliveryToken?: string;
+	semantic?: SemanticState;
+	narrativeProcessor?: ReportNarrativeProcessor;
+	narrativeCache?: { baseline: ReportDraft; result: Awaited<ReturnType<ReportNarrativeProcessor>> };
 	trace: ReportToolTrace[];
 }
 
 const reportContext = new AsyncLocalStorage<AuditReportRequestContext>();
 
 export function createAuditReportRequestContext(dataset: AuditReportDataset): AuditReportRequestContext {
-	return { dataset, trace: [] };
+	return { dataset: structuredClone(dataset), trace: [] };
 }
 
 export function withAuditReportRequestContext<T>(

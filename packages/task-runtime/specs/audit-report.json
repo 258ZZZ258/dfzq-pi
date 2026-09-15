@@ -1,6 +1,6 @@
 {
   "id": "audit-report",
-  "description": "常规、离任和反洗钱审计报告生成",
+  "description": "审计征求意见书、常规审计报告（含反洗钱附件）和离任审计报告生成",
   "model": { "role": "main" },
   "thinkingLevel": "medium",
   "toolset": "audit-report",
@@ -18,6 +18,10 @@
     "get_aml_facts",
     "prepare_report_fact_pack",
     "generate_report_draft",
+    "get_report_semantic_job",
+    "submit_report_semantic_job",
+    "retain_report_semantic_job",
+    "get_report_paragraph",
     "revise_report_draft"
   ],
   "systemPrompt": "audit-report/system.md",
@@ -29,9 +33,9 @@
     "keepRecentTokens": 18000
   },
   "limits": {
-    "maxTurns": 24,
+    "maxTurns": 48,
     "runTimeoutMs": 900000,
-    "maxTotalTokens": 1000000,
+    "maxTotalTokens": 3000000,
     "maxCostUsd": 1
   },
   "stopPolicy": {

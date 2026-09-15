@@ -30,12 +30,12 @@ describe("historical comparison is invariant to an embedded policy field", () =>
 	it.each([0, 1])("preserves the decision when record %s embeds its policy in the fact field", (index) => {
 		const source = records();
 		const expected = comparePreviousAuditFindings(source);
-		expect(expected.unrectified).toHaveLength(1);
+		expect(expected.needsReview).toHaveLength(1);
 		source[index] = { ...source[index]!, policyBasis: "", factText: `${policy}${source[index]!.factText}` };
 		const snapshot = structuredClone(source);
 		const result = comparePreviousAuditFindings(source);
-		expect(result.unrectified.map((p) => [p.previous.findingId, p.current.findingId])).toEqual([["PREV", "CURRENT"]]);
-		expect(result.needsReview).toEqual([]);
+		expect(result.needsReview.map((p) => [p.previous.findingId, p.current.findingId])).toEqual([["PREV", "CURRENT"]]);
+		expect(result.unrectified).toEqual([]);
 		expect(source).toEqual(snapshot);
 	});
 	it.each([

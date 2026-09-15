@@ -1,3 +1,5 @@
+export type { AuditReportTaskExtension } from "./business-task-adapter.ts";
+export { toAuditBusinessTaskRecord, toAuditReportTask } from "./business-task-adapter.ts";
 export type {
 	AuditFinding,
 	AuditReportDataset,
@@ -15,6 +17,17 @@ export {
 	loadAuditReportDataset,
 	type SourceReadTrace,
 } from "./report-data-source.ts";
+export {
+	type AuditReportJavaDocument,
+	type ReportCitation,
+	type ReportDocumentNode,
+	type ReportDocumentNodeType,
+	type ReportNodeBasis,
+	reportBasisNeedsRecheck,
+	reportDocumentMatches,
+	reportTextHash,
+	toAuditReportJavaDocument,
+} from "./report-java-contract.ts";
 export {
 	assessSourceCoverage,
 	buildFactPack,

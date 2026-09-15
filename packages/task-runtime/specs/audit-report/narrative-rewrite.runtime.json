@@ -1,0 +1,11 @@
+{
+  "id": "audit-report-narrative-rewrite",
+  "model": { "role": "main" },
+  "thinkingLevel": "medium",
+  "toolset": "audit-report-narrative",
+  "toolMode": "none",
+  "tools": [],
+  "systemPrompt": "narrative-rewrite.md",
+  "limits": { "maxTurns": 2, "runTimeoutMs": 60000, "maxTotalTokens": 16000, "maxCostUsd": 0.1 },
+  "observability": { "contextSnapshot": "hash" }
+}

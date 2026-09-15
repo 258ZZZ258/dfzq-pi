@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { Hono } from "hono";
 import type { SpecRouter } from "../router/router.ts";
 import type { RunResult } from "../runtime/contract.ts";
@@ -81,6 +82,34 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			c.req.query("includeHistory") === "true",
 		);
 		return c.json(items);
+	});
+
+	// Read-only reconciliation: never call manager.submit, even when the key is absent.
+	app.post("/runs/lookup", async (c) => {
+		let raw: unknown;
+		try {
+			raw = await c.req.json();
+		} catch {
+			return c.json(errorBody("malformed_json", "request body is not valid JSON"), 400);
+		}
+		const validated = validateSubmitBody(raw);
+		if (!validated.ok) return c.json(errorBody(validated.error.code, validated.error.message), 422);
+		const body = validated.body;
+		const row = await store.findByClientRequestId(body.clientRequestId);
+		if (!row) return c.json(errorBody("not_found", "run not found; absence does not authorize resubmission"), 404);
+		const equal =
+			row.taskKind === body.taskKind &&
+			row.sessionId === body.sessionId &&
+			row.input === body.input &&
+			isDeepStrictEqual(JSON.parse(row.filtersJson), body.filters) &&
+			isDeepStrictEqual(row.optionsJson === undefined ? undefined : JSON.parse(row.optionsJson), body.options) &&
+			isDeepStrictEqual(row.payloadJson === undefined ? undefined : JSON.parse(row.payloadJson), body.payload);
+		if (!equal)
+			return c.json(
+				errorBody("request_conflict", "request key belongs to different input or authorization scope"),
+				409,
+			);
+		return c.json({ runId: row.runId, status: row.status, clientRequestId: row.clientRequestId }, 200);
 	});
 
 	app.post("/runs", async (c) => {

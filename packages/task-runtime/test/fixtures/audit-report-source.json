@@ -3,15 +3,41 @@
     "caseId": "CASE-001", "description": "最小常规审计测试", "taskId": "TASK-001",
     "projectId": "PROJECT-001", "reportType": "regular", "organizationId": "ORG-001",
     "auditStart": "2025-01-01", "auditEnd": "2025-12-31", "auditGroupEstablishedMonth": "2026年1月",
-    "reportDate": "2026年2月1日", "templateId": "regular-v1", "templateVersion": "1",
-    "closingOrganization": "测试证券公司", "feedbackCompleted": true
+    "reportDate": "2026-02-01", "templateId": "regular-v1", "templateVersion": "1",
+    "closingOrganization": "测试证券公司", "feedbackCompleted": true, "subjectPersonId":"PERSON-001", "subjectPersonName":"张三"
   }],
+  "报告流程": [{"taskId":"TASK-001","mode":"independent","matchingCompleted":true,"consultationExists":false}],
+  "业务检查": [
+    {"taskId":"TASK-001","code":"岗位设置","result":"conforming"},
+    {"taskId":"TASK-001","code":"不相容职务分离","result":"conforming"},
+    {"taskId":"TASK-001","code":"授权审批","result":"conforming"},
+    {"taskId":"TASK-001","code":"财产保护","result":"conforming"},
+    {"taskId":"TASK-001","code":"预算控制","result":"conforming"},
+    {"taskId":"TASK-001","code":"客户账户管理","result":"conforming"},
+    {"taskId":"TASK-001","code":"适当性管理","result":"conforming"},
+    {"taskId":"TASK-001","code":"员工执业行为管理","result":"conforming"},
+    {"taskId":"TASK-001","code":"客户投诉处理","result":"conforming"},
+    {"taskId":"TASK-001","code":"廉洁从业管理","result":"conforming"},
+    {"taskId":"TASK-001","code":"财务管理","result":"conforming"},
+    {"taskId":"TASK-001","code":"信息系统管理","result":"conforming"},
+    {"taskId":"TASK-001","code":"反洗钱组织机制","result":"conforming"},
+    {"taskId":"TASK-001","code":"反洗钱制度及备案","result":"conforming"},
+    {"taskId":"TASK-001","code":"客户身份识别","result":"conforming"},
+    {"taskId":"TASK-001","code":"客户风险分类","result":"conforming"},
+    {"taskId":"TASK-001","code":"外部监管或执法函件录入","result":"conforming"},
+    {"taskId":"TASK-001","code":"大额及可疑交易甄别与报送","result":"conforming"},
+    {"taskId":"TASK-001","code":"客户身份资料和交易记录保存","result":"conforming"},
+    {"taskId":"TASK-001","code":"反洗钱培训与宣传","result":"conforming"}
+  ],
   "营业部基础库": [{
     "organizationId": "ORG-001", "organizationCode": "BR001", "fullName": "测试证券营业部",
     "address": "测试市测试路1号", "areaSquareMeters": 300, "asOf": "2025-12-31", "historyStatement": "无机构变更。"
   }],
   "人员快照": [{ "organizationId": "ORG-001", "employeeCount": 8, "brokerCount": 2, "asOf": "2025-12-31" }],
-  "OA任免发文": [],
+  "OA任免发文": [
+    {"organizationId":"ORG-001","personId":"PERSON-001","personName":"张三","title":"总经理","action":"appoint","startDate":"2025-01-01","issuer":"测试证券公司","documentTitle":"关于聘任张三的通知","documentNumber":"测试人〔2025〕1号","documentDate":"2025-01-01"},
+    {"organizationId":"ORG-001","personId":"PERSON-001","personName":"张三","title":"总经理","action":"remove","startDate":"2025-12-31","endDate":"2025-12-31","issuer":"测试证券公司","documentTitle":"关于免去张三职务的通知","documentNumber":"测试人〔2025〕2号","documentDate":"2025-12-31"}
+  ],
   "审计发现": [{
     "findingId": "F-001", "projectId": "PROJECT-001", "organizationId": "ORG-001",
     "category": "综合管理", "subcategory": "信息公示", "findingType": "制度执行类", "severity": "一般",
@@ -33,7 +59,14 @@
     { "organizationId": "ORG-001", "eventId": "R-5", "type": "regulatory-penalty", "state": "VERIFIED_NONE" },
     { "organizationId": "ORG-001", "eventId": "R-6", "type": "financial-loss", "state": "VERIFIED_NONE" }
   ],
-  "反洗钱领域事实": [], "反洗钱新开户风险等级": [], "反洗钱定期审核": [], "反洗钱协查函": [],
+  "反洗钱领域事实": [
+    {"domain":"internal-control","state":"VERIFIED_VALUE","summary":"已开展内控检查。"},
+    {"domain":"customer-identification","state":"VERIFIED_VALUE","summary":"已开展身份识别检查。"},
+    {"domain":"risk-classification","state":"VERIFIED_VALUE","summary":"已开展风险分类检查。"},
+    {"domain":"large-suspicious-transactions","state":"VERIFIED_VALUE","summary":"已开展可疑交易检查。"},
+    {"domain":"record-retention","state":"VERIFIED_VALUE","summary":"已开展资料保存检查。"},
+    {"domain":"training-publicity","state":"VERIFIED_VALUE","summary":"已开展宣传培训检查。"}
+  ], "反洗钱新开户风险等级": [], "反洗钱定期审核": [], "反洗钱协查函": [],
   "总部可疑交易认定": [], "重大事项判断": [], "绩效考核": [],
   "反洗钱汇总": [{
     "organizationId": "ORG-001", "suspiciousTransactionCount": 0, "suspiciousTransactionType": "一般可疑交易",

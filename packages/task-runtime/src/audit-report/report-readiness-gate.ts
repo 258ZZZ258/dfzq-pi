@@ -19,12 +19,29 @@ export const auditReportReadinessDescriptor: PluginDescriptor = {
 				const extracted = extractJsonBlock(lastAssistantText);
 				if (extracted.kind === "ok" && typeof extracted.value === "object" && extracted.value !== null) {
 					const value = extracted.value as Record<string, unknown>;
-					if (typeof value.taskId === "string" && Array.isArray(value.sections)) return { ok: true };
+					const report = value.report;
+					if (
+						value.schemaVersion === "audit-report-document.v1" &&
+						typeof report === "object" &&
+						report !== null &&
+						typeof (report as Record<string, unknown>).taskId === "string" &&
+						Array.isArray((report as Record<string, unknown>).sections) &&
+						Array.isArray(value.nodes) &&
+						Array.isArray(value.citations)
+					) {
+						const checked = await context.callTool("validate_report_document", {
+							documentJson: JSON.stringify(value),
+						});
+						if (typeof checked === "object" && checked !== null && "valid" in checked && checked.valid === true)
+							return { ok: true };
+					}
 				}
 				return {
 					ok: false,
-					followUp: "请完成取数和规则生成，只输出完整 ReportDraft JSON，不要输出过程说明。",
-					detail: "final answer is not a complete ReportDraft",
+					followUp:
+						"请完成取数和规则生成，只输出最新工具返回的 audit-report-result-ref.v1 三字段引用，由 Runtime 解析完整文档，不要输出过程说明。",
+					detail:
+						"final document is incomplete or differs from the current tool-generated report, nodes or sources",
 				};
 			},
 		};

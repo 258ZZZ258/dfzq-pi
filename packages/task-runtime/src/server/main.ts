@@ -1,6 +1,11 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { type ServerType, serve } from "@hono/node-server";
+import { createDisclosureLinkTools, disclosureLinkDelivery } from "../audit-report/disclosure-link.ts";
+import { parseReportInput } from "../audit-report/report-input.ts";
+import type { ReportNarrativeProcessor } from "../audit-report/report-narrative-processing.ts";
+import { createAuditReportRuntime } from "../audit-report/report-runtime.ts";
+import { createBoundAuditReportTools } from "../audit-report/report-tools.ts";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { loadSpecRouter } from "../router/router.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
@@ -19,6 +24,7 @@ import { createSqliteRunStore } from "../store/sqlite.ts";
 import { createAuditReportToolset } from "../toolsets/audit-report.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
+import { createSupervisionAnalysisToolset } from "../toolsets/supervision-analysis.ts";
 import { createApp } from "./app.ts";
 import { Gate } from "./gate.ts";
 import type { RuntimeFactory } from "./run-manager.ts";
@@ -226,15 +232,29 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		// 无害);真正会炸的是**这个闭包自己**如果被改成复用同一个 registry 实例、却仍然在
 		// 每次调用里执行 `register(...)`——那样第二次调用会在一个已经登记过 `spec.toolset`
 		// 的实例上再登记一次,直接抛 `Toolset "policy-query" is already registered`。
-		const buildToolsets = (): ToolsetRegistry => {
+		const buildToolsets = (narrativeProcessor?: ReportNarrativeProcessor): ToolsetRegistry => {
 			const registry = new ToolsetRegistry();
-			if (spec.toolset === "audit-report") {
-				if (!options.auditReportSources) {
-					throw new Error("audit-report source configuration is not available");
-				}
+			if (spec.toolset === "audit-disclosure") {
+				registry.register(spec.toolset, async () => createDisclosureLinkTools(payload, runOptions.reportTaskId));
+			} else if (spec.toolset === "supervision-analysis") {
+				registry.register(spec.toolset, createSupervisionAnalysisToolset(payload));
+			} else if (spec.toolset === "audit-report") {
 				if (!runOptions.reportTaskId || !runOptions.reportType) {
 					throw new Error("audit-report requires options.reportTaskId and options.reportType");
 				}
+				if (payload !== undefined) {
+					const dataset = parseReportInput(payload, runOptions.reportTaskId, runOptions.reportType);
+					registry.register(spec.toolset, async () =>
+						createBoundAuditReportTools(
+							dataset,
+							resolve(options.specsDir, "audit-report/skills"),
+							narrativeProcessor,
+						),
+					);
+					return registry;
+				}
+				if (!options.auditReportSources)
+					throw new Error("audit-report requires Java input payload or server source configuration");
 				registry.register(
 					spec.toolset,
 					createAuditReportToolset({
@@ -243,6 +263,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 						apiBaseUrl: options.auditReportSources.apiBaseUrl,
 						operatingWorkbookPath: options.auditReportSources.operatingWorkbookPath,
 						skillRoot: resolve(options.specsDir, "audit-report/skills"),
+						narrativeProcessor,
 					}),
 				);
 			} else {
@@ -325,8 +346,32 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			});
 		}
 
+		if (spec.toolset === "audit-report") {
+			const narrativeDir = resolve(options.specsDir, "audit-report");
+			const rewrite = JSON.parse(
+				await readFile(join(narrativeDir, "narrative-rewrite.runtime.json"), "utf8"),
+			) as RuntimeSpec;
+			const review = JSON.parse(
+				await readFile(join(narrativeDir, "narrative-review.runtime.json"), "utf8"),
+			) as RuntimeSpec;
+			await resolveSpecPromptPaths(rewrite, narrativeDir);
+			await resolveSpecPromptPaths(review, narrativeDir);
+			return createAuditReportRuntime({
+				spec,
+				profile,
+				registry: plugins,
+				buildToolsets,
+				narrativeSpecs: { rewrite, review },
+				cwd: join(workdir, "workspace"),
+				agentDir: join(workdir, "agent"),
+				outputContractSchema: outputContractSchemas.get(specId),
+				skillPaths: skillPaths.get(specId),
+			});
+		}
+
 		const buildFull = () =>
 			createSessionRuntime({
+				...(spec.toolset === "audit-disclosure" ? disclosureLinkDelivery : {}),
 				spec,
 				profile,
 				registry: plugins,

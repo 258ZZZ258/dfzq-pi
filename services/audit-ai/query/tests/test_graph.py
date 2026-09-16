@@ -1,0 +1,319 @@
+"""T13(单元):LangGraph 路由装配——R7 澄清 / R8 兜底 / R2–R6 占位(均不触检索/PG/LLM)。
+
+R1 evidence 路径连真栈,见 test_graph_integration。本测只验路由分支落到正确终端节点 + 契约形态。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from query.config import load_query_config
+from query.contract import BlockType, RouteType
+from query.graph import QueryAgent
+from query.llm.stub import StubLLMClient
+
+
+@pytest.fixture
+def agent():
+    # retriever/pg=None:非 evidence 路径不触碰它们(纯函数节点)
+    return QueryAgent(retriever=None, pg=None, llm=StubLLMClient(), qcfg=load_query_config())
+
+
+def test_off_domain_routes_to_refuse(agent):
+    res = agent.ask("今天天气怎么样")
+    assert res.route_type is RouteType.REFUSE
+    assert "超出" in res.answer_blocks[0].content
+
+
+def test_ambiguous_routes_to_clarify(agent):
+    res = agent.ask("它呢")
+    assert res.route_type is RouteType.CLARIFY
+    assert res.answer_blocks[0].type is BlockType.CLARIFY_QUESTION
+
+
+def test_judgmental_routes_to_r5_node(monkeypatch):
+    # R5 已实装(收官):JUDGMENTAL 路由落 r5_judgment 节点;**八路全实装,无占位**。
+    from query.contract import Citation
+    from query.judge import r5_judgment
+    from query.retrieve.hybrid import Candidate
+
+    cand = Candidate("a1", 1.0, "P-EXT", "DV1", "第三条", 1, False, "hybrid")
+
+    class _Retr:
+        def retrieve(self, q, *, include_superseded=False):
+            return [cand]
+
+        def retrieve_cases(self, q, *, include_superseded=False):
+            return []
+
+    monkeypatch.setattr(
+        r5_judgment, "fetch_anchors",
+        lambda pg, ids: {
+            "a1": Citation(clause_id="a1", doc_title="合同管理办法", doc_no="令1",
+                           clause_path="第三条", page_start=1, status="effective")
+        },
+    )
+    monkeypatch.setattr(r5_judgment, "fetch_texts", lambda pg, ids: {"a1": "合同应当经法务审查。"})
+    monkeypatch.setattr(r5_judgment, "resolve_cited_clauses", lambda pg, dvids: [])
+    agent = QueryAgent(retriever=_Retr(), pg=None, llm=StubLLMClient(), qcfg=load_query_config())
+    res = agent.ask("二维码介绍开户是否违规")
+    assert res.route_type is RouteType.JUDGMENTAL
+    assert res.review_required is True            # 人工复核框
+    assert res.citations                          # 三段式 ① 依据条款
+    for b in res.answer_blocks:                    # 红线:无裸结论
+        assert not any(w in b.content for w in ("违规", "违法", "合规", "合法", "可能违反"))
+
+
+def test_enumerate_routes_to_r4_node(monkeypatch):
+    # R4 已实装:ENUMERATE 路由落 r4_listing 节点(fake retriever + monkeypatch anchors,零栈)。
+    from query.contract import Citation
+    from query.listing import r4_listing
+    from query.retrieve.hybrid import Candidate
+
+    cand = Candidate("a1", 1.0, "P-INT", "DV1", "1/1", 1, False, "hybrid")
+
+    class _Retr:
+        def retrieve_enumerate(self, q, *, extra_expr=None, include_superseded=False):
+            return [cand]
+
+    monkeypatch.setattr(
+        r4_listing, "fetch_anchors",
+        lambda pg, ids: {
+            "a1": Citation(
+                clause_id="a1", doc_title="《信息披露管理办法》", doc_no="令1号",
+                clause_path="1/1", page_start=1, status="effective",
+            )
+        },
+    )
+    agent = QueryAgent(retriever=_Retr(), pg=None, llm=StubLLMClient(), qcfg=load_query_config())
+    res = agent.ask("哪些制度规定了信息披露")
+    assert res.route_type is RouteType.ENUMERATE
+    assert res.answer_blocks[0].type is BlockType.TABLE  # 列表化输出
+    assert len(res.citations) == 1  # 四级锚点
+
+
+def test_r4_node_forwards_scene_terms(monkeypatch):
+    # R4 图节点须把 state.scene 抽取的 matters/entity 注入 answer_enumerate(T6 验收)
+    from query.contract import Citation
+    from query.listing import r4_listing
+    from query.retrieve.hybrid import Candidate
+    from query.state import QueryState
+
+    cand = Candidate("a1", 1.0, "P-INT", "DV1", "1/1", 1, False, "hybrid")
+    captured = {}
+
+    class _Retr:
+        def retrieve_enumerate(self, q, *, extra_expr=None, include_superseded=False):
+            captured["expr"] = extra_expr
+            return [cand]
+
+    monkeypatch.setattr(
+        r4_listing, "fetch_anchors",
+        lambda pg, ids: {
+            "a1": Citation(
+                clause_id="a1", doc_title="《X》", doc_no="1", clause_path="1/1",
+                page_start=1, status="effective",
+            )
+        },
+    )
+    agent = QueryAgent(retriever=_Retr(), pg=None, llm=StubLLMClient(), qcfg=load_query_config())
+    st = QueryState(
+        "哪些制度规定了反洗钱",
+        scene={"scene_type": "enumerate", "matters": ["反洗钱"], "entity_types": []},
+    )
+    agent._r4_listing(st)
+    # scene 抽取的 matters 下推为 biz 过滤(非仅 chunk_type)
+    assert 'array_contains_any(biz_domain, ["反洗钱"])' in captured["expr"]
+
+
+def test_statistical_routes_to_r6_node():
+    # R6 已实装:STATISTICAL 路由落 r6_stats 节点(fake pg,零栈)。空结果 → 明示。
+    class _Result:
+        def all(self):
+            return []
+
+    class _Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, _stmt):
+            return _Result()
+
+    class _Pg:
+        def session(self):
+            return _Session()
+
+    agent = QueryAgent(retriever=None, pg=_Pg(), llm=StubLLMClient(), qcfg=load_query_config())
+    res = agent.ask("哪些板块处罚高发")
+    assert res.route_type is RouteType.STATISTICAL
+    assert "未检索到" in res.answer_blocks[0].content  # 空结果明示,不臆造
+    assert res.citations == []
+
+
+def test_case_routes_to_r3_node():
+    # R3 已实装:CASE 路由落 r3_case 节点(用 fake retriever/pg,零栈)。空命中 → 明示。
+    class _Retr:
+        def retrieve_cases(self, q, *, include_superseded=False):
+            return []
+
+    class _Pg:
+        def get_case(self, dvid):
+            return None
+
+        def get(self, model, pk):
+            return None
+
+    agent = QueryAgent(retriever=_Retr(), pg=_Pg(), llm=StubLLMClient(), qcfg=load_query_config())
+    res = agent.ask("有没有类似的处罚案例")
+    assert res.route_type is RouteType.CASE
+    assert "未检索到" in res.answer_blocks[0].content  # 诚实明示,不裸答、不臆造
+    assert res.citations == []
+
+
+def test_route_only_no_retrieval(agent):
+    assert agent.route_only("费用报销三个月的规定在哪里") is RouteType.EVIDENCE
+
+
+# ── N0 多轮归并节点(§3.4)+ R7 闭环 + 单轮 no-op + merge 客户端门控(零栈)──────
+_R7_HIST = [
+    {"role": "user", "content": "合同管理办法什么时候改的"},
+    {"role": "assistant", "content": "您问现行版本还是某历史版本?", "route_type": "clarify"},
+]
+_ANSWER_HIST = [
+    {"role": "user", "content": "内幕交易的认定标准"},
+    {"role": "assistant", "content": "根据相关规定……"},
+]
+
+
+def test_n0_merge_r7_closure_node(agent):
+    from query.state import QueryState
+
+    out = agent._n0_merge(QueryState("现行版本", history=_R7_HIST))
+    assert "合同管理办法什么时候改的" in out["query"]  # 原问
+    assert "现行版本" in out["query"]                   # 澄清答
+
+
+def test_n0_merge_single_turn_noop(agent):
+    from query.state import QueryState
+
+    # 空 history → 不改写(返 {} → state.query 不变)→ 既有单轮 byte 等价
+    assert agent._n0_merge(QueryState("费用报销三个月的规定在哪", history=[])) == {}
+
+
+def test_n0_merge_self_contained_noop(agent):
+    from query.state import QueryState
+
+    # 有 history 但自足问句(无指代/不短)→ 规则版 None → 原句 → 返 {}
+    assert agent._n0_merge(QueryState("洗钱罪的构成要件是什么", history=_ANSWER_HIST)) == {}
+
+
+def test_r7_closure_changes_routing(agent):
+    # 单轮裸指代 → CLARIFY;N0 归并后不再歧义 → 离开 CLARIFY(R7 闭环效果,零栈)
+    from query.state import QueryState
+
+    assert agent.route_only("它呢") is RouteType.CLARIFY
+    merged = agent._n0_merge(QueryState("它的处罚呢", history=_ANSWER_HIST))["query"]
+    assert agent.route_only(merged) is not RouteType.CLARIFY
+
+
+def test_ask_accepts_history_backward_compatible(agent):
+    # ask(query, history=None) 向后兼容:单轮不传 history 照常(既有调用零变化)
+    assert agent.ask("它呢").route_type is RouteType.CLARIFY
+
+
+def test_merge_llm_built_only_when_gateway_on_with_key(monkeypatch):
+    # 经 maybe_make_llm_client:monkeypatch 内层 client.make_llm_client + 控 key 环境。
+    import query.llm.client as client
+
+    monkeypatch.setattr(client, "make_llm_client", lambda cfg, *, model=None: ("sentinel", model))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")  # 有 key
+    base = load_query_config()
+    # stub(默认后端)→ 不建归并客户端(零网络、走规则版)
+    assert QueryAgent(None, None, StubLLMClient(), base)._merge_llm is None
+    # gateway + merge_context 开 + 有 key → 建(真 LLM 为主)
+    gw_on = base.model_copy(update={"llm_backend": "gateway", "merge_context": True})
+    assert QueryAgent(None, None, StubLLMClient(), gw_on)._merge_llm == (
+        "sentinel", gw_on.merge_model or gw_on.llm_model
+    )
+    # gateway + merge_context 关 → 不建
+    gw_off = base.model_copy(update={"llm_backend": "gateway", "merge_context": False})
+    assert QueryAgent(None, None, StubLLMClient(), gw_off)._merge_llm is None
+    # gateway 但无 OPENAI_API_KEY → 不建、不崩溃(降级规则版,QUERY-N0-OFFLINE-GATE)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert QueryAgent(None, None, StubLLMClient(), gw_on)._merge_llm is None
+
+
+# ── 附挂门控(§6.3 适用边界):仅充分 evidence + 非概念判断型;拒答/关闭不挂(零栈)──────
+class _OneCaseRetr:
+    def retrieve_cases(self, q, *, include_superseded=False):
+        from query.retrieve.hybrid import Candidate
+
+        return [Candidate("c1", 1.0, "P-CASE", "DV1", None, None, False, "hybrid")]
+
+
+class _OneCasePg:
+    def get_case(self, dvid):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            doc_version_id=dvid, penalty_org="XX证监局", penalty_date=None, respondent="XX公司",
+            penalty_type="罚款", amount_wan=None, violation_category=None, cited_regulations=[],
+        )
+
+    def get(self, model, pk):
+        return None
+
+    def session(self):  # 精确反查走 fake;citations=[] 时不触达
+        raise AssertionError("不应触达 PG session")
+
+
+def _agent(attach_cases=True):
+    qcfg = load_query_config().model_copy(update={"attach_cases": attach_cases})
+    return QueryAgent(_OneCaseRetr(), _OneCasePg(), StubLLMClient(), qcfg)
+
+
+def _evidence_res():
+    from query.contract import AnswerBlock, QueryResult
+
+    return QueryResult(RouteType.EVIDENCE, answer_blocks=[AnswerBlock(BlockType.TEXT, "答")])
+
+
+def _cards(res):
+    return [b for b in res.answer_blocks if b.type is BlockType.CASE_CARD]
+
+
+def test_attach_on_evidence_non_definition():
+    from query.state import QueryState
+
+    st = QueryState("q", scene={"scene_type": "evidence"})
+    res = _agent()._maybe_attach_cases(st, _evidence_res())
+    assert len(_cards(res)) == 1   # 充分 evidence + 非 definition → 附挂
+
+
+def test_no_attach_definition_scene():
+    from query.state import QueryState
+
+    st = QueryState("q", scene={"scene_type": "definition"})
+    res = _agent()._maybe_attach_cases(st, _evidence_res())
+    assert _cards(res) == []   # 概念判断型不附挂(§6.3 适用边界)
+
+
+def test_no_attach_when_refuse_route():
+    from query.contract import AnswerBlock, QueryResult
+    from query.state import QueryState
+
+    refuse = QueryResult(RouteType.REFUSE, answer_blocks=[AnswerBlock(BlockType.TEXT, "拒")])
+    res = _agent()._maybe_attach_cases(QueryState("q", scene={"scene_type": "evidence"}), refuse)
+    assert _cards(res) == []   # 拒答/降级不附挂
+
+
+def test_no_attach_when_toggle_off():
+    from query.state import QueryState
+
+    res = _agent(attach_cases=False)._maybe_attach_cases(
+        QueryState("q", scene={"scene_type": "evidence"}), _evidence_res()
+    )
+    assert _cards(res) == []   # 开关关闭 → 不附挂

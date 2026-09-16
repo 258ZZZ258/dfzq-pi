@@ -1,7 +1,11 @@
 {
   "id": "audit-report",
+  "durableSession": false,
+  "$commentRecovery": "The report toolset keeps a mutable draft outside Session state. Automatic resume and queued conversation continuation remain disabled until that state has an explicit checkpoint contract.",
   "description": "审计征求意见书、常规审计报告（含反洗钱附件）和离任审计报告生成",
-  "model": { "role": "main" },
+  "model": {
+    "role": "main"
+  },
   "thinkingLevel": "medium",
   "toolset": "audit-report",
   "tools": [
@@ -22,8 +26,12 @@
     "validate_report_document"
   ],
   "systemPrompt": "audit-report/system.md",
-  "skills": ["audit-report/skills/SKILL.md"],
-  "appendSystemPrompt": ["audit-report/output-format.md"],
+  "skills": [
+    "audit-report/skills/SKILL.md"
+  ],
+  "appendSystemPrompt": [
+    "audit-report/output-format.md"
+  ],
   "compaction": {
     "enabled": true,
     "reserveTokens": 12000,
@@ -31,23 +39,27 @@
   },
   "limits": {
     "maxTurns": 24,
-    "runTimeoutMs": 900000,
-    "maxTotalTokens": 1000000,
-    "maxCostUsd": 1
+    "runTimeoutMs": 900000
   },
   "stopPolicy": {
     "name": "audit-report-readiness",
-    "options": { "maxAttempts": 1 }
+    "options": {
+      "maxAttempts": 1
+    }
   },
   "resultPolicy": {
     "name": "result-budget",
     "options": {
-      "maxChars": { "default": 60000 }
+      "maxChars": {
+        "default": 60000
+      }
     }
   },
   "outputContract": {
     "schema": "audit-report/output-contract.schema.json",
     "maxRepairAttempts": 2
   },
-  "observability": { "contextSnapshot": "hash" }
+  "observability": {
+    "contextSnapshot": "hash"
+  }
 }

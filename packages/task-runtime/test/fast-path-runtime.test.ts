@@ -117,7 +117,7 @@ describe("deriveFastSpec", () => {
 		toolset: "t",
 		tools: ["search_policy"],
 		thinkingLevel: "medium",
-		limits: { maxTurns: 30, maxCostUsd: 0.5 },
+		limits: { maxTurns: 30, runTimeoutMs: 900000 },
 		resultPolicy: { name: "result-budget", options: { maxChars: { get_clause_detail: 7700 } } },
 		fastPath: {
 			enabled: true,
@@ -125,7 +125,7 @@ describe("deriveFastSpec", () => {
 			rewritePrompt: "rw",
 			answerPrompt: "ans",
 			maxClauses: 12,
-			limits: { maxCostUsd: 0.1 },
+			limits: { runTimeoutMs: 45000 },
 			thinkingLevel: "off",
 			maxChars: { get_clause_detail: 11500 },
 		},
@@ -139,7 +139,7 @@ describe("deriveFastSpec", () => {
 
 	it("takes limits, thinkingLevel and maxChars from fastPath", () => {
 		const got = deriveFastSpec(spec);
-		expect(got.limits).toEqual({ maxCostUsd: 0.1 });
+		expect(got.limits).toEqual({ runTimeoutMs: 45000, maxTurns: 30 });
 		expect(got.thinkingLevel).toBe("off");
 		// `resultPolicy` 的静态类型是 `PluginRef | undefined`(`PluginRef` 含 `string` 变体),
 		// 与 `{ options: {...} }` 没有足够的结构重叠,直接断言会被 tsgo 拒绝;先过一道 `unknown`
@@ -225,9 +225,9 @@ interface FastOpts {
 	toolThrows?: "search_policy" | "get_clause_detail";
 	/** fastPath.limits.runTimeoutMs 覆盖值,缺省不设(与其余用例一致,不测超时时不需要它)。 */
 	runTimeoutMs?: number;
-	/** fastPath.limits.maxTotalTokens 覆盖值,用来验规格 §7「阶段 1 撞 limits 插件的阈值 ⇒
-	 *  升级」——测试用的 profile 计费全 0,maxCostUsd 永远撞不上,只有 token 计数能触发。 */
-	maxTotalTokens?: number;
+	/** fastPath.limits.maxTurns 覆盖值,用来验规格 §7「阶段 1 撞 limits 插件的阈值 ⇒
+	 *  升级」，以轮数触发执行限制。 */
+	maxTurns?: number;
 	/** 让 modelReplies[0](模型①改写词那次回复)延迟这么多 ms 才 resolve,模拟"模型①挂住"。
 	 *  必须配合 runTimeoutMs 使用。 */
 	hangRewriteMs?: number;
@@ -354,7 +354,7 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 			model: { role: "main" },
 			toolset: "demo",
 			tools: ["search_policy", "get_clause_detail"],
-			limits: { maxCostUsd: 1 },
+			limits: { runTimeoutMs: 60000 },
 			fastPath: {
 				enabled: true,
 				// ⚠ 这三个在生产上是路径,但 resolveSpecPromptPaths 在**构造期**已把它们读成正文,
@@ -364,9 +364,9 @@ async function fastOptions(o: FastOpts): Promise<FastPathRuntimeOptions> {
 				answerPrompt: FAST_ANSWER_PROMPT,
 				maxClauses: o.maxClauses ?? 12,
 				limits: {
-					maxCostUsd: 1,
+					runTimeoutMs: 60000,
 					...(o.runTimeoutMs !== undefined ? { runTimeoutMs: o.runTimeoutMs } : {}),
-					...(o.maxTotalTokens !== undefined ? { maxTotalTokens: o.maxTotalTokens } : {}),
+					...(o.maxTurns !== undefined ? { maxTurns: o.maxTurns } : {}),
 				},
 			},
 		},
@@ -588,12 +588,12 @@ describe("createFastPathRuntime", () => {
 	});
 
 	// 规格 §7:阶段 1 撞 limits 插件维护的阈值(不止挂钟超时)也要升级。测试用的 profile 计费
-	// 全 0,maxCostUsd 永远撞不上,用 maxTotalTokens 触发同一条 limitState.tripped 通路。
+	// 元数据不参与中止，用 maxTurns 触发 limitState.tripped 通路。
 	it("escalates when a limits-plugin threshold trips between the two prompts (regspec §7, not just wall-clock timeout)", async () => {
 		const calls: string[] = [];
 		const rt = await createFastPathRuntime(
 			await fastOptions({
-				maxTotalTokens: 1,
+				maxTurns: 1,
 				onToolCall: (name) => {
 					calls.push(name);
 				},
@@ -603,9 +603,9 @@ describe("createFastPathRuntime", () => {
 		cleanups.push(rt.dispose);
 		const got = await rt.runFast("原始问题");
 		expect(got.verdict.accept).toBe(false);
-		if (!got.verdict.accept) expect(got.verdict.reason).toContain("token 上限");
+		if (!got.verdict.accept) expect(got.verdict.reason).toContain("限额");
 		expect(got.result.status).toBe("limit_exceeded");
-		expect(got.result.limit).toBe("maxTotalTokens");
+		expect(got.result.limit).toBe("maxTurns");
 		expect(got.result.turns).toBe(1);
 		// limits 插件的 turn_end 钩子在 promptOnce(rewrite) 返回后立刻触发,checkPreempted()
 		// 的检查点 1 应该在那一刻就早退——不该再走到 get_clause_detail。

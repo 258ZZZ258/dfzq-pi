@@ -46,7 +46,12 @@
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
 		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
-		"prepare": "husky"
+		"prepare": "husky",
+		"audit-ai:check": "node scripts/audit-ai.mjs check",
+		"audit-ai:test": "node scripts/audit-ai.mjs test",
+		"audit-ai:mcp": "node scripts/audit-ai.mjs mcp",
+		"audit-ai:api": "node scripts/audit-ai.mjs api",
+		"audit-ai:migration-sql": "node scripts/audit-ai.mjs migration-sql"
 	},
 	"devDependencies": {
 		"@anthropic-ai/sandbox-runtime": "0.0.26",

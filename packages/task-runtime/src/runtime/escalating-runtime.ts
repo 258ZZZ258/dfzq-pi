@@ -51,8 +51,12 @@ function abortedResult(fastResult: RunResult): RunResult {
  */
 export function createEscalatingRuntime(options: {
 	fast: FastPathRuntime;
-	createFull: () => Promise<Runtime>;
+	/** Total completed-turn allowance for both stages. */
+	maxTurns: number;
+	createFull: (remainingTurns: number) => Promise<Runtime>;
 }): Runtime {
+	if (!Number.isInteger(options.maxTurns) || options.maxTurns < 1)
+		throw new Error("maxTurns must be a positive integer");
 	const listeners = new Set<(event: RuntimeEvent) => void>();
 	let full: Runtime | undefined;
 	let unsubscribeFull: (() => void) | undefined;
@@ -107,13 +111,23 @@ export function createEscalatingRuntime(options: {
 		// 都必须查)。有人已经调用过 abort(),这次 accept:false 不是"阶段 1 判负",是"阶段 1
 		// 被打断",不升级。
 		if (stopRequested) return abortedResult(fastResult);
+		const remainingTurns = options.maxTurns - fastResult.turns;
+		if (remainingTurns <= 0) {
+			return {
+				...fastResult,
+				status: "limit_exceeded",
+				limit: "maxTurns",
+				answer: undefined,
+				errorMessage: `Task reached maxTurns=${options.maxTurns}; full runtime was not started`,
+			};
+		}
 
 		// 升级。阶段 1 的输出到此为止:不进 output、不进 answer、不进阶段 2 的 context。
 		// `fast_path_escalated` 事件已由 FastPathRuntime 发过,payload 只带 `reason`。
 		// `reason` 有 5 个 emit 点(`grep -n 'emit("fast_path_escalated"' fast-path-
 		// runtime.ts`,逐一核对过),来源不止一种,泄漏面也不是同一个量级:
 		//   - 限额/超时(checkPreempted):`describeTripped()` 拼配置数值(runTimeoutMs /
-		//     maxCostUsd / maxTotalTokens),有界;
+		//     maxTurns),有界;
 		//   - 检索无命中 / 一条正文都没取到:固定串;
 		//   - 判负(judgeFastPathOutput 的 verdict.reason):可能内嵌阶段 1 输出里的
 		//     clause_id / finish_reason / confidence 取值(judgeFastPathOutput 读的是
@@ -135,7 +149,12 @@ export function createEscalatingRuntime(options: {
 		// 可以事后修正。没有为这条专门改 `fast_path_escalated` 的 5 个 emit 点(动它们会改变
 		// `trajectory.ts` 的落库语义,超出这次 C-1 的验收范围),这里只记录这条"事件名与实际
 		// 发生的事不完全对应"的事实,留给下一轮决定要不要收紧。
-		full = await options.createFull();
+		try {
+			full = await options.createFull(remainingTurns);
+		} catch (error) {
+			if (stopRequested) return abortedResult(fastResult);
+			throw error;
+		}
 		unsubscribeFull = full.subscribe(fanOut);
 		// C-1(两阶段交界处):`stopRequested` 可能是在 `createFull()` 还没 resolve 时才被置位
 		// 的——那次 `abort()` 调用当时转发给的是 `options.fast`(下面 `full` 那一刻还没赋值),

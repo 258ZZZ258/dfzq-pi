@@ -1,0 +1,39 @@
+# audit-query —— 制度查询智能体(功能1)。Chatbox 型 / 同步流式。
+# 依赖方向:query → pipeline → common(复用 pipeline 的混合检索/嵌入/Milvus I/O + common 契约)。
+# import 包名 = query(发行名 audit-query);成员 query/query/。
+# 本切片:R1 依据查询 + 覆盖感知拒答 + 八路路由/契约骨架(见 docs/query-agent-docs/SPEC.md)。
+# langgraph(编排)/ typer(CLI)等依赖随对应任务(T13/T14)再加,T1 仅建骨架。
+[build-system]
+requires = ["setuptools==80.10.2", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audit-query"
+version = "0.1.0"
+description = "audit-ai 制度查询智能体 MVP:R1 依据查询 + 覆盖感知拒答 + 八路路由/契约骨架"
+requires-python = ">=3.11"
+dependencies = [
+    "audit-pipeline==0.1.0",   # 依赖方向:query → pipeline → common
+    "langgraph==1.2.10",   # 运行时编排(§1.2 状态机);节点纯函数,可换底座(PLAN §2.5-1)
+    "typer==0.27.0",       # CLI(query ask / query route)
+    "fastapi==0.141.1",   # HTTP API(SPEC-API):原生 SSE/multipart/校验(query.api)
+    "uvicorn==0.52.0",    # ASGI 服务器(query-api 启动)
+    "python-multipart==0.0.32",  # FastAPI 文件上传(multipart/form-data;/uploads)
+    # policy-query-mcp(C1)的 stdio server。pin 大版本:2.0 的 server API 与 1.x 不同,
+    # 且协议版本集合是跨仓耦合点 —— 消费方 dfzq-pi 的 MCP client 硬编码 protocolVersion
+    # "2024-11-05"(packages/task-runtime/src/toolsets/mcp/client.ts:127),而它正是本 SDK
+    # HANDSHAKE_PROTOCOL_VERSIONS 里**最老**的一个(= OLDEST_SUPPORTED_VERSION)。
+    # 下一个大版本若把它移出握手集合,启动即失败 —— 靠真 spawn 的跨仓握手测试兜(规格 §6-3)。
+    "mcp==2.0.0",
+]
+
+# §9.3 Langfuse 观测(可选):默认 NoopTracer 零网络、不需 langfuse;observe 开 + creds 时按需装。
+[project.optional-dependencies]
+observe = ["langfuse==2.60.10"]   # LangfuseTracer 懒导入;trace/event/flush API(v2)
+
+[project.scripts]
+query = "query.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["query*"]

@@ -2,7 +2,8 @@
 
 ## DFZQ Task Runtime Scope
 
-- Put all subsequent DFZQ task-runtime feature development in `packages/task-runtime`.
+- Put DFZQ TypeScript task-runtime feature development in `packages/task-runtime`.
+- The user-approved Python service integration lives in `services/audit-ai`; keep its Python workspace independent of npm package workspaces. Run only the documented offline test allowlist unless real-service integration is explicitly authorized.
 - Do not modify Pi upstream packages (`packages/agent`, `packages/ai`, `packages/coding-agent`, or `packages/tui`) for this work unless the user explicitly requests it.
 - New task agents must use the repository runtime chain: `RuntimeSpec` → `ProviderProfile` → `ToolsetRegistry` → `SessionRuntime`. Do not create parallel session factories or hard-code providers/models.
 - Put task-owned prompts, output contracts, and skills under `packages/task-runtime/specs/<task>/`; keep `src/` for reusable runtime and tool code.

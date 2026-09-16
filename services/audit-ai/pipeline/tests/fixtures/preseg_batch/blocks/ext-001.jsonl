@@ -1,0 +1,6 @@
+{"block_seq": 0, "clause_label": "第一章", "text": "总则", "is_table": false, "is_catalog": true, "source_code": "LC-EXT001-CH1"}
+{"block_seq": 1, "clause_label": "第一条", "text": "为规范证券公司客户招揽行为,保护投资者合法权益,依据《证券法》制定本办法。", "source_code": "LC-EXT001-001"}
+{"block_seq": 2, "clause_label": "第二十一条", "text": "证券公司不得通过即时通讯工具二维码等方式向不特定对象招揽客户。", "source_code": "LC-EXT001-021"}
+{"block_seq": 3, "clause_label": "第二十一条之一", "text": "前条所称不特定对象,包括未建立委托关系的潜在投资者。", "source_code": "LC-EXT001-021-1"}
+{"block_seq": 4, "clause_label": "备注说明", "text": "本块条款标识无法推导,应落伪路径 preseg/4。"}
+{"block_seq": 5, "clause_label": null, "text": "附:相关罚则对照表。", "is_table": true}

@@ -1,0 +1,52 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+_objectstore/
+_web_uploads/
+.DS_Store
+# fixtures 可由 tools/build_fixtures.py 重建,不入库(二进制语料)
+/fixtures/
+
+# report JSON 快照(生成物,不入库;config 在 repo 根 → reports 落 repo 根)
+/reports/
+
+# codegraph 本地索引(各自本地建,不入库;配置 .mcp.json/.claude/settings.json 共享入库)
+.codegraph/
+# Claude Code 个人本地设置(不共享;团队共享配置走 .claude/settings.json)
+.claude/settings.local.json
+
+# 本地密钥 / 网关 env(OPENAI_API_KEY 等绝不入库;见 CLAUDE.md「key 走 env」)
+.env
+.env.local
+.env.*.local
+
+# 升格过渡期临时渲染/重存目录(工作树杂物,不入库)
+/rendered_fusion*/
+/lo_resave/
+/.understand-anything/
+
+# CLAUDE.md / AGENTS.md 改本地私有,不入库(2026-07-02 决策;原团队共享 → git rm --cached 停跟踪,保留本地副本)
+CLAUDE.md
+AGENTS.md
+# 用户意留未跟踪(不入库):cursor 本地设置 / Office 临时锁文件
+/.cursor/settings.json
+~$*
+
+# 第一期文档测试生成的报告(不入库)
+tools/doc_test/out/
+tools/doc_test/config.yaml
+
+# Codex 代码审查产物(.review/findings.json 随审查流程,不入库)
+.review/
+
+# 会话分析临时目录(误提交防复发)
+.tmp_transcript_analysis/
+
+# Monorepo test outputs
+*.xlsx
+*.docx
+*.pdf

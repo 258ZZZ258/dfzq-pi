@@ -1,12 +1,13 @@
 import postgres from "postgres";
 import type { LimitKind, RunResult } from "../runtime/contract.ts";
+import { sealFailure } from "../runtime/delivery.ts";
 import type { NewRun, RunRecord, RunStore, StoredRunStatus } from "./contract.ts";
 
 const RUN_COLUMNS = `
   run_id, client_request_id, request_id, spec_id, task_kind, session_id,
   filters_json, options_json, payload_json, status, input, output,
   error_message, stop_reason, limit_hit, usage_json, turns,
-  source_details_json, created_at, started_at, finished_at`;
+  source_details_json, created_at, started_at, finished_at, session_id_explicit, delivery_json, principal_json`;
 
 type Row = Record<string, unknown>;
 
@@ -28,12 +29,14 @@ function arrayJson(value: unknown): Array<Record<string, unknown>> | undefined {
 
 function toRecord(row: Row): RunRecord {
 	return {
+		principalJson: row.principal_json == null ? undefined : JSON.stringify(row.principal_json),
 		runId: String(row.run_id),
 		clientRequestId: String(row.client_request_id),
 		requestId: typeof row.request_id === "string" ? row.request_id : undefined,
 		specId: String(row.spec_id),
 		taskKind: String(row.task_kind),
 		sessionId: String(row.session_id),
+		sessionIdExplicit: typeof row.session_id_explicit === "boolean" ? row.session_id_explicit : undefined,
 		filtersJson: JSON.stringify(objectJson(row.filters_json) ?? {}),
 		optionsJson: row.options_json === null ? undefined : JSON.stringify(row.options_json),
 		payloadJson: row.payload_json === null ? undefined : JSON.stringify(row.payload_json),
@@ -44,6 +47,7 @@ function toRecord(row: Row): RunRecord {
 		stopReason: typeof row.stop_reason === "string" ? row.stop_reason : undefined,
 		limitHit: typeof row.limit_hit === "string" ? (row.limit_hit as LimitKind) : undefined,
 		usageJson: row.usage_json === null ? undefined : JSON.stringify(row.usage_json),
+		deliveryJson: row.delivery_json == null ? undefined : JSON.stringify(row.delivery_json),
 		turns: typeof row.turns === "number" ? row.turns : undefined,
 		sourceDetails: arrayJson(row.source_details_json) as RunRecord["sourceDetails"],
 		createdAt: dateMs(row.created_at) ?? 0,
@@ -63,7 +67,12 @@ function requireUpdated(rows: readonly Row[], runId: string): void {
 /** PostgreSQL 是生产唯一任务历史库；连接 DSN 使用 audit-ai 的 PIPELINE_DB_DSN。 */
 export async function createPostgresRunStore(dsn: string): Promise<RunStore<true>> {
 	if (!dsn) throw new Error("PIPELINE_DB_DSN is required for PostgreSQL task history");
-	const sql = postgres(dsn, { max: 10, idle_timeout: 20 });
+	const sql = postgres(dsn, {
+		max: 10,
+		idle_timeout: 20,
+		connect_timeout: 10,
+		connection: { statement_timeout: 15000 },
+	});
 	try {
 		await sql`SELECT 1`;
 	} catch (error) {
@@ -76,8 +85,8 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 			const inserted = await sql.unsafe(
 				`INSERT INTO task_runs (
           run_id, client_request_id, request_id, spec_id, task_kind, session_id,
-          filters_json, options_json, payload_json, status, input
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10)
+          filters_json, options_json, payload_json, status, input, session_id_explicit, principal_json
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, $11, $12)
         ON CONFLICT (client_request_id) DO NOTHING
         RETURNING ${RUN_COLUMNS}`,
 				[
@@ -91,6 +100,8 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 					jsonValue(rec.optionsJson),
 					jsonValue(rec.payloadJson),
 					rec.input,
+					rec.sessionIdExplicit ?? null,
+					jsonValue(rec.principalJson),
 				],
 			);
 			if (inserted.length > 0) return { inserted: true, run: toRecord(inserted[0] as Row) };
@@ -116,7 +127,7 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 				`UPDATE task_runs SET
           status = $1, output = $2, error_message = $3, stop_reason = $4, limit_hit = $5,
           usage_json = $6, turns = $7, source_details_json = $8,
-          finished_at = to_timestamp($9 / 1000.0), updated_at = now()
+          finished_at = to_timestamp($9 / 1000.0), updated_at = now(), delivery_json = $11
         WHERE run_id = $10 RETURNING run_id`,
 				[
 					result.status,
@@ -129,26 +140,70 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 					result.sourceDetails ? JSON.stringify(result.sourceDetails) : null,
 					finishedAt,
 					runId,
+					result.delivery ? JSON.stringify(result.delivery) : null,
 				],
 			);
 			requireUpdated(rows as Row[], runId);
 		},
 		async markError(runId, message, finishedAt) {
-			const rows = await sql.unsafe(
-				"UPDATE task_runs SET status = 'error', error_message = $1, finished_at = to_timestamp($2 / 1000.0), updated_at = now() WHERE run_id = $3 RETURNING run_id",
-				[message, finishedAt, runId],
-			);
-			requireUpdated(rows as Row[], runId);
+			await sql.begin(async (transaction) => {
+				const existing = await transaction.unsafe(
+					`SELECT ${RUN_COLUMNS} FROM task_runs WHERE run_id = $1 FOR UPDATE`,
+					[runId],
+				);
+				requireUpdated(existing as Row[], runId);
+				const row = toRecord(existing[0] as Row);
+				const delivery = sealFailure(
+					{ runId, specId: row.specId, output: row.output, limit: row.limitHit },
+					message,
+				);
+				const rows = await transaction.unsafe(
+					"UPDATE task_runs SET status = 'error', error_message = $1, finished_at = to_timestamp($2 / 1000.0), updated_at = now(), delivery_json = $4 WHERE run_id = $3 RETURNING run_id",
+					[message, finishedAt, runId, JSON.stringify(delivery)],
+				);
+				requireUpdated(rows as Row[], runId);
+			});
+		},
+		async markStale(runId, message, finishedAt) {
+			return await sql.begin(async (transaction) => {
+				const rows = await transaction.unsafe(
+					`SELECT ${RUN_COLUMNS} FROM task_runs WHERE run_id=$1 AND status IN ('queued','running') FOR UPDATE`,
+					[runId],
+				);
+				if (!rows.length) return false;
+				const row = toRecord(rows[0] as Row);
+				const delivery = sealFailure(
+					{ runId, specId: row.specId, output: row.output, limit: row.limitHit },
+					message,
+				);
+				await transaction.unsafe(
+					"UPDATE task_runs SET status='error',error_message=$1,finished_at=to_timestamp($2 / 1000.0),delivery_json=$3,updated_at=now() WHERE run_id=$4",
+					[message, finishedAt, JSON.stringify(delivery), runId],
+				);
+				return true;
+			});
 		},
 		async deleteRun(runId) {
 			await sql.unsafe("DELETE FROM task_runs WHERE run_id = $1", [runId]);
 		},
 		async recoverStaleRuns(now) {
-			const rows = await sql.unsafe(
-				"UPDATE task_runs SET status = 'error', error_message = 'process restarted', finished_at = to_timestamp($1 / 1000.0), updated_at = now() WHERE status IN ('queued', 'running') RETURNING run_id",
-				[now],
-			);
-			return rows.length;
+			return await sql.begin(async (transaction) => {
+				const rows = await transaction.unsafe(
+					`SELECT ${RUN_COLUMNS} FROM task_runs WHERE status IN ('queued','running') FOR UPDATE`,
+				);
+				for (const raw of rows) {
+					const row = toRecord(raw as Row);
+					const delivery = sealFailure(
+						{ runId: row.runId, specId: row.specId, output: row.output, limit: row.limitHit },
+						"process restarted",
+					);
+					await transaction.unsafe(
+						"UPDATE task_runs SET status='error',error_message='process restarted',finished_at=to_timestamp($1 / 1000.0),updated_at=now(),delivery_json=$2 WHERE run_id=$3",
+						[now, JSON.stringify(delivery), row.runId],
+					);
+				}
+				return rows.length;
+			});
 		},
 		async appendEvents(runId, events) {
 			if (events.length === 0) return;

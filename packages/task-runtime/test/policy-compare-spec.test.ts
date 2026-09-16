@@ -38,7 +38,6 @@ describe("policy-compare-coverage.json", () => {
 
 	it("护栏定值与规格 §3.5 一致", () => {
 		expect(spec.limits.runTimeoutMs).toBe(1_800_000);
-		expect(spec.limits.maxCostUsd).toBe(2.0);
 	});
 
 	// maxTurns 必须严格大于 ceil(pairs.length / 最小 batchSize)。

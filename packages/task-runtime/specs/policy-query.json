@@ -20,7 +20,9 @@
     "policy-query/skills/evidence-standard.md",
     "policy-query/skills/policy-validity.md"
   ],
-  "appendSystemPrompt": ["policy-query/output-format.md"],
+  "appendSystemPrompt": [
+    "policy-query/output-format.md"
+  ],
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
@@ -28,9 +30,7 @@
   },
   "limits": {
     "maxTurns": 30,
-    "runTimeoutMs": 900000,
-    "maxTotalTokens": 3000000,
-    "maxCostUsd": 0.5
+    "runTimeoutMs": 900000
   },
   "stopPolicy": {
     "name": "sufficiency-gate",
@@ -65,7 +65,9 @@
     "rewritePrompt": "policy-query/fast-rewrite.md",
     "answerPrompt": "policy-query/fast-answer.md",
     "maxClauses": 12,
-    "limits": { "runTimeoutMs": 45000, "maxCostUsd": 0.1 },
+    "limits": {
+      "runTimeoutMs": 45000
+    },
     "thinkingLevel": "off"
   },
   "observability": {
@@ -86,6 +88,13 @@
         "PIPELINE_SPARSE_BACKEND": "${PIPELINE_SPARSE_BACKEND}",
         "HF_HUB_OFFLINE": "1",
         "PATH": "${PATH}"
+      },
+      "toolEffects": {
+        "search_policy": "read",
+        "search_cases": "read",
+        "enumerate_clauses": "read",
+        "get_clause_detail": "read",
+        "assess_sufficiency": "read"
       }
     }
   ]

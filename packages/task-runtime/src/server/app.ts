@@ -1,5 +1,19 @@
 import { randomUUID } from "node:crypto";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import {
+	type Action,
+	AuthorizationError,
+	authorize,
+	constrainFilters,
+	type Grant,
+	type GrantVerifier,
+	grantScopeHash,
+	type Principal,
+} from "../auth/grant.ts";
+import type { InboxMessage, MessageInput } from "../interaction/inbox.ts";
+import { actorScope, createMemoryRoutes } from "../memory/http.ts";
+import type { MemoryScope, MemoryService } from "../memory/service.ts";
 import type { SpecRouter } from "../router/router.ts";
 import type { RunResult } from "../runtime/contract.ts";
 import type { DocumentsClient } from "../runtime/policy-compare/documents-client.ts";
@@ -10,6 +24,8 @@ import { isTerminal, recordToRunResult, toWireResult } from "./routes.ts";
 import type { RunManager, RunOptions } from "./run-manager.ts";
 
 export interface AppOptions {
+	grants?: GrantVerifier;
+	memory?: MemoryService;
 	manager: RunManager;
 	router: SpecRouter;
 	store: RunStore<boolean>;
@@ -24,7 +40,7 @@ function errorBody(code: string, message: string) {
 }
 
 /** c.set/c.get 需要 Variables 泛型声明,否则 requestId 这一项过不了类型检查。 */
-type AppEnv = { Variables: { requestId: string } };
+type AppEnv = { Variables: { requestId: string; grant: Grant | undefined } };
 
 export function createApp(options: AppOptions): Hono<AppEnv> {
 	const { manager, router, store, internalToken } = options;
@@ -33,6 +49,9 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 
 	// 错误归一化:统一响应形状,绝不泄漏栈与内部文件路径(设计文档 §5.2-8)。
 	app.onError((error, c) => {
+		if (/^authorization_[a-z_]+$/.test(error.message)) return c.json(errorBody(error.message, error.message), 409);
+		if (error.message === "run_not_found") return c.json(errorBody("not_found", "run not found"), 404);
+		if (error instanceof AuthorizationError) return c.json(errorBody(error.message, error.message), error.status);
 		// 客户端 body 是刻意不透明的(不泄漏栈/内部路径)—— 这行 console.error 是 500 的
 		// 唯一诊断信息。传整个 error 对象(而不是只拼 message)才能保住堆栈,与仓库既有
 		// 风格一致(见 run-manager.ts 里同样传整个 error/markErrorFailure 对象的 console.error)。
@@ -60,25 +79,99 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 		if (outcome === "unauthorized") {
 			return c.json(errorBody("unauthorized", "invalid internal token"), 401);
 		}
+		if (options.grants) {
+			const authorization = c.req.header("authorization");
+			if (!authorization?.startsWith("Bearer ")) throw new AuthorizationError("unauthorized");
+			const grant = options.grants.verify(authorization.slice(7));
+			c.set("grant", grant);
+			// Existing memory adapter consumes these headers only after verification.
+			c.req.raw.headers.set("x-tenant-id", grant.tenantId);
+			c.req.raw.headers.set("x-user-id", grant.sub);
+		}
 		await next();
 	});
 
+	app.use(
+		"*",
+		bodyLimit({
+			maxSize: 8 * 1024 * 1024,
+			onError: (c) => c.json(errorBody("body_too_large", "request exceeds 8MiB"), 413),
+		}),
+	);
+	for (const path of ["/runs/:runId", "/runs/:runId/*"])
+		app.use(path, async (c, next) => {
+			const runId = c.req.param("runId");
+			if (!runId) return c.json(errorBody("not_found", "run not found"), 404);
+			const row = await store.findByRunId(runId);
+			const grant = c.get("grant");
+			if (grant && row) {
+				if (!row.principalJson) throw new AuthorizationError("forbidden");
+				const suffix = c.req.path.split("/").at(-1);
+				const action: Action =
+					suffix === "authorization"
+						? c.req.method === "DELETE"
+							? "run:cancel"
+							: "run:renew"
+						: suffix === "cancel"
+							? "run:cancel"
+							: suffix === "resume"
+								? "run:resume"
+								: "run:read";
+				authorize(grant, action, {
+					sessionId: row.sessionId,
+					taskKind: row.taskKind,
+					principal: JSON.parse(row.principalJson) as Principal,
+				});
+				const original = row.optionsJson ? (JSON.parse(row.optionsJson) as RunOptions).authorization : undefined;
+				if (action !== "run:cancel" && (!original || grantScopeHash(original) !== grantScopeHash(grant)))
+					throw new AuthorizationError("forbidden");
+			}
+			const saved = row?.optionsJson ? (JSON.parse(row.optionsJson) as RunOptions).memoryScope : undefined;
+			if (saved) {
+				let actor: MemoryScope | undefined;
+				try {
+					actor = actorScope(c.req.header("x-tenant-id"), c.req.header("x-user-id"));
+				} catch {
+					return c.json(errorBody("forbidden", "actor mismatch"), 403);
+				}
+				if (!actor || actor.tenantId !== saved.tenantId || actor.userId !== saved.userId)
+					return c.json(errorBody("forbidden", "actor mismatch"), 403);
+			}
+			await next();
+		});
+	if (options.memory)
+		app.route(
+			"/memories",
+			createMemoryRoutes(options.memory, (context) => context.get("grant") as Grant | undefined),
+		);
 	app.get("/library/external-documents", async (c) => {
+		const grant = c.get("grant");
+		if (grant) authorize(grant, "library:read", {});
+		if (grant && !grant.dataScope.corpusTypes.includes("external")) throw new AuthorizationError("forbidden");
 		if (!options.documents?.listExternalDocuments)
 			return c.json(errorBody("not_configured", "document library is not configured"), 503);
 		const items = await options.documents.listExternalDocuments(
-			c.req.queries("permTag") ?? [],
-			c.req.query("includeHistory") === "true",
+			grant
+				? (constrainFilters(grant, { corpusTypes: grant.dataScope.corpusTypes, permTags: c.req.queries("permTag") })
+						.permTags ?? [])
+				: (c.req.queries("permTag") ?? []),
+			c.req.query("includeHistory") === "true" && (!grant || grant.dataScope.includeSuperseded === true),
 		);
 		return c.json(items);
 	});
 
 	app.get("/library/internal-documents", async (c) => {
+		const grant = c.get("grant");
+		if (grant) authorize(grant, "library:read", {});
+		if (grant && !grant.dataScope.corpusTypes.includes("internal")) throw new AuthorizationError("forbidden");
 		if (!options.documents?.listInternalDocuments)
 			return c.json(errorBody("not_configured", "document library is not configured"), 503);
 		const items = await options.documents.listInternalDocuments(
-			c.req.queries("permTag") ?? [],
-			c.req.query("includeHistory") === "true",
+			grant
+				? (constrainFilters(grant, { corpusTypes: grant.dataScope.corpusTypes, permTags: c.req.queries("permTag") })
+						.permTags ?? [])
+				: (c.req.queries("permTag") ?? []),
+			c.req.query("includeHistory") === "true" && (!grant || grant.dataScope.includeSuperseded === true),
 		);
 		return c.json(items);
 	});
@@ -99,32 +192,74 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			return c.json(errorBody(validated.error.code, validated.error.message), 422);
 		}
 		const body = validated.body;
+		if (
+			body.options &&
+			[
+				"resumeFrom",
+				"memoryScope",
+				"authorization",
+				"conversation",
+				"messageId",
+				"interaction",
+				"durableSession",
+			].some((key) => key in body.options!)
+		)
+			return c.json(errorBody("reserved_option", "resumeFrom and memoryScope are host controlled"), 422);
+		let actor: MemoryScope | undefined;
+		try {
+			actor = actorScope(c.req.header("x-tenant-id"), c.req.header("x-user-id"));
+		} catch {
+			return c.json(errorBody("actor_context_invalid", "both actor headers are required"), 422);
+		}
 
 		const spec = router.resolve(body.taskKind);
 		if (!spec) {
 			return c.json(errorBody("unknown_task_kind", `unknown taskKind "${body.taskKind}"`), 422);
 		}
+		const grant = c.get("grant");
+		const sessionId = body.sessionId ?? grant?.sessionId ?? newSessionId();
+		if (grant) authorize(grant, "run:create", { sessionId, taskKind: body.taskKind });
+		const runOptions = {
+			durableSession: spec.durableSession !== false && !spec.workflow,
+			interaction: Boolean(grant && manager.supportsMessages && !spec.workflow && spec.durableSession !== false),
+			...body.options,
+			...(grant
+				? {
+						authorization: grant,
+						includeSuperseded:
+							body.options?.includeSuperseded === true && grant.dataScope.includeSuperseded === true,
+					}
+				: {}),
+		};
 
 		const outcome = await manager.submit({
+			principal: grant ? { tenantId: grant.tenantId, userId: grant.sub } : undefined,
 			taskKind: body.taskKind,
 			specId: spec.id,
 			input: body.input,
 			clientRequestId: body.clientRequestId,
 			requestId: body.requestId,
-			sessionId: body.sessionId ?? newSessionId(),
+			sessionId,
+			sessionIdExplicit: body.sessionId !== undefined,
 			// 结构化下传,**原样**:序列化归 RunManager(它同时要落库和透给工厂,两处只能有一份
 			// 口径)。这里不补任何默认值 —— filters_json 是事后审计「这个 run 当时被授权了什么」
 			// 的唯一凭证,补默认值会让存档与 Java 发来的请求体对不上。形状已由 validateSubmitBody 校验。
-			filters: body.filters,
+			filters: grant ? constrainFilters(grant, body.filters) : body.filters,
 			// SubmitBodySchema 把 options 声明成 Record<string, unknown>,比 RunOptions 宽。
 			// 不为此收窄 schema —— options 是给下游 audit-ai 的透传位,收窄会让将来加一个
 			// 查询层字段变成一次 HTTP 层改动。
-			options: body.options as RunOptions | undefined,
+			options: actor ? ({ ...runOptions, memoryScope: actor } as RunOptions) : (runOptions as RunOptions),
 			// 与 filters 同款:**原样**下传,不补默认值 —— payload_json 是事后审计
 			// 「这个 run 当时拿到的任务输入是什么」的唯一凭证。
 			payload: body.payload,
 		});
 
+		if (outcome.kind === "idempotency_conflict") {
+			return c.json(
+				errorBody("idempotency_conflict", "clientRequestId was already used with different request content"),
+				409,
+			);
+		}
 		if (outcome.kind === "rejected") {
 			if (outcome.rejection.kind === "session_busy") {
 				return c.json(errorBody("session_busy", "this session already has a run in flight"), 409);
@@ -133,7 +268,7 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			return c.json(errorBody("queue_full", "server is at capacity"), 503);
 		}
 		if (outcome.kind === "idempotent") {
-			const row = await store.findByRunId(outcome.runId);
+			const row = await manager.findRun(outcome.runId);
 			if (row && isTerminal(row.status)) return c.json(toWireResult(recordToRunResult(row)), 200);
 			// row?.status 而不是 outcome.status(创建时的快照):markError/markRunning 等落库
 			// 写入若失败,drive() 的 finally 仍会无条件 live.delete,行却可能停在非终态 ——
@@ -161,7 +296,7 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			// timeout 信号,而此时行已落库为 error(终态)。以 store 当前状态为准 ——
 			// 终态直接回 200 结果(含 error),非终态回 202 并如实报 queued/running
 			// (排队中的 run 不许谎称 running,RunManager 的 queued 语义就是为此服务的)。
-			const row = await store.findByRunId(outcome.runId);
+			const row = await manager.findRun(outcome.runId);
 			if (row && isTerminal(row.status)) return c.json(toWireResult(recordToRunResult(row)), 200);
 			return c.json({ runId: outcome.runId, status: row?.status ?? "running" }, 202);
 		}
@@ -169,7 +304,7 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 	});
 
 	app.get("/runs/:runId", async (c) => {
-		const row = await store.findByRunId(c.req.param("runId"));
+		const row = await manager.findRun(c.req.param("runId"));
 		if (!row) return c.json(errorBody("not_found", "run not found"), 404);
 		// isTerminal 判定必须先于 progress —— 一个已经落库为终态的行不该再挂 progress 字段
 		// (规格 §7.2:progress 只描述「正在跑」这件事;终态的真相是下面的 RunResult)。
@@ -185,6 +320,118 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 		return c.json(toWireResult(recordToRunResult(row)), 200);
 	});
 
+	app.post("/runs/:runId/resume", async (c) => {
+		let raw: unknown;
+		try {
+			raw = await c.req.json();
+		} catch {
+			return c.json(errorBody("malformed_json", "request body is not valid JSON"), 400);
+		}
+		const key = raw && typeof raw === "object" ? (raw as { clientRequestId?: unknown }).clientRequestId : undefined;
+		if (
+			typeof key !== "string" ||
+			key.length === 0 ||
+			key.length > 256 ||
+			Object.keys(raw as object).some((name) => name !== "clientRequestId")
+		)
+			return c.json(errorBody("invalid_body", "only clientRequestId is accepted"), 422);
+		const outcome = await manager.resume(c.req.param("runId"), key, c.get("grant"));
+		if (outcome.kind === "not_found") return c.json(errorBody("not_found", "run not found"), 404);
+		if (outcome.kind === "not_resumable")
+			return c.json(errorBody("not_resumable", "durable resume is not configured or run is completed"), 409);
+		if (outcome.kind === "idempotency_conflict")
+			return c.json(errorBody("idempotency_conflict", "resume request key was reused"), 409);
+		if (outcome.kind === "rejected") {
+			if (outcome.rejection.kind === "session_busy")
+				return c.json(errorBody("session_busy", "session is busy"), 409);
+			c.header("Retry-After", String(outcome.rejection.retryAfterSeconds));
+			return c.json(errorBody("queue_full", "resume admission rejected"), 503);
+		}
+		if (outcome.kind === "accepted") void outcome.completion.catch(() => {});
+		const row = await manager.findRun(outcome.runId);
+		if (row && isTerminal(row.status))
+			return c.json({ ...toWireResult(recordToRunResult(row)), resumedFrom: c.req.param("runId") }, 200);
+		return c.json({ runId: outcome.runId, resumedFrom: c.req.param("runId"), status: row?.status ?? "queued" }, 202);
+	});
+
+	app.post("/runs/:runId/authorization", async (c) => {
+		const grant = c.get("grant");
+		if (!grant) throw new AuthorizationError("unauthorized");
+		await manager.updateAuthorization(c.req.param("runId"), grant);
+		return c.json({ renewed: true, expiresAt: grant.exp * 1000 });
+	});
+	app.delete("/runs/:runId/authorization", async (c) => {
+		const grant = c.get("grant");
+		if (!grant) throw new AuthorizationError("unauthorized");
+		await manager.updateAuthorization(c.req.param("runId"), grant, true);
+		return c.json({ revoked: true }, 202);
+	});
+	const messageView = (message: InboxMessage) => ({
+		messageId: message.messageId,
+		clientMessageId: message.clientMessageId,
+		kind: message.kind,
+		sequence: message.sequence,
+		status: message.status,
+		text: message.text,
+		targetRunId: message.targetRunId,
+		afterRunId: message.afterRunId,
+		runId: message.runId,
+		consumedCheckpointSeq: message.consumedCheckpointSeq,
+		error: message.error,
+	});
+	app.post("/sessions/:sessionId/messages", async (c) => {
+		const grant = c.get("grant");
+		if (!grant) throw new AuthorizationError("unauthorized");
+		if (!manager.supportsMessages)
+			return c.json(errorBody("messages_not_configured", "persistent inbox required"), 503);
+		let raw: unknown;
+		try {
+			raw = await c.req.json();
+		} catch {
+			return c.json(errorBody("malformed_json", "invalid JSON"), 400);
+		}
+		if (
+			!raw ||
+			typeof raw !== "object" ||
+			Array.isArray(raw) ||
+			Object.keys(raw).some((key) => !["clientMessageId", "kind", "targetRunId", "afterRunId", "text"].includes(key))
+		)
+			return c.json(errorBody("message_invalid", "invalid message"), 422);
+		const input = raw as MessageInput;
+		if (
+			!["steer", "follow_up"].includes(input.kind) ||
+			typeof input.clientMessageId !== "string" ||
+			typeof input.text !== "string" ||
+			(input.targetRunId !== undefined && typeof input.targetRunId !== "string") ||
+			(input.afterRunId !== undefined && typeof input.afterRunId !== "string")
+		)
+			return c.json(errorBody("message_invalid", "invalid message"), 422);
+		authorize(grant, input.kind === "steer" ? "run:steer" : "run:follow_up", { sessionId: c.req.param("sessionId") });
+		try {
+			return c.json(messageView(await manager.enqueueMessage(grant, input)), 202);
+		} catch (error) {
+			if (error instanceof AuthorizationError) throw error;
+			const code = error instanceof Error ? error.message : "message_failed";
+			return c.json(
+				errorBody(code, code),
+				code === "message_queue_full" ? 429 : code === "message_invalid" ? 422 : 409,
+			);
+		}
+	});
+	app.get("/sessions/:sessionId/messages", async (c) => {
+		if (!manager.supportsMessages)
+			return c.json(errorBody("messages_not_configured", "persistent inbox required"), 503);
+		const grant = c.get("grant");
+		if (!grant) throw new AuthorizationError("unauthorized");
+		authorize(grant, "run:read", { sessionId: c.req.param("sessionId") });
+		const after = Number(c.req.query("afterSequence") ?? 0);
+		if (!Number.isSafeInteger(after) || after < 0) return c.json(errorBody("invalid_cursor", "invalid cursor"), 422);
+		const items = (await manager.listMessages(grant))
+			.filter((m) => m.sequence > after && grantScopeHash(m.grant) === grantScopeHash(grant))
+			.slice(0, 50)
+			.map(messageView);
+		return c.json({ items, nextSequence: items.at(-1)?.sequence ?? after });
+	});
 	app.post("/runs/:runId/cancel", async (c) => {
 		const outcome = await manager.cancel(c.req.param("runId"));
 		if (outcome === "accepted") return c.body(null, 202);

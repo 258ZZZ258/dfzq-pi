@@ -16,6 +16,8 @@ export interface FinalJudge {
 }
 
 export interface RejudgeDeps {
+	initialAttempts?: Record<string, number>;
+	beforeReprompt?: (text: string, attempts: Record<string, number>) => Promise<void>;
 	judges: readonly FinalJudge[];
 	getLastAssistantText: () => string;
 	getClauseIds: () => readonly string[];
@@ -42,7 +44,12 @@ export interface RejudgeOutcome {
  */
 export async function runFinalJudges(deps: RejudgeDeps): Promise<RejudgeOutcome> {
 	const attempts: Record<string, number> = {};
-	for (const judge of deps.judges) attempts[judge.name] = 0;
+	for (const judge of deps.judges) {
+		const initial = deps.initialAttempts?.[judge.name] ?? 0;
+		if (!Number.isInteger(initial) || initial < 0 || initial > judge.maxAttempts)
+			throw new Error("checkpoint_judge_attempts_invalid");
+		attempts[judge.name] = initial;
+	}
 
 	for (;;) {
 		// 限额已触发就必须立刻收手。危害远不止"多跑一轮"—— 那次多发的 prompt 是**完全无界**的:
@@ -91,8 +98,11 @@ export async function runFinalJudges(deps: RejudgeDeps): Promise<RejudgeOutcome>
 			// 复查放在 attempts 自增**之前**:这一轮并没有真的花掉一次尝试,不该记账。
 			if (deps.shouldStop()) return { attempts };
 
-			attempts[judge.name] = (attempts[judge.name] ?? 0) + 1;
 			try {
+				const nextAttempts = { ...attempts, [judge.name]: (attempts[judge.name] ?? 0) + 1 };
+				await deps.beforeReprompt?.(verdict.followUp, nextAttempts);
+				if (deps.shouldStop()) return { attempts };
+				attempts[judge.name] = nextAttempts[judge.name];
 				await deps.reprompt(verdict.followUp);
 			} catch (error) {
 				// 同上:续跑失败也要保住已经花掉的 attempts。

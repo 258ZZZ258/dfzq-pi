@@ -1,15 +1,18 @@
 import { DatabaseSync } from "node:sqlite";
 import type { LimitKind, RunResult } from "../runtime/contract.ts";
+import { sealFailure } from "../runtime/delivery.ts";
 import type { NewRun, RunRecord, RunStore, StoredEvent, StoredRunStatus } from "./contract.ts";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS runs (
   run_id            TEXT PRIMARY KEY,
   client_request_id TEXT NOT NULL,
+  principal_json TEXT,
   request_id        TEXT,
   spec_id           TEXT NOT NULL,
   task_kind         TEXT NOT NULL,
   session_id        TEXT NOT NULL,
+  session_id_explicit INTEGER,
   filters_json      TEXT NOT NULL,
   options_json      TEXT,
   payload_json      TEXT,
@@ -22,6 +25,7 @@ CREATE TABLE IF NOT EXISTS runs (
   usage_json        TEXT,
   turns             INTEGER,
   source_details_json TEXT,
+  delivery_json     TEXT,
   created_at        INTEGER NOT NULL,
   started_at        INTEGER,
   finished_at       INTEGER
@@ -40,12 +44,14 @@ CREATE TABLE IF NOT EXISTS run_events (
 `;
 
 interface RunRow {
+	principal_json: string | null;
 	run_id: string;
 	client_request_id: string;
 	request_id: string | null;
 	spec_id: string;
 	task_kind: string;
 	session_id: string;
+	session_id_explicit: number | null;
 	filters_json: string;
 	options_json: string | null;
 	payload_json: string | null;
@@ -58,6 +64,7 @@ interface RunRow {
 	usage_json: string | null;
 	turns: number | null;
 	source_details_json: string | null;
+	delivery_json: string | null;
 	created_at: number;
 	started_at: number | null;
 	finished_at: number | null;
@@ -66,12 +73,14 @@ interface RunRow {
 /** SQL NULL 与 TS optional 的边界只在这一处翻译,别处不再判 null。 */
 function toRecord(row: RunRow): RunRecord {
 	return {
+		principalJson: row.principal_json ?? undefined,
 		runId: row.run_id,
 		clientRequestId: row.client_request_id,
 		requestId: row.request_id ?? undefined,
 		specId: row.spec_id,
 		taskKind: row.task_kind,
 		sessionId: row.session_id,
+		sessionIdExplicit: row.session_id_explicit === null ? undefined : row.session_id_explicit === 1,
 		filtersJson: row.filters_json,
 		optionsJson: row.options_json ?? undefined,
 		payloadJson: row.payload_json ?? undefined,
@@ -82,6 +91,7 @@ function toRecord(row: RunRow): RunRecord {
 		stopReason: row.stop_reason ?? undefined,
 		limitHit: (row.limit_hit as LimitKind | null) ?? undefined,
 		usageJson: row.usage_json ?? undefined,
+		deliveryJson: row.delivery_json ?? undefined,
 		turns: row.turns ?? undefined,
 		sourceDetails: row.source_details_json
 			? (JSON.parse(row.source_details_json) as RunRecord["sourceDetails"])
@@ -94,6 +104,7 @@ function toRecord(row: RunRow): RunRecord {
 
 export function createSqliteRunStore(path: string): RunStore {
 	const db = new DatabaseSync(path);
+	db.exec("PRAGMA busy_timeout=5000");
 	// close() 必须能安全重入:调用方(以及测试的 afterEach)可能在已手动 close 后再 close 一次,
 	// 而 node:sqlite 的 DatabaseSync.close() 对已关闭的连接会抛 "database is not open"。
 	let closed = false;
@@ -105,6 +116,11 @@ export function createSqliteRunStore(path: string): RunStore {
 	// 用 PRAGMA 查一次再补,幂等且对空库无副作用(空库刚被上面的 DDL 创建时就已带这一列,
 	// table_info 会查到它,不会重复 ALTER)。SQLite 的 ADD COLUMN 是 O(1) 元数据操作。
 	const columns = db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
+	if (!columns.some((c) => c.name === "principal_json")) db.exec("ALTER TABLE runs ADD COLUMN principal_json TEXT");
+	if (!columns.some((c) => c.name === "delivery_json")) db.exec("ALTER TABLE runs ADD COLUMN delivery_json TEXT");
+	if (!columns.some((c) => c.name === "session_id_explicit")) {
+		db.exec("ALTER TABLE runs ADD COLUMN session_id_explicit INTEGER");
+	}
 	if (!columns.some((c) => c.name === "payload_json")) {
 		db.exec("ALTER TABLE runs ADD COLUMN payload_json TEXT");
 	}
@@ -114,8 +130,8 @@ export function createSqliteRunStore(path: string): RunStore {
 
 	const insert = db.prepare(`
 		INSERT INTO runs (run_id, client_request_id, request_id, spec_id, task_kind, session_id,
-		                  filters_json, options_json, payload_json, status, input, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
+		                  filters_json, options_json, payload_json, status, input, created_at, session_id_explicit, principal_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
 		ON CONFLICT(client_request_id) DO NOTHING
 	`);
 	const byRunId = db.prepare("SELECT * FROM runs WHERE run_id = ?");
@@ -123,14 +139,15 @@ export function createSqliteRunStore(path: string): RunStore {
 	const setRunning = db.prepare("UPDATE runs SET status = 'running', started_at = ? WHERE run_id = ?");
 	const setFinished = db.prepare(`
 		UPDATE runs SET status = ?, output = ?, error_message = ?, stop_reason = ?, limit_hit = ?,
-		                usage_json = ?, turns = ?, source_details_json = ?, finished_at = ?
+		                usage_json = ?, turns = ?, source_details_json = ?, finished_at = ?, delivery_json = ?
 		WHERE run_id = ?
 	`);
-	const setError = db.prepare("UPDATE runs SET status = 'error', error_message = ?, finished_at = ? WHERE run_id = ?");
+	const setError = db.prepare(
+		"UPDATE runs SET status = 'error', error_message = ?, finished_at = ?, delivery_json = ? WHERE run_id = ?",
+	);
 	const del = db.prepare("DELETE FROM runs WHERE run_id = ?");
 	const recover = db.prepare(`
-		UPDATE runs SET status = 'error', error_message = 'process restarted', finished_at = ?
-		WHERE status IN ('queued', 'running')
+		SELECT * FROM runs WHERE status IN ('queued', 'running')
 	`);
 	const insertEvent = db.prepare("INSERT INTO run_events (run_id, seq, ts, type, payload) VALUES (?, ?, ?, ?, ?)");
 	const selectEvents = db.prepare("SELECT seq, ts, type, payload FROM run_events WHERE run_id = ? ORDER BY seq");
@@ -158,6 +175,8 @@ export function createSqliteRunStore(path: string): RunStore {
 					rec.payloadJson ?? null,
 					rec.input,
 					rec.createdAt,
+					rec.sessionIdExplicit === undefined ? null : Number(rec.sessionIdExplicit),
+					rec.principalJson ?? null,
 				).changes,
 			);
 			if (changes === 1) return { inserted: true, run: requireByRunId(rec.runId) };
@@ -188,14 +207,40 @@ export function createSqliteRunStore(path: string): RunStore {
 					result.turns,
 					result.sourceDetails ? JSON.stringify(result.sourceDetails) : null,
 					finishedAt,
+					result.delivery ? JSON.stringify(result.delivery) : null,
 					runId,
 				).changes,
 			);
 			if (changes === 0) throw new Error(`finish: run "${runId}" not found`);
 		},
 		markError(runId: string, message: string, finishedAt: number) {
-			const changes = Number(setError.run(message, finishedAt, runId).changes);
+			const row = requireByRunId(runId);
+			const delivery = sealFailure({ runId, specId: row.specId, output: row.output, limit: row.limitHit }, message);
+			const changes = Number(setError.run(message, finishedAt, JSON.stringify(delivery), runId).changes);
 			if (changes === 0) throw new Error(`markError: run "${runId}" not found`);
+		},
+		markStale(runId: string, message: string, finishedAt: number) {
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				const raw = byRunId.get(runId) as RunRow | undefined;
+				if (!raw || !["queued", "running"].includes(raw.status)) {
+					db.exec("COMMIT");
+					return false;
+				}
+				const row = toRecord(raw);
+				const delivery = sealFailure(
+					{ runId, specId: row.specId, output: row.output, limit: row.limitHit },
+					message,
+				);
+				setError.run(message, finishedAt, JSON.stringify(delivery), runId);
+				db.exec("COMMIT");
+				return true;
+			} catch (error) {
+				try {
+					db.exec("ROLLBACK");
+				} catch {}
+				throw error;
+			}
 		},
 		deleteRun(runId: string) {
 			// 与其余写入方法不同,这里删不到行不抛:契约里已写明「拒绝路径是唯一调用方,
@@ -203,7 +248,23 @@ export function createSqliteRunStore(path: string): RunStore {
 			del.run(runId);
 		},
 		recoverStaleRuns(now: number) {
-			return Number(recover.run(now).changes);
+			db.exec("BEGIN IMMEDIATE");
+			try {
+				const rows = recover.all() as unknown as RunRow[];
+				for (const raw of rows) {
+					const row = toRecord(raw);
+					const delivery = sealFailure(
+						{ runId: row.runId, specId: row.specId, output: row.output, limit: row.limitHit },
+						"process restarted",
+					);
+					setError.run("process restarted", now, JSON.stringify(delivery), row.runId);
+				}
+				db.exec("COMMIT");
+				return rows.length;
+			} catch (error) {
+				db.exec("ROLLBACK");
+				throw error;
+			}
 		},
 		appendEvents(runId: string, events: StoredEvent[]) {
 			// 显式事务:要么整批落盘,要么一条都不落。node:sqlite 的 DatabaseSync 没有

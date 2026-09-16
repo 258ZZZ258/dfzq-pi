@@ -14,24 +14,10 @@ function parseErrorPosition(message: string): number {
 	return m ? Number(m[1]) : 0;
 }
 
-/**
- * 从助手文本里挖出 JSON。允许三种形态:裸对象、```json 围栏、无标签围栏。
- *
- * **三态而非二态**:`absent`(压根没有花括号,模型输出的是散文)与 `unparsable`
- * (有花括号但 JSON 坏了)必须分开 —— 前者没有解析错误可报,后者有,而 C6 的 followUp
- * 要靠后者告诉模型错在第几个字符。合并成一个 undefined 就是把这条信息扔掉,那正是
- * 第 7 次真 run 只能拿到「未找到 JSON 块」的原因。
- *
- * candidates 的顺序是 `[围栏内容, 原文本]`——**实测过**这不是两次对称的尝试:
- * - 围栏内容本身不含花括号(比如模型贴的是一段非 JSON 的代码块)时,第一个候选在
- *   `start < 0` 处 `continue`,回退到原文本、从紧跟着的裸 JSON 里截出结果 —— 这条回退
- *   路径**实测真的会走通**(见 `test/output-contract.test.ts` 的
- *   "reads a bare JSON object that follows an unlabelled non-JSON fence" 用例)。
- * - 围栏内容含花括号但解析失败时,原文本的 `indexOf("{")…lastIndexOf("}")` 跨度必然
- *   **包住**围栏里那段坏内容(原文本本来就包含整个围栏),回退候选截出来的还是同一段坏
- *   JSON。**实测这种情况下 `catch` 分支恢复不了**——保留第二个候选只是为了上面那种
- *   "围栏非 JSON + 裸 JSON 兜底" 的场景,不是为了"从损坏的围栏里抢救"。
- *   ⇒ 因此 `unparsable` 报的是**最后一个候选**的错误。
+/** Extract one object/array root from a bare or fenced response.
+ * Prefer the fenced candidate. A non-JSON fence may fall back to a bare root.
+ * Keep the outer root so a malformed array cannot validate as an inner object.
+ * Preserve absent versus unparsable diagnostics for the repair prompt.
  */
 export function extractJsonBlock(text: string): JsonBlockResult {
 	const fenced = /```(?:json)?\s*\n([\s\S]*?)\n?```/i.exec(text);
@@ -39,10 +25,11 @@ export function extractJsonBlock(text: string): JsonBlockResult {
 	let lastFailure: { error: string; snippet: string } | undefined;
 	for (const candidate of candidates) {
 		const trimmed = candidate.trim();
-		const start = trimmed.indexOf("{");
-		const end = trimmed.lastIndexOf("}");
-		if (start < 0 || end <= start) continue;
-		const slice = trimmed.slice(start, end + 1);
+		const start = trimmed.search(/[[{]/);
+		if (start < 0) continue;
+		// Preserve the outer root. A damaged array must not become a valid inner object.
+		const end = trimmed.lastIndexOf(trimmed[start] === "[" ? "]" : "}");
+		const slice = trimmed.slice(start, end < start ? undefined : end + 1);
 		try {
 			return { kind: "ok", value: JSON.parse(slice) };
 		} catch (error) {
@@ -188,7 +175,7 @@ export type ContractCheck = { ok: true; value: unknown } | { ok: false; detail: 
  * `judgeFastPathOutput`(`fast-path-runtime.ts`)也调它 —— 两处各写一套必然漂移,而这一份
  * 正是反幻觉兜底(风险 10)的唯一落点。
  */
-export function validateOutputContract(text: string, schema: unknown, clauseIds: readonly string[]): ContractCheck {
+export function validateOutputShape(text: string, schema: unknown): ContractCheck {
 	const extracted = extractJsonBlock(text);
 	if (extracted.kind === "absent") {
 		return {
@@ -228,7 +215,13 @@ export function validateOutputContract(text: string, schema: unknown, clauseIds:
 		};
 	}
 
-	const conditional = checkConditional(json as ContractShape, clauseIds);
+	return { ok: true, value: json };
+}
+
+export function validateOutputContract(text: string, schema: unknown, clauseIds: readonly string[]): ContractCheck {
+	const shape = validateOutputShape(text, schema);
+	if (!shape.ok) return shape;
+	const conditional = checkConditional(shape.value as ContractShape, clauseIds);
 	if (conditional !== undefined) {
 		return {
 			ok: false,
@@ -237,7 +230,7 @@ export function validateOutputContract(text: string, schema: unknown, clauseIds:
 		};
 	}
 
-	return { ok: true, value: json };
+	return shape;
 }
 
 export function createOutputContractJudge(options: { schema: unknown; maxRepairAttempts: number }): FinalJudge {

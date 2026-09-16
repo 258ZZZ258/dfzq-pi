@@ -1,0 +1,23 @@
+# audit-common —— 契约承重层(单一来源,只搬不改)。
+# 内容:IR schema(§4.2)/ chunk_id 公式(§6.5)/ PG 表模型(§10)/ Milvus collection schema(§8.2)/
+# manifest 列(§3.1)。**不依赖任何上层**(pipeline / eval);所有上层只从这里取契约。
+# import 包名 = common(发行名 audit-common)。源码在 Step 2 由 git mv 填入 common/。
+[build-system]
+requires = ["setuptools==80.10.2", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audit-common"
+version = "0.1.0"
+description = "audit-ai 契约层:IR / chunk_id / PG 模型 / Milvus schema / manifest 列(byte 级不变)"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic==2.13.4",       # IR schema(§4.2)
+    "sqlalchemy==2.0.51",     # PG 表模型 ORM(§10)
+    "pymilvus==2.5.18",  # Milvus schema + BM25 Function(§8.2;CP-012 原生 BM25 需 2.5)
+    "setuptools==80.10.2",  # pymilvus 2.5 声明 setuptools>69;import 期已不拉 pkg_resources(CP-012 验),保守留 <81
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["common*"]

@@ -19,6 +19,26 @@ const ctx = {
 };
 
 describe("validateSpec", () => {
+	it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])("rejects invalid maxTurns=%s", (maxTurns) => {
+		expect(() => validateSpec({ ...baseSpec(), limits: { maxTurns } }, ctx)).toThrow(/maxTurns/);
+	});
+	it.each(["maxTotalTokens", "maxCostUsd"])("rejects retired fastPath limit %s", (key) => {
+		const spec = {
+			...baseSpec(),
+			fastPath: {
+				enabled: true,
+				systemPrompt: "a",
+				rewritePrompt: "b",
+				answerPrompt: "c",
+				maxClauses: 2,
+				limits: { runTimeoutMs: 1000, [key]: 1 },
+			},
+		};
+		expect(() => validateSpec(spec, ctx)).toThrow(/fastPath.limits.*unsupported/);
+	});
+	it.each(["maxTotalTokens", "maxCostUsd", "unknownLimit"])("rejects unsupported limit %s", (key) => {
+		expect(() => validateSpec({ ...baseSpec(), limits: { maxTurns: 5, [key]: 100 } }, ctx)).toThrow(/unsupported/);
+	});
 	it("accepts a well-formed spec", () => {
 		expect(() => validateSpec(baseSpec(), ctx)).not.toThrow();
 	});
@@ -88,7 +108,7 @@ describe("fastPath 校验", () => {
 				rewritePrompt: "b.md",
 				answerPrompt: "c.md",
 				maxClauses: 12,
-				limits: { maxCostUsd: 0.1 },
+				limits: { runTimeoutMs: 45000 },
 			},
 		};
 		expect(() => validateSpec(spec as never, CTX)).not.toThrow();
@@ -127,7 +147,7 @@ describe("fastPath 校验", () => {
 	// maxChars 那样声明「缺省继承」),{} 只能读作「一条限额都没设」,必须按顶层 spec.limits
 	// 同一严格度拒绝——否则 runTimeoutMs 缺失时快路径没有挂钟硬顶,一次挂死会把两条路径的
 	// 耗时相加。
-	it("rejects fastPath.limits with none of runTimeoutMs/maxCostUsd/maxTotalTokens set", () => {
+	it("rejects fastPath.limits with no supported limit set", () => {
 		const spec = {
 			...BASE,
 			fastPath: {
@@ -166,9 +186,9 @@ describe("fastPath 校验", () => {
 				rewritePrompt: "b.md",
 				answerPrompt: "c.md",
 				maxClauses: 12,
-				limits: { maxCostUsd: "5" },
+				limits: { runTimeoutMs: "5" },
 			},
 		};
-		expect(() => validateSpec(spec as never, CTX)).toThrow(/fastPath\.limits\.maxCostUsd.*positive/);
+		expect(() => validateSpec(spec as never, CTX)).toThrow(/fastPath\.limits\.runTimeoutMs.*positive/);
 	});
 });

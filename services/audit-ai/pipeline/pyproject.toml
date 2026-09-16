@@ -1,0 +1,45 @@
+# audit-pipeline —— 文档处理管线(S0–S5 + finalize、富集 E1、机制、两个接缝、web 工作台)。
+# 依赖方向:pipeline → common(契约层)。import 包名 = pipeline(发行名 audit-pipeline)。
+# 源码在 Step 3 由 git mv 从 src/pipeline/ 填入 pipeline/。
+[build-system]
+requires = ["setuptools==80.10.2", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audit-pipeline"
+version = "0.1.0"
+description = "audit-ai 文档处理管线:S0–S5/finalize、富集 E1、编排/解析接缝、web 工作台"
+requires-python = ">=3.11"
+# console_scripts(demo/demo-web)按构建 profile 条件注册,见 setup.py(生产剔除人操作面入口)。
+dynamic = ["scripts"]
+dependencies = [
+    "audit-common==0.1.0",        # 契约层(依赖方向:pipeline → common)
+    "pyyaml==6.0.3",
+    "typer==0.27.0",
+    "sqlalchemy==2.0.51",
+    "psycopg[binary]==3.3.4",
+    "pymilvus==2.5.18",  # CP-012:Milvus 2.5 原生 BM25 全文检索
+    "python-docx==1.2.0",
+    "pdfplumber==0.11.10",
+    "rapidfuzz==3.14.5",
+    "httpx[socks]==0.28.1",  # E2 LLM client(OpenAI 兼容)+ web 测试；支持企业 SOCKS 代理
+    "minio==7.2.20",          # ObjectStore MinIO 后端(backend=minio;上传/内网部署)
+    "openpyxl==3.1.5",
+    "python-ulid==4.0.1",
+    "pydantic==2.13.4",
+    "setuptools==80.10.2",
+]
+
+[project.optional-dependencies]
+# 本地嵌入(torch,重)——仅 local 模式需要,endpoint 模式不需。
+embed = ["FlagEmbedding==1.4.0"]
+# 扫描件/图片 OCR(MinerU pipeline 后端,重:torch/onnx + 模型)——仅 PIPELINE_OCR_BACKEND=mineru 需。
+# 模型源走 env MINERU_MODEL_SOURCE=modelscope(中国网络;首跑下载,之后缓存)。
+ocr = ["mineru[core]==3.4.5"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pipeline*"]
+
+[tool.setuptools.package-data]
+"pipeline.web" = ["static/*"]

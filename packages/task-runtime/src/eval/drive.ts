@@ -140,7 +140,7 @@ export function renderSummary(
 		"",
 		`- **${criterion1Label}**:${verdict.criterion1.pass ? "通过" : "**不通过**"} —— ${verdict.criterion1.detail}`,
 		`- **判据②(工具调用与 EVAL_TASK_LOG 逐条对上)**:${verdict.criterion2.pass ? "通过" : "**不通过**"} —— ${verdict.criterion2.detail}`,
-		"- **判据③(四类限额)**:见 `limits/summary.md`",
+		"- **判据③(轮数与超时两类限制)**:见 `limits/summary.md`",
 		"- **判据④(并发零污染)**:已由 `test/isolation.test.ts` 覆盖",
 		"",
 	].join("\n");

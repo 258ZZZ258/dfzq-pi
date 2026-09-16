@@ -9,19 +9,15 @@ export interface ProbeSpec {
 }
 
 /**
- * 四类限额各一次(判据③)。阈值压到必触发。
+ * 轮数与超时两类限制各一次(判据③)。阈值压到必触发。
  *
  * 载荷统一用 L3-001(full_year_audit):它必然需要多轮工具调用,否则 P1 的 maxTurns=1
  * 可能一轮就答完而不触发,探针就变成假阳性。
  *
- * P4 依赖 profile 的 cost 费率非零。阈值取到任何非零成本都触发,所以费率准确性
- * 不影响本探针 —— 只影响「总花费」这个数字(规格 B1:单位是元)。
  */
 export const PROBES: readonly ProbeSpec[] = [
 	{ id: "P1", caseId: "L3-001", limits: { maxTurns: 1 }, expect: "maxTurns" },
 	{ id: "P2", caseId: "L3-001", limits: { runTimeoutMs: 1000 }, expect: "runTimeout" },
-	{ id: "P3", caseId: "L3-001", limits: { maxTotalTokens: 100 }, expect: "maxTotalTokens" },
-	{ id: "P4", caseId: "L3-001", limits: { maxCostUsd: 0.000001 }, expect: "maxCostUsd" },
 ];
 
 export interface ProbeOutcome {
@@ -48,7 +44,7 @@ export function judgeProbes(outcomes: ProbeOutcome[]): { pass: boolean; detail: 
 		pass: failed.length === 0 && outcomes.length === PROBES.length,
 		detail:
 			failed.length === 0
-				? `四类限额各触发一次且归类正确(${outcomes.length}/${PROBES.length})`
+				? `轮数与超时两类限制各触发一次且归类正确(${outcomes.length}/${PROBES.length})`
 				: failed
 						.map(
 							(o) =>
@@ -67,7 +63,7 @@ export function renderProbeSummary(outcomes: ProbeOutcome[]): string {
 		.join("\n");
 	const verdict = judgeProbes(outcomes);
 	return [
-		"# 判据③ · 四类限额探针",
+		"# 判据③ · 轮数与超时两类限制探针",
 		"",
 		"| 探针 | 期望 limit | 实际 status | 实际 limit | 结果 |",
 		"|---|---|---|---|---|",

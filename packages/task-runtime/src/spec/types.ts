@@ -5,8 +5,6 @@ export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhi
 export interface RuntimeLimits {
 	maxTurns?: number;
 	runTimeoutMs?: number;
-	maxTotalTokens?: number;
-	maxCostUsd?: number;
 }
 
 export interface CompactionSpec {
@@ -29,6 +27,8 @@ export interface OutputContractSpec {
 }
 
 export interface RuntimeSpec {
+	/** False for toolsets with private mutable state that cannot be reconstructed from a Session checkpoint. */
+	durableSession?: boolean;
 	id: string;
 	description?: string;
 
@@ -161,7 +161,7 @@ export interface FastPathSpec {
 	answerPrompt: string;
 	/** 取正文的 clause_id 条数上限。 */
 	maxClauses: number;
-	/** 快路径自己的限额。`maxTurns` 不适用(结构固定 2 次模型调用)。 */
+	/** 快路径自己的轮数/超时限制；正常结构固定两次模型调用。 */
 	limits: RuntimeLimits;
 	/** 缺省沿用 `RuntimeSpec.thinkingLevel`。 */
 	thinkingLevel?: ThinkingLevel;

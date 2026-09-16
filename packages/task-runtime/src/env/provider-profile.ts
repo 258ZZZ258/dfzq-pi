@@ -28,7 +28,7 @@ export interface RoleBinding {
 	 */
 	reasoning: boolean;
 	/**
-	 * 计费费率。RuntimeLimits.maxCostUsd 依赖它才能生效。必填,不给默认值:内网网关确实不计费,
+	 * 用量观测费率，不参与中止判定。内网网关不计费时,
 	 * 就显式填全 0——那是 profile 作者的选择,不是装配器悄悄替其做的决定。
 	 */
 	cost: RoleBindingCost;

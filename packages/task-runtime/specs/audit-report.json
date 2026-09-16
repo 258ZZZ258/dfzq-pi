@@ -1,7 +1,5 @@
 {
   "id": "audit-report",
-  "durableSession": false,
-  "$commentRecovery": "The report toolset keeps a mutable draft outside Session state. Automatic resume and queued conversation continuation remain disabled until that state has an explicit checkpoint contract.",
   "description": "审计征求意见书、常规审计报告（含反洗钱附件）和离任审计报告生成",
   "model": {
     "role": "main"
@@ -22,8 +20,11 @@
     "get_aml_facts",
     "prepare_report_fact_pack",
     "generate_report_draft",
-    "revise_report_draft",
-    "validate_report_document"
+    "get_report_semantic_job",
+    "submit_report_semantic_job",
+    "retain_report_semantic_job",
+    "get_report_paragraph",
+    "revise_report_draft"
   ],
   "systemPrompt": "audit-report/system.md",
   "skills": [
@@ -38,7 +39,7 @@
     "keepRecentTokens": 18000
   },
   "limits": {
-    "maxTurns": 24,
+    "maxTurns": 48,
     "runTimeoutMs": 900000
   },
   "stopPolicy": {
@@ -61,5 +62,7 @@
   },
   "observability": {
     "contextSnapshot": "hash"
-  }
+  },
+  "durableSession": false,
+  "$commentRecovery": "The report toolset keeps a mutable draft outside Session state. Automatic resume and queued conversation continuation remain disabled until that state has an explicit checkpoint contract."
 }

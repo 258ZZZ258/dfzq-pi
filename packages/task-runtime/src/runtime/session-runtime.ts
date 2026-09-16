@@ -14,6 +14,8 @@ import type { PluginContext } from "./plugin-registry.ts";
 
 export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "pluginContext"> & {
 	authorizeExecution?: () => Promise<void>;
+	/** Once per model dispatch; allows a task composition to share a turn ceiling. */
+	consumeModelTurn?: () => void;
 	interaction?: { inbox: SessionInbox; grant: Grant; rootRunId: string; messageId?: string };
 	conversation?: Conversation;
 	memory?: { service: MemoryService; scope: MemoryScope };
@@ -21,6 +23,9 @@ export type CreateSessionRuntimeOptions = Omit<AssembleOptions, "pluginContext">
 	onCheckpoint?: (checkpoint: SessionCheckpoint) => Promise<void>;
 	/** spec.outputContract.schema 指向的文件已由调用方读好。缺省即不挂 C6 判官。 */
 	outputContractSchema?: unknown;
+	/** Trusted task-owned finalization; runs before all final judges, never after validation. */
+	resolveOutput?: (text: string, callTool: Assembled["callTool"]) => Promise<string>;
+	beforeRun?: (callTool: Assembled["callTool"]) => Promise<void>;
 };
 
 /** 只接收 MCP adapter 已校验并放入工具私有 details 的条款正文。 */
@@ -319,7 +324,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 	// Extension context handlers intentionally swallow errors. Enforce authorization
 	// and checkpoint failures at the Agent transform boundary, before stream dispatch.
 	const transformContext = session.agent.transformContext;
-	if (options.onCheckpoint || options.authorizeExecution)
+	if (options.onCheckpoint || options.authorizeExecution || options.consumeModelTurn)
 		session.agent.transformContext = async (messages, signal) => {
 			signal?.throwIfAborted();
 			await options.authorizeExecution?.();
@@ -327,6 +332,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 			if (checkpointError) throw checkpointError;
 			signal?.throwIfAborted();
 			await options.authorizeExecution?.();
+			options.consumeModelTurn?.();
 			return transformed;
 		};
 	if (options.conversation && !options.resume) {
@@ -575,9 +581,11 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 		}
 
 		let thrown: unknown;
+		let resolvedOutput: string | undefined;
 		let judgeError: string | undefined;
 		let judgeAttempts: Record<string, number> = {};
 		let continueForSteer = false;
+		let beforeRunDone = false;
 		try {
 			if (options.interaction) {
 				if (options.resume) await saveCheckpoint(options.resume.next);
@@ -586,6 +594,10 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 			for (;;) {
 				try {
 					if (stopRequested) throw new Error("run_cancelled");
+					if (!beforeRunDone) {
+						await options.beforeRun?.(assembled.callTool);
+						beforeRunDone = true;
+					}
 					if (options.spec.limits.maxTurns !== undefined && state.turns >= options.spec.limits.maxTurns)
 						state.tripped = "maxTurns";
 					if (!state.tripped && options.resume?.next === "pending_tools") {
@@ -661,6 +673,11 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 						await session.prompt(pendingRepairPrompt);
 					} else if (options.resume.next !== "judge") await session.agent.continue();
 					if (checkpointError) thrown = checkpointError;
+					if (!thrown && !stopRequested && !state.tripped && options.resolveOutput)
+						resolvedOutput = await options.resolveOutput(
+							session.getLastAssistantText() ?? "",
+							assembled.callTool,
+						);
 				} catch (error) {
 					thrown = error;
 				}
@@ -677,10 +694,16 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 							await saveCheckpoint("repair");
 						},
 						judges,
-						getLastAssistantText: () => session.getLastAssistantText() ?? "",
+						getLastAssistantText: () => resolvedOutput ?? session.getLastAssistantText() ?? "",
 						getClauseIds: () => [...clauseIds],
 						reprompt: async (text) => {
 							await session.prompt(text);
+							resolvedOutput = undefined;
+							if (!stopRequested && !state.tripped && options.resolveOutput)
+								resolvedOutput = await options.resolveOutput(
+									session.getLastAssistantText() ?? "",
+									assembled.callTool,
+								);
 						},
 						// state.turns / timer 都不重置 —— maxTurns 与 runTimeoutMs 横跨全部重判,
 						// 这是重判不会变成无限循环的第二道保险(第一道是 Σ maxAttempts)。
@@ -730,7 +753,7 @@ export async function createSessionRuntime(options: CreateSessionRuntimeOptions)
 			specId,
 			status,
 			memoryObservation,
-			output: session.getLastAssistantText() ?? undefined,
+			output: resolvedOutput ?? session.getLastAssistantText() ?? undefined,
 			errorMessage: judgeError ?? (thrown instanceof Error ? thrown.message : assistant?.errorMessage),
 			stopReason: assistant?.stopReason,
 			limit: state.tripped,

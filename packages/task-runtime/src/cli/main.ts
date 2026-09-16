@@ -2,8 +2,11 @@
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
+import type { ReportNarrativeProcessor } from "../audit-report/report-narrative-processing.ts";
+import { createAuditReportRuntime } from "../audit-report/report-runtime.ts";
 import type { ProviderProfile } from "../env/provider-profile.ts";
 import { attachTrajectory } from "../observability/trajectory.ts";
+import type { Runtime } from "../runtime/contract.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { localAuditEnvironment, localAuditServers } from "../server/local-services.ts";
@@ -98,56 +101,76 @@ async function main(): Promise<void> {
 		);
 	}
 
-	const toolsets = new ToolsetRegistry();
 	if (spec.mcpServers?.some((server) => server.args[0] === "-m" && server.args[1] === "query.mcp.server"))
 		await mkdir(dirname(localAuditEnvironment(process.env).POLICY_MCP_AUDIT_LOG!), { recursive: true });
-	if (spec.toolset === "audit-report") {
-		const reportType = values["report-type"];
-		if (reportType !== "regular" && reportType !== "turnover" && reportType !== "consultation") {
-			throw new Error("--report-type must be consultation, regular, or turnover");
+	const buildToolsets = (narrativeProcessor?: ReportNarrativeProcessor) => {
+		const toolsets = new ToolsetRegistry();
+		if (spec.toolset === "audit-report") {
+			const reportType = values["report-type"];
+			if (reportType !== "regular" && reportType !== "turnover" && reportType !== "consultation") {
+				throw new Error("--report-type must be consultation, regular, or turnover");
+			}
+			for (const key of ["report-task-id", "audit-api-base-url", "operating-workbook"] as const) {
+				if (!values[key]) throw new Error(`--${key} is required for audit-report`);
+			}
+			toolsets.register(
+				spec.toolset,
+				createAuditReportToolset({
+					taskId: values["report-task-id"] as string,
+					reportType,
+					apiBaseUrl: values["audit-api-base-url"] as string,
+					operatingWorkbookPath: values["operating-workbook"] as string,
+					skillRoot: resolve(dirname(values.spec as string), "audit-report/skills"),
+					narrativeProcessor,
+				}),
+			);
+		} else {
+			toolsets.register(
+				spec.toolset,
+				createMcpToolset(
+					localAuditServers(spec.mcpServers ?? []).map((server) => ({
+						...server,
+						// eval 模式:把每任务的工具调用日志路径传进 MCP server
+						env: {
+							...server.env,
+							...(process.env.EVAL_TASK_LOG ? { EVAL_TASK_LOG: process.env.EVAL_TASK_LOG } : {}),
+						},
+					})),
+					// eval / CLI 不是权限场景:没有 POST /runs 的 filters,也没有 runId。
+					// 显式 null 而不是省略 —— 参数不可省略,于是生产路径漏传 scope 是编译错误。
+					null,
+				),
+			);
 		}
-		for (const key of ["report-task-id", "audit-api-base-url", "operating-workbook"] as const) {
-			if (!values[key]) throw new Error(`--${key} is required for audit-report`);
-		}
-		toolsets.register(
-			spec.toolset,
-			createAuditReportToolset({
-				taskId: values["report-task-id"] as string,
-				reportType,
-				apiBaseUrl: values["audit-api-base-url"] as string,
-				operatingWorkbookPath: values["operating-workbook"] as string,
-				skillRoot: resolve(dirname(values.spec as string), "audit-report/skills"),
-			}),
-		);
-	} else {
-		toolsets.register(
-			spec.toolset,
-			createMcpToolset(
-				localAuditServers(spec.mcpServers ?? []).map((server) => ({
-					...server,
-					// eval 模式:把每任务的工具调用日志路径传进 MCP server
-					env: {
-						...server.env,
-						...(process.env.EVAL_TASK_LOG ? { EVAL_TASK_LOG: process.env.EVAL_TASK_LOG } : {}),
-					},
-				})),
-				// eval / CLI 不是权限场景:没有 POST /runs 的 filters,也没有 runId。
-				// 显式 null 而不是省略 —— 参数不可省略,于是生产路径漏传 scope 是编译错误。
-				null,
-			),
-		);
-	}
 
-	const runtime = await createSessionRuntime({
+		return toolsets;
+	};
+	const commonOptions = {
 		spec,
 		profile,
 		registry: createDefaultPluginRegistry(),
-		toolsets,
 		cwd: join(workdir, "workspace"),
 		agentDir: join(workdir, "agent"),
 		outputContractSchema,
 		skillPaths: spec.skills?.map((rel) => resolve(dirname(values.spec as string), rel)),
-	});
+	};
+	const narrativeDir = resolve(dirname(values.spec as string), "audit-report");
+	let runtime: Runtime;
+	if (spec.toolset === "audit-report") {
+		const rewrite = JSON.parse(
+			await readFile(join(narrativeDir, "narrative-rewrite.runtime.json"), "utf8"),
+		) as RuntimeSpec;
+		const review = JSON.parse(
+			await readFile(join(narrativeDir, "narrative-review.runtime.json"), "utf8"),
+		) as RuntimeSpec;
+		await resolveSpecPromptPaths(rewrite, narrativeDir);
+		await resolveSpecPromptPaths(review, narrativeDir);
+		runtime = await createAuditReportRuntime({
+			...commonOptions,
+			buildToolsets,
+			narrativeSpecs: { rewrite, review },
+		});
+	} else runtime = await createSessionRuntime({ ...commonOptions, toolsets: buildToolsets() });
 
 	const detach = values.trajectory ? await attachTrajectory(runtime, values.trajectory) : undefined;
 	try {

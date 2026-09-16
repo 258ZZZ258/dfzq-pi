@@ -48,4 +48,6 @@ Java 需在实际项目成员授权范围内匹配：同营业部、同审计期
 5. Pi queued/running 继续查询；其他非 completed 终态保留诊断结果，不存为正式可用文档。网络重试复用同一 clientRequestId；若已有任务失败需新建版本重试，不覆盖原始版本。
 6. 需联合验收：主表组装真实 dataset、同项目多人权限、实际数据库迁移、真实模型、附件分页和 Word 样式、前端反馈交互及失败提示。
 
-本地定向测试：Pi 执行 `npx vitest run test/audit-report-agent.test.ts test/business-data-contracts.test.ts`。当前19项通过，使用模拟HTTP与临时Excel验证取数边界，使用测试模型验证运行链路；不代表真实 Java 或模型联调通过。测试 fixture 仅用于回归，不是生产取数来源。
+本地定向测试：在 task-runtime 执行 `node ../../node_modules/vitest/dist/cli.js --run test/audit-report-agent.test.ts test/session-runtime.test.ts test/server-startup.test.ts`。2026-09-10 共74项通过，覆盖来源过滤、短引用交付、伪造和过期引用、反洗钱问题存在性评分、运行时和服务启动。测试 fixture 仅用于回归，不是生产取数来源。
+
+同日使用已有模拟Excel及其HTTP服务、真实 DeepSeek 模型、正式运行工厂和 /runs 提交轮询接口，四场景（征求意见书、独立常规、关联常规、离任）均 completed，完整文档与规则基准一致。实际交付文档的当前逐句 rubric 分别为124/124、151/151、151/151、144/144。此结果证明该组模拟数据的 Pi 链路可运行，不代表规则语义覆盖率100%，也不覆盖 Java业务持久化、真实业务数据核验和 Word排版验收；模拟检查项使用技术占位说明，仍需业务样本替换。

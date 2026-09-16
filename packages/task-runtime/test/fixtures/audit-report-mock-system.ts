@@ -38,6 +38,17 @@ export async function startAuditReportMockSystem(tables: SourceTables): Promise<
 		const list = (sheet: string, predicate: (row: SourceRow) => boolean = () => true) =>
 			send((tables[sheet] ?? []).filter(predicate), sheet);
 
+		if (url.pathname === "/api/audit/projects/previous") {
+			const before = url.searchParams.get("before") ?? "";
+			const previous = (tables.审计项目 ?? [])
+				.filter(
+					(row) =>
+						matches(row, "organizationId", url.searchParams.get("organizationId")) &&
+						String(row.auditEnd ?? "") < before,
+				)
+				.sort((a, b) => String(b.auditEnd).localeCompare(String(a.auditEnd)))[0];
+			return send(previous ?? null, "审计项目");
+		}
 		const project = url.pathname.match(/^\/api\/audit\/projects\/([^/]+)$/u);
 		const workflow = url.pathname.match(/^\/api\/audit\/projects\/([^/]+)\/workflow$/u);
 		if (workflow)
@@ -49,7 +60,6 @@ export async function startAuditReportMockSystem(tables: SourceTables): Promise<
 				(tables.审计项目 ?? []).find((row) => matches(row, "taskId", project[1] ?? "")) ?? null,
 				"审计项目",
 			);
-		if (url.pathname === "/api/audit/projects/previous") return send(null, "审计项目");
 		const organization = url.pathname.match(/^\/api\/organizations\/([^/]+)$/u);
 		if (organization)
 			return send(
@@ -62,7 +72,8 @@ export async function startAuditReportMockSystem(tables: SourceTables): Promise<
 				(tables.人员快照 ?? []).find((row) => matches(row, "organizationId", personnel[1] ?? "")) ?? null,
 				"人员快照",
 			);
-		if (url.pathname === "/api/oa/appointments") return list("OA任免发文");
+		if (url.pathname === "/api/oa/appointments")
+			return list("OA任免发文", (row) => matches(row, "personId", url.searchParams.get("personId")));
 		if (url.pathname === "/api/audit/findings")
 			return list(
 				"审计发现",
@@ -86,7 +97,8 @@ export async function startAuditReportMockSystem(tables: SourceTables): Promise<
 		if (url.pathname === "/api/aml/suspicious-transactions") return list("总部可疑交易认定");
 		if (url.pathname === "/api/audit/major-matters") return list("重大事项判断");
 		if (url.pathname === "/api/aml/summary") return send(tables.反洗钱汇总?.[0] ?? null, "反洗钱汇总");
-		if (url.pathname === "/api/performance") return list("绩效考核");
+		if (url.pathname === "/api/performance")
+			return list("绩效考核", (row) => matches(row, "personId", url.searchParams.get("personId")));
 		if (url.pathname === "/api/audit/narrative-facts") return send(tables.审计叙述事实?.[0] ?? null, "审计叙述事实");
 		if (url.pathname === "/api/source-catalog") return list("数据源目录");
 		return send(null, "", 404);

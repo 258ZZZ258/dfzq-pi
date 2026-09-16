@@ -1,7 +1,10 @@
 import { mkdir, readdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { type ServerType, serve } from "@hono/node-server";
+import { createDisclosureLinkTools, disclosureLinkDelivery } from "../audit-report/disclosure-link.ts";
 import { parseReportInput } from "../audit-report/report-input.ts";
+import type { ReportNarrativeProcessor } from "../audit-report/report-narrative-processing.ts";
+import { createAuditReportRuntime } from "../audit-report/report-runtime.ts";
 import { createBoundAuditReportTools } from "../audit-report/report-tools.ts";
 import { AuthorizationError, type GrantVerifier } from "../auth/grant.ts";
 import type { GrantLease } from "../auth/lease.ts";
@@ -288,7 +291,11 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		if (resume && spec.durableSession === false) throw new Error("task_session_recovery_unsupported");
 		const checkNativeTool = async (name?: string) => {
 			await checkExecution();
-			if (name && grant && !grant.tools.includes(name)) throw new AuthorizationError("forbidden");
+			const internal =
+				spec.toolset === "audit-report"
+					? ["begin_report_run", "resolve_report_document", "validate_report_document"].includes(name ?? "")
+					: spec.toolset === "audit-disclosure" && name === "validate_disclosure_result";
+			if (name && !internal && grant && !grant.tools.includes(name)) throw new AuthorizationError("forbidden");
 		};
 
 		// 🔴 每次调用都新建一个 ToolsetRegistry。ToolsetRegistry **必须按 run 新建**
@@ -299,9 +306,17 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		// 无害);真正会炸的是**这个闭包自己**如果被改成复用同一个 registry 实例、却仍然在
 		// 每次调用里执行 `register(...)`——那样第二次调用会在一个已经登记过 `spec.toolset`
 		// 的实例上再登记一次,直接抛 `Toolset "policy-query" is already registered`。
-		const buildToolsets = (): ToolsetRegistry => {
+		const buildToolsets = (narrativeProcessor?: ReportNarrativeProcessor): ToolsetRegistry => {
 			const registry = new ToolsetRegistry();
-			if (spec.toolset === "supervision-analysis") {
+			if (spec.toolset === "audit-disclosure") {
+				registry.register(
+					spec.toolset,
+					authorizedToolset(
+						async () => createDisclosureLinkTools(payload, runOptions.reportTaskId),
+						checkNativeTool,
+					),
+				);
+			} else if (spec.toolset === "supervision-analysis") {
 				registry.register(
 					spec.toolset,
 					authorizedToolset(createSupervisionAnalysisToolset(payload), checkNativeTool),
@@ -315,7 +330,12 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 					registry.register(
 						spec.toolset,
 						authorizedToolset(
-							async () => createBoundAuditReportTools(dataset, resolve(options.specsDir, "audit-report/skills")),
+							async () =>
+								createBoundAuditReportTools(
+									dataset,
+									resolve(options.specsDir, "audit-report/skills"),
+									narrativeProcessor,
+								),
 							checkNativeTool,
 						),
 					);
@@ -332,6 +352,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 							apiBaseUrl: options.auditReportSources.apiBaseUrl,
 							operatingWorkbookPath: options.auditReportSources.operatingWorkbookPath,
 							skillRoot: resolve(options.specsDir, "audit-report/skills"),
+							narrativeProcessor,
 						}),
 						checkNativeTool,
 					),
@@ -437,8 +458,35 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			});
 		}
 
+		if (spec.toolset === "audit-report") {
+			const narrativeDir = resolve(options.specsDir, "audit-report");
+			const rewrite = JSON.parse(
+				await readFile(join(narrativeDir, "narrative-rewrite.runtime.json"), "utf8"),
+			) as RuntimeSpec;
+			const review = JSON.parse(
+				await readFile(join(narrativeDir, "narrative-review.runtime.json"), "utf8"),
+			) as RuntimeSpec;
+			await resolveSpecPromptPaths(rewrite, narrativeDir);
+			await resolveSpecPromptPaths(review, narrativeDir);
+			return createAuditReportRuntime({
+				authorizeExecution: checkExecution,
+				signal,
+				assemblyTimeoutMs: options.assemblyTimeoutMs,
+				spec,
+				profile,
+				registry: plugins,
+				buildToolsets,
+				narrativeSpecs: { rewrite, review },
+				cwd: join(workdir, "workspace"),
+				agentDir: join(workdir, "agent"),
+				outputContractSchema: outputContractSchemas.get(specId),
+				skillPaths: skillPaths.get(specId),
+			});
+		}
+
 		const buildFull = (maxTurns = spec.limits.maxTurns) =>
 			createSessionRuntime({
+				...(spec.toolset === "audit-disclosure" ? disclosureLinkDelivery : {}),
 				authorizeExecution: checkExecution,
 				interaction:
 					runOptions.interaction && grant && options.inbox

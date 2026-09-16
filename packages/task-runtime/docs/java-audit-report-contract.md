@@ -32,6 +32,8 @@ dataset.task.workflow 包含 `mode`、布尔值 `matchingCompleted`、`consultat
 
 ## 2. `answer` 文档包
 
+Pi 内部模型只返回本次生成的短引用 `audit-report-result-ref.v1`，Runtime 从任务私有上下文取回完整文档，再执行输出 schema 和深度一致性校验。Java 的成功 `answer` 仍然是以下完整 `audit-report-document.v1`，不需要新增取引用接口。引用不是业务报告ID，不能持久化后跨任务复用；伪造、旧版本、未生成的引用直接失败。模型可通过 `get_report_paragraph` 按段读取待改内容，无须复述整份文档和来源目录。
+
 ```jsonc
 {
   "schemaVersion": "audit-report-document.v1",

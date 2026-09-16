@@ -38,7 +38,8 @@ export const auditReportReadinessDescriptor: PluginDescriptor = {
 				}
 				return {
 					ok: false,
-					followUp: "请完成取数和规则生成，只输出工具返回的完整 audit-report-document.v1 JSON，不要输出过程说明。",
+					followUp:
+						"请完成取数和规则生成，只输出最新工具返回的 audit-report-result-ref.v1 三字段引用，由 Runtime 解析完整文档，不要输出过程说明。",
 					detail:
 						"final document is incomplete or differs from the current tool-generated report, nodes or sources",
 				};

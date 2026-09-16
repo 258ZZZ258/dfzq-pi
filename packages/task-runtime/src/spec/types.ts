@@ -37,6 +37,8 @@ export interface RuntimeSpec {
 	thinkingLevel?: ThinkingLevel;
 
 	toolset: string;
+	/** Explicit opt-in for isolated text-only phases; omitted retains the required non-empty whitelist. */
+	toolMode?: "none";
 	/** 必填白名单。pi 的 noTools:"all" 不填 tools 等于工具全关(sdk.ts:246,249-251)。 */
 	tools: string[];
 	excludeTools?: string[];

@@ -1,4 +1,5 @@
 import type { AuditReportDataset, AuditReportType } from "./report-contracts.ts";
+import { buildUnpublishedPerformanceSummary } from "./report-unpublished-performance.ts";
 import { businessCheckErrors, workflowErrors } from "./report-workflow.ts";
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -70,6 +71,13 @@ export function parseReportInput(
 				throw new Error(`Invalid workflow.${field}`);
 		}
 	const personnel = object(raw.personnel, "personnel");
+	for (const field of ["employeeCount", "brokerCount"]) {
+		const count = personnel[field];
+		if (field === "brokerCount" && count === undefined) continue;
+		if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0)
+			throw new Error(`Invalid personnel.${field}; unknown broker count must be omitted`);
+	}
+	if (personnel.asOf !== task.auditEnd) throw new Error("Personnel snapshot must match the audit end date");
 	object(raw.fixedFacts, "fixedFacts");
 	if (org.organizationId !== task.organizationId || personnel.organizationId !== task.organizationId)
 		throw new Error("Cross-organization snapshot rejected");
@@ -85,14 +93,33 @@ export function parseReportInput(
 		"checks",
 	])
 		if (!Array.isArray(raw[field])) throw new Error(`dataset.${field} must be an array`);
-	for (const f of raw.findings as unknown[])
+	for (const f of raw.findings as unknown[]) {
+		const finding = object(f, "finding");
+		if (
+			finding.issueCount !== undefined &&
+			(typeof finding.issueCount !== "number" ||
+				!Number.isSafeInteger(finding.issueCount) ||
+				finding.issueCount <= 0)
+		)
+			throw new Error("Invalid finding.issueCount; unknown count must be omitted");
 		if (
 			object(f, "finding").organizationId !== task.organizationId ||
 			(object(f, "finding").isHistorical !== true && object(f, "finding").projectId !== task.projectId)
 		)
 			throw new Error("Cross-project or organization finding rejected");
+	}
 	const dataset = structuredClone(raw) as unknown as AuditReportDataset;
+	for (const event of dataset.riskEvents) {
+		if (
+			event.absenceScope !== undefined &&
+			(event.state !== "VERIFIED_NONE" ||
+				(event.absenceScope !== "all" &&
+					(event.absenceScope !== "unresolved-during-period" || !["complaint", "lawsuit"].includes(event.type))))
+		)
+			throw new Error("Invalid risk absence scope");
+	}
 	const errors = [...workflowErrors(dataset.task), ...businessCheckErrors(dataset)];
+	if (raw.performanceAvailability !== undefined) errors.push(...buildUnpublishedPerformanceSummary(dataset).errors);
 	if (errors.length) throw new Error(errors.join("\n"));
 	return dataset;
 }

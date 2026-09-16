@@ -1,5 +1,6 @@
 import { readFile, stat } from "node:fs/promises";
 import * as XLSX from "@e965/xlsx";
+import { buildCleanPracticeSummary } from "./report-clean-practice.ts";
 import type {
 	AmlDomainFact,
 	AmlMajorMatterRecord,
@@ -24,6 +25,7 @@ import type {
 	ReportWorkflow,
 	RiskEvent,
 } from "./report-contracts.ts";
+import { buildControlSummary } from "./report-control-summary.ts";
 
 type Primitive = string | number | boolean | null;
 type FlatRecord = Record<string, Primitive>;
@@ -50,6 +52,7 @@ export interface SourceReadTrace {
 }
 
 export interface LoadAuditReportDatasetOptions {
+	signal?: AbortSignal;
 	taskId: string;
 	reportType: AuditReportType;
 	apiBaseUrl: string;
@@ -146,9 +149,12 @@ async function loadOperatingMetrics(
 	evidence: EvidenceRecord[],
 	trace: SourceReadTrace[],
 	allowEmpty: boolean,
+	signal?: AbortSignal,
 ): Promise<OperatingMetric[]> {
-	const workbook = XLSX.read(await readFile(workbookPath), { type: "buffer", cellDates: true });
+	signal?.throwIfAborted();
+	const workbook = XLSX.read(await readFile(workbookPath, { signal }), { type: "buffer", cellDates: true });
 	const workbookStat = await stat(workbookPath);
+	signal?.throwIfAborted();
 	const queryTime = new Date().toISOString();
 	const dataVersion = `xlsx-${Math.trunc(workbookStat.mtimeMs)}`;
 	const dictionary = new Map(
@@ -294,12 +300,15 @@ async function loadOperatingMetrics(
 export async function loadAuditReportDataset(
 	options: LoadAuditReportDatasetOptions,
 ): Promise<LoadedAuditReportDataset> {
+	options.signal?.throwIfAborted();
 	const trace: SourceReadTrace[] = [];
 	const evidence: EvidenceRecord[] = [];
 
 	const get = async (sourceId: string, endpoint: string): Promise<ApiEnvelope> => {
-		const response = await fetch(`${options.apiBaseUrl}${endpoint}`);
+		options.signal?.throwIfAborted();
+		const response = await fetch(`${options.apiBaseUrl}${endpoint}`, { signal: options.signal });
 		const envelope = (await response.json()) as ApiEnvelope;
+		options.signal?.throwIfAborted();
 		const recordCount = Array.isArray(envelope.data) ? envelope.data.length : envelope.data ? 1 : 0;
 		trace.push({
 			sourceId,
@@ -405,9 +414,12 @@ export async function loadAuditReportDataset(
 		factText: optionalText(r, "factText"),
 		sampleCount: optionalNumber(r, "sampleCount"),
 		exceptionCount: optionalNumber(r, "exceptionCount"),
-		evidenceIds: [
-			addEvidence("DS-03", text(r, "code"), "result", r.result, checksEnvelope.meta, checksEndpoint, task.auditEnd),
-		],
+		evidenceIds: ["result", "factText", "sampleCount", "exceptionCount"].flatMap((field) => {
+			const value = r[field];
+			return value === null || value === undefined || value === ""
+				? []
+				: [addEvidence("DS-03", text(r, "code"), field, value, checksEnvelope.meta, checksEndpoint, task.auditEnd)];
+		}),
 	}));
 	for (const field of [
 		"projectId",
@@ -476,21 +488,41 @@ export async function loadAuditReportDataset(
 	const personnelEnvelope = await get("DS-06", personnelEndpoint);
 	const personnelRecord = asRecord(personnelEnvelope.data, personnelEndpoint);
 	const personnelRecordId = `${task.organizationId}-${text(personnelRecord, "asOf")}`;
-	const personnelEvidenceIds = ["employeeCount", "brokerCount", "asOf"].map((field) =>
-		addEvidence(
-			"DS-06",
-			personnelRecordId,
-			field,
-			personnelRecord[field],
-			personnelEnvelope.meta,
-			personnelEndpoint,
-			text(personnelRecord, "asOf"),
-		),
-	);
+	const personnelEvidenceIds = ["employeeCount", "brokerCount", "asOf"]
+		.filter(
+			(field) =>
+				personnelRecord[field] !== null && personnelRecord[field] !== undefined && personnelRecord[field] !== "",
+		)
+		.map((field) =>
+			addEvidence(
+				"DS-06",
+				personnelRecordId,
+				field,
+				personnelRecord[field],
+				personnelEnvelope.meta,
+				personnelEndpoint,
+				text(personnelRecord, "asOf"),
+			),
+		);
+	const employeeCount = personnelRecord.employeeCount;
+	const brokerCount = personnelRecord.brokerCount;
+	const brokerUnknown = brokerCount === null || brokerCount === undefined || brokerCount === "";
+	if (
+		(typeof employeeCount !== "number" && typeof employeeCount !== "string") ||
+		String(employeeCount).trim() === "" ||
+		!Number.isSafeInteger(Number(employeeCount)) ||
+		Number(employeeCount) < 0 ||
+		(!brokerUnknown &&
+			((typeof brokerCount !== "number" && typeof brokerCount !== "string") ||
+				String(brokerCount).trim() === "" ||
+				!Number.isSafeInteger(Number(brokerCount)) ||
+				Number(brokerCount) < 0))
+	)
+		throw new Error("Invalid personnel counts; missing values cannot become zero");
 	const personnel: PersonnelSnapshot = {
 		organizationId: text(personnelRecord, "organizationId"),
 		employeeCount: numberValue(personnelRecord, "employeeCount"),
-		brokerCount: numberValue(personnelRecord, "brokerCount"),
+		...(brokerUnknown ? {} : { brokerCount: Number(brokerCount) }),
 		asOf: text(personnelRecord, "asOf"),
 		evidenceIds: personnelEvidenceIds,
 	};
@@ -555,8 +587,7 @@ export async function loadAuditReportDataset(
 	const findingListEnvelope = await get("DS-03", findingsEndpoint);
 	const currentFindingList = asRecords(findingListEnvelope.data, findingsEndpoint);
 	const previousProjectEndpoint = `/api/audit/projects/previous?organizationId=${encodeURIComponent(task.organizationId)}&before=${encodeURIComponent(task.auditStart)}`;
-	const previousProjectEnvelope =
-		task.reportType === "turnover" ? await get("DS-01", previousProjectEndpoint) : undefined;
+	const previousProjectEnvelope = await get("DS-01", previousProjectEndpoint);
 	const previousProjectRecord =
 		previousProjectEnvelope?.data !== null &&
 		previousProjectEnvelope?.data !== undefined &&
@@ -677,6 +708,10 @@ export async function loadAuditReportDataset(
 			};
 		}
 		const sourceOrder = optionalNumber(record, "sourceOrder");
+		const issueCount =
+			record.issueCount == null || record.issueCount === "" ? undefined : numberValue(record, "issueCount");
+		if (issueCount !== undefined && (!Number.isSafeInteger(issueCount) || issueCount <= 0))
+			throw new Error("Source issueCount must be a positive integer or unknown");
 		const internalSubitems = listValue(record, "internalSubitems");
 		findings.push({
 			findingId,
@@ -687,7 +722,9 @@ export async function loadAuditReportDataset(
 			findingType: text(record, "findingType"),
 			severity: text(record, "severity") as AuditFinding["severity"],
 			title: text(record, "title"),
-			policyBasis: text(record, "policyBasis"),
+			// Some sources embed the policy in factText. Keep the missing dedicated field empty;
+			// never invent a policy or reject the complete raw narrative before semantic organization.
+			policyBasis: text(record, "policyBasis", false),
 			factText: text(record, "factText"),
 			...(optionalText(record, "rawDetail") ? { rawDetail: optionalText(record, "rawDetail") } : {}),
 			...(internalSubitems.length > 0 ? { internalSubitems } : {}),
@@ -701,7 +738,7 @@ export async function loadAuditReportDataset(
 				? { majorConfirmed: booleanValue(record, "majorConfirmed") }
 				: {}),
 			...(sourceOrder === undefined ? {} : { sourceOrder }),
-			issueCount: numberValue(record, "issueCount"),
+			...(issueCount === undefined ? {} : { issueCount }),
 			foundDate: text(record, "foundDate"),
 			status: text(record, "status") as AuditFinding["status"],
 			isHistorical: previousFindingIds.has(findingId),
@@ -1058,11 +1095,9 @@ export async function loadAuditReportDataset(
 	const narrative = asRecord(narrativeEnvelope.data, narrativeEndpoint);
 	for (const field of [
 		"auditProcedures",
-		"internalControlSummary",
 		"managerDutySummary",
 		"previousRectificationSummary",
 		"historicalFindingSummary",
-		"cleanPracticeSummary",
 	] as const) {
 		addEvidence(
 			"DS-10",
@@ -1084,7 +1119,9 @@ export async function loadAuditReportDataset(
 		evidence,
 		trace,
 		false,
+		options.signal,
 	);
+	options.signal?.throwIfAborted();
 
 	return {
 		dataset: {
@@ -1105,11 +1142,12 @@ export async function loadAuditReportDataset(
 			evidence,
 			fixedFacts: {
 				auditProcedures: text(narrative, "auditProcedures"),
-				internalControlSummary: text(narrative, "internalControlSummary"),
+				internalControlSummary: buildControlSummary({ checks, evidence }).text,
 				managerDutySummary: text(narrative, "managerDutySummary"),
 				previousRectificationSummary: text(narrative, "previousRectificationSummary"),
 				historicalFindingSummary: text(narrative, "historicalFindingSummary"),
-				cleanPracticeSummary: text(narrative, "cleanPracticeSummary"),
+				cleanPracticeSummary:
+					task.reportType === "turnover" ? buildCleanPracticeSummary({ checks, evidence }).text : "",
 			},
 		},
 		sourceReadTrace: trace,

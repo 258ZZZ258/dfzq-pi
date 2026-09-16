@@ -3,6 +3,7 @@ export const PACKAGE_NAME = "@dfzq/task-runtime";
 export type {
 	AuditFinding,
 	AuditReportDataset,
+	AuditReportTaskExtension,
 	AuditReportType,
 	EvidenceRecord,
 	LoadAuditReportDatasetOptions,
@@ -29,6 +30,8 @@ export {
 	renderReportMarkdown,
 	scoreReport,
 	scoreStrictReportClaims,
+	toAuditBusinessTaskRecord,
+	toAuditReportTask,
 } from "./audit-report/index.ts";
 export * from "./business-data/index.ts";
 export type { ProviderProfile, RoleBinding } from "./env/provider-profile.ts";

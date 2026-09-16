@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import {
@@ -17,6 +18,7 @@ import type { MemoryScope, MemoryService } from "../memory/service.ts";
 import type { SpecRouter } from "../router/router.ts";
 import type { RunResult } from "../runtime/contract.ts";
 import type { DocumentsClient } from "../runtime/policy-compare/documents-client.ts";
+import { hashState } from "../state/json.ts";
 import type { RunStore } from "../store/contract.ts";
 import { checkInternalToken, INTERNAL_TOKEN_HEADER } from "./middleware/auth.ts";
 import { clampWaitMs, validateSubmitBody } from "./middleware/validate.ts";
@@ -41,6 +43,16 @@ function errorBody(code: string, message: string) {
 
 /** c.set/c.get 需要 Variables 泛型声明,否则 requestId 这一项过不了类型检查。 */
 type AppEnv = { Variables: { requestId: string; grant: Grant | undefined } };
+
+const HOST_OPTIONS = [
+	"resumeFrom",
+	"memoryScope",
+	"authorization",
+	"conversation",
+	"messageId",
+	"interaction",
+	"durableSession",
+];
 
 export function createApp(options: AppOptions): Hono<AppEnv> {
 	const { manager, router, store, internalToken } = options;
@@ -176,6 +188,70 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 		return c.json(items);
 	});
 
+	// Read-only reconciliation: never call manager.submit, even when the key is absent.
+	app.post("/runs/lookup", async (c) => {
+		let raw: unknown;
+		try {
+			raw = await c.req.json();
+		} catch {
+			return c.json(errorBody("malformed_json", "request body is not valid JSON"), 400);
+		}
+		const validated = validateSubmitBody(raw);
+		if (!validated.ok) return c.json(errorBody(validated.error.code, validated.error.message), 422);
+		const body = validated.body;
+		if (body.options && HOST_OPTIONS.some((key) => key in body.options!))
+			return c.json(errorBody("reserved_option", "host controlled options are not accepted"), 422);
+		const grant = c.get("grant");
+		const requestKey = grant ? hashState([grant.tenantId, grant.sub, body.clientRequestId]) : body.clientRequestId;
+		const row = await store.findByClientRequestId(requestKey);
+		if (!row) return c.json(errorBody("not_found", "run not found; absence does not authorize resubmission"), 404);
+		const storedOptions = JSON.parse(row.optionsJson ?? "{}") as RunOptions;
+		if (grant) {
+			if (!row.principalJson || !storedOptions.authorization) throw new AuthorizationError("forbidden");
+			authorize(grant, "run:read", {
+				sessionId: row.sessionId,
+				taskKind: row.taskKind,
+				principal: JSON.parse(row.principalJson) as Principal,
+			});
+			if (grantScopeHash(grant) !== grantScopeHash(storedOptions.authorization))
+				throw new AuthorizationError("forbidden");
+		}
+		if (storedOptions.memoryScope) {
+			const actor = actorScope(c.req.header("x-tenant-id"), c.req.header("x-user-id"));
+			if (
+				!actor ||
+				actor.tenantId !== storedOptions.memoryScope.tenantId ||
+				actor.userId !== storedOptions.memoryScope.userId
+			)
+				throw new AuthorizationError("forbidden");
+		}
+		const clientOptions: Record<string, unknown> = { ...storedOptions };
+		for (const key of HOST_OPTIONS) delete clientOptions[key];
+		const requestedOptions = {
+			...body.options,
+			...(grant
+				? {
+						includeSuperseded:
+							body.options?.includeSuperseded === true && grant.dataScope.includeSuperseded === true,
+					}
+				: {}),
+		};
+		const equal =
+			row.taskKind === body.taskKind &&
+			(row.sessionIdExplicit ?? true) === (body.sessionId !== undefined) &&
+			(body.sessionId === undefined || row.sessionId === body.sessionId) &&
+			row.input === body.input &&
+			isDeepStrictEqual(JSON.parse(row.filtersJson), grant ? constrainFilters(grant, body.filters) : body.filters) &&
+			isDeepStrictEqual(clientOptions, requestedOptions) &&
+			isDeepStrictEqual(row.payloadJson === undefined ? undefined : JSON.parse(row.payloadJson), body.payload);
+		if (!equal)
+			return c.json(
+				errorBody("request_conflict", "request key belongs to different input or authorization scope"),
+				409,
+			);
+		return c.json({ runId: row.runId, status: row.status, clientRequestId: body.clientRequestId }, 200);
+	});
+
 	app.post("/runs", async (c) => {
 		let raw: unknown;
 		try {
@@ -192,18 +268,7 @@ export function createApp(options: AppOptions): Hono<AppEnv> {
 			return c.json(errorBody(validated.error.code, validated.error.message), 422);
 		}
 		const body = validated.body;
-		if (
-			body.options &&
-			[
-				"resumeFrom",
-				"memoryScope",
-				"authorization",
-				"conversation",
-				"messageId",
-				"interaction",
-				"durableSession",
-			].some((key) => key in body.options!)
-		)
+		if (body.options && HOST_OPTIONS.some((key) => key in body.options!))
 			return c.json(errorBody("reserved_option", "resumeFrom and memoryScope are host controlled"), 422);
 		let actor: MemoryScope | undefined;
 		try {

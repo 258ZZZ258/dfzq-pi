@@ -87,6 +87,11 @@ class MemoryRunStore implements RunStore<true> {
 		return row ? cloneRun(row) : undefined;
 	}
 
+	async findByClientRequestId(key: string): Promise<RunRecord | undefined> {
+		const runId = this.runIdByClientRequestId.get(key);
+		return runId ? this.findByRunId(runId) : undefined;
+	}
+
 	async markRunning(runId: string, startedAt: number): Promise<void> {
 		const row = this.requireRun(runId);
 		row.status = "running";

@@ -1,3 +1,4 @@
+import { buildCleanPracticeSummary } from "./report-clean-practice.ts";
 import type {
 	AmlDomainFact,
 	AuditFinding,
@@ -15,6 +16,11 @@ import type {
 	ReportTable,
 	SourceCoverageAssessment,
 } from "./report-contracts.ts";
+import { buildControlSummary } from "./report-control-summary.ts";
+import { isTitleOnlyFact } from "./report-fact-text.ts";
+import { buildFirstAuditSummary } from "./report-first-audit.ts";
+import { buildPerformanceSummary } from "./report-performance.ts";
+import { reportFieldEvidence } from "./report-task-evidence.ts";
 import { businessCheckErrors, workflowErrors } from "./report-workflow.ts";
 
 const sourceStatusWeight: Readonly<Record<DataSourceDefinition["implementationStatus"], number>> = {
@@ -46,19 +52,17 @@ const requiredCapabilities: Readonly<Record<AuditReportType, readonly string[]>>
 		"finding-category",
 		"finding-severity",
 		"finding-count-semantics",
-		"rectification-status",
 		"accountability",
 		"complaints",
 		"lawsuits",
 		"regulatory-events",
 		"lease-area",
 		"template-version",
-		"template-slots",
-		"generation-rules",
 	],
 	turnover: [
 		"audit-project",
 		"audit-period",
+		"previous-audit-project",
 		"workflow-status",
 		"organization-id",
 		"organization-name",
@@ -72,15 +76,12 @@ const requiredCapabilities: Readonly<Record<AuditReportType, readonly string[]>>
 		"finding-id",
 		"finding-detail",
 		"finding-severity",
-		"rectification-status",
 		"accountability",
 		"complaints",
 		"lawsuits",
 		"clean-practice",
 		"performance-ratings",
 		"template-version",
-		"template-slots",
-		"generation-rules",
 	],
 	consultation: [
 		"audit-project",
@@ -96,13 +97,30 @@ const requiredCapabilities: Readonly<Record<AuditReportType, readonly string[]>>
 		"regulatory-letter-entry",
 		"training-materials",
 		"template-version",
-		"template-slots",
-		"generation-rules",
 	],
 };
 
 function unique<T>(values: readonly T[]): T[] {
 	return [...new Set(values)];
+}
+
+/**
+ * A zero-findings statement is an audit conclusion, not an ungrounded template
+ * sentence. For a linked regular report it is proved by the immutable
+ * consultation-effective snapshot; for an unlinked report it is proved by the
+ * completed current-finding query returning zero records.
+ */
+function zeroCurrentFindingEvidenceIds(dataset: AuditReportDataset): string[] {
+	return unique(
+		dataset.evidence
+			.filter(
+				(item) =>
+					item.sourceId === "DS-03" &&
+					["effectiveCurrentFindingCount", "queryReturnedRecordCount"].includes(item.sourceField) &&
+					item.normalizedValue === "0",
+			)
+			.map((item) => item.evidenceId),
+	);
 }
 
 export function normalizeChineseProse(value: string): string {
@@ -160,15 +178,26 @@ function normalizeFindingMatchText(value: string): string {
 }
 
 function findingsRepresentSameProblem(previous: AuditFinding, current: AuditFinding): boolean {
-	if (normalizeFindingMatchText(previous.category) !== normalizeFindingMatchText(current.category)) return false;
-	const previousSubcategory = normalizeFindingMatchText(previous.subcategory);
-	const currentSubcategory = normalizeFindingMatchText(current.subcategory);
-	const previousTitle = normalizeFindingMatchText(previous.title);
-	const currentTitle = normalizeFindingMatchText(current.title);
-	const structurallyAligned =
-		(previousSubcategory.length > 0 && previousSubcategory === currentSubcategory) ||
-		(previousTitle.length > 0 && previousTitle === currentTitle);
-	return structurallyAligned && findingReviewSimilarity(previous, current) >= 0.75;
+	const fact = (record: AuditFinding, other: AuditFinding) => {
+		const policy = record.policyBasis.trim() || other.policyBasis.trim();
+		const text = record.factText.trim();
+		return (policy && text.startsWith(policy) ? text.slice(policy.length) : text).trim();
+	};
+	const left = fact(previous, current);
+	const right = fact(current, previous);
+	// Exact source facts only. Similar headings/policies never prove the defect is identical.
+	return (
+		left.length >= 8 &&
+		!isTitleOnlyFact(left, previous.title) &&
+		!isTitleOnlyFact(right, current.title) &&
+		left === right &&
+		left !== previous.title.trim() &&
+		left !== current.title.trim() &&
+		(previous.policyBasis.trim() === current.policyBasis.trim() ||
+			(!previous.policyBasis.trim() && previous.factText.trim().startsWith(current.policyBasis.trim())) ||
+			(!current.policyBasis.trim() && current.factText.trim().startsWith(previous.policyBasis.trim()))) &&
+		JSON.stringify(previous.internalSubitems ?? []) === JSON.stringify(current.internalSubitems ?? [])
+	);
 }
 
 function bigrams(value: string): Set<string> {
@@ -187,71 +216,78 @@ function textSimilarity(left: string, right: string): number {
 
 function findingReviewSimilarity(previous: AuditFinding, current: AuditFinding): number {
 	if (normalizeFindingMatchText(previous.category) !== normalizeFindingMatchText(current.category)) return 0;
+	// Recover only an exact leading policy already present in the other record.
+	// This is a comparison view, not an inferred policy or a mutation of source facts.
+	const comparisonView = (finding: AuditFinding, other: AuditFinding) => {
+		const explicitPolicy = finding.policyBasis.trim();
+		const otherPolicy = other.policyBasis.trim();
+		const fact = finding.factText.trimStart();
+		if (!explicitPolicy && otherPolicy.length > 0 && fact.startsWith(otherPolicy)) {
+			return { policy: otherPolicy, fact: fact.slice(otherPolicy.length).trimStart() };
+		}
+		return { policy: explicitPolicy, fact };
+	};
+	const previousView = comparisonView(previous, current);
+	const currentView = comparisonView(current, previous);
 	return (
 		textSimilarity(previous.subcategory, current.subcategory) * 0.4 +
 		textSimilarity(previous.title, current.title) * 0.3 +
-		textSimilarity(previous.policyBasis, current.policyBasis) * 0.2 +
-		textSimilarity(previous.factText, current.factText) * 0.1
+		textSimilarity(previousView.policy, currentView.policy) * 0.2 +
+		textSimilarity(previousView.fact, currentView.fact) * 0.1
 	);
 }
 
 export function comparePreviousAuditFindings(findings: readonly AuditFinding[]): PreviousAuditComparison {
 	const previousFindings = findings.filter((finding) => finding.isHistorical);
 	const currentFindings = findings.filter((finding) => !finding.isHistorical);
-	const usedCurrentFindingIds = new Set<string>();
+	const matchedCurrentFindingIds = new Set<string>();
 	const unrectified: PreviousAuditFindingMatch[] = [];
 	const needsReview: PreviousAuditFindingReviewCandidate[] = [];
 	const rectified: AuditFinding[] = [];
 	for (const previous of previousFindings) {
-		const current = currentFindings.find(
-			(candidate) =>
-				!usedCurrentFindingIds.has(candidate.findingId) && findingsRepresentSameProblem(previous, candidate),
-		);
-		if (!current) {
-			const reviewCandidate = currentFindings
-				.filter((candidate) => !usedCurrentFindingIds.has(candidate.findingId))
-				.map((candidate) => ({
-					current: candidate,
-					similarity: findingReviewSimilarity(previous, candidate),
-				}))
-				.filter((candidate) => candidate.similarity >= 0.45)
-				.sort((left, right) => right.similarity - left.similarity)[0];
-			if (reviewCandidate) {
-				usedCurrentFindingIds.add(reviewCandidate.current.findingId);
-				needsReview.push({ previous, ...reviewCandidate });
-			} else {
-				rectified.push(previous);
-			}
-			continue;
+		for (const current of currentFindings) {
+			if (findingsRepresentSameProblem(previous, current)) {
+				unrectified.push({ previous, current });
+				matchedCurrentFindingIds.add(current.findingId);
+			} else needsReview.push({ previous, current, similarity: findingReviewSimilarity(previous, current) });
 		}
-		usedCurrentFindingIds.add(current.findingId);
-		unrectified.push({ previous, current });
 	}
+	needsReview.sort((left, right) => right.similarity - left.similarity);
 	return {
 		previousFindings,
 		currentFindings,
 		unrectified,
 		needsReview,
 		rectified,
-		newFindings: currentFindings.filter((finding) => !usedCurrentFindingIds.has(finding.findingId)),
+		newFindings: currentFindings.filter(
+			(finding) =>
+				!matchedCurrentFindingIds.has(finding.findingId) &&
+				!needsReview.some((pair) => pair.current.findingId === finding.findingId),
+		),
 	};
 }
 
-function previousAuditNarrative(subjectName: string, comparison: PreviousAuditComparison): ReportParagraph | undefined {
+function previousAuditNarrative(
+	dataset: AuditReportDataset,
+	comparison: PreviousAuditComparison,
+): ReportParagraph | undefined {
 	if (comparison.previousFindings.length === 0) return undefined;
+	const subjectName = dataset.task.reportType === "turnover" ? dataset.task.subjectPersonName : undefined;
 	const previousTitles = comparison.previousFindings.map((finding) => finding.title).join("、");
-	const unrectifiedTitles = comparison.unrectified.map(({ previous }) => previous.title).join("、");
-	const reviewTitles = comparison.needsReview.map(({ previous }) => previous.title).join("、");
-	const comparisonConclusion =
-		comparison.unrectified.length === 0 && comparison.needsReview.length === 0
-			? "经与本次审计发现的问题逐项比对，上述问题本次均未再发现，认定为已整改。"
-			: `${unrectifiedTitles ? `其中“${unrectifiedTitles}”问题在本次审计中仍然存在，未有效整改。` : ""}${
-					reviewTitles ? `“${reviewTitles}”与本次问题规则比对未形成确定结论，已转交大模型进行语义一致性判断。` : ""
-				}`;
+	const unrectifiedTitles = unique(comparison.unrectified.map(({ previous }) => previous.title)).join("、");
+	const comparisonConclusion = `${unrectifiedTitles ? `其中“${unrectifiedTitles}”问题在本次审计中仍然存在，未有效整改。` : ""}`;
 	return paragraph(
-		"turnover-historical-findings",
-		`${subjectName}同志任职期内，审计中心上一次对其所在营业部开展审计发现的问题主要包括：${previousTitles}等问题。${comparisonConclusion}`,
+		subjectName === undefined ? "regular-previous-rectification" : "turnover-historical-findings",
+		`${subjectName === undefined ? "前次审计发现的问题主要包括：" : "审计中心上一次对该营业部开展审计发现的问题主要包括："}${previousTitles}等问题。${comparisonConclusion}`,
 		unique([
+			...dataset.evidence
+				.filter(
+					(e) =>
+						e.sourceId === "DS-03" &&
+						e.sourceField === "previousQueryReturnedRecordCount" &&
+						comparison.previousFindings.some((finding) => finding.projectId === e.sourceRecordId),
+				)
+				.map((e) => e.evidenceId),
 			...comparison.previousFindings.flatMap((finding) => finding.evidenceIds),
 			...comparison.unrectified.flatMap(({ current }) => current.evidenceIds),
 			...comparison.needsReview.flatMap(({ current }) => current.evidenceIds),
@@ -263,8 +299,11 @@ function projectEvidenceIds(dataset: AuditReportDataset): string[] {
 	return dataset.evidence
 		.filter(
 			(item) =>
-				item.sourceId === "DS-01" &&
-				(item.sourceRecordId === dataset.task.taskId || item.normalizedValue === dataset.task.projectId),
+				(item.sourceId === "DS-01" &&
+					(item.sourceRecordId === dataset.task.taskId || item.normalizedValue === dataset.task.projectId)) ||
+				(item.sourceId === "DS-03" &&
+					item.sourceRecordId === dataset.task.projectId &&
+					["auditStart", "auditEnd", "auditGroupEstablishedMonth"].includes(item.sourceField)),
 		)
 		.map((item) => item.evidenceId);
 }
@@ -285,7 +324,13 @@ export function assessSourceCoverage(dataset: AuditReportDataset): SourceCoverag
 		...(dataset.task.reportType !== "turnover"
 			? [...requiredCapabilities.regular, ...requiredCapabilities.consultation]
 			: []),
-	]);
+	]).map((capability) =>
+		capability === "performance-ratings" &&
+		dataset.performanceAvailability !== undefined &&
+		buildPerformanceSummary(dataset).errors.length === 0
+			? "performance-availability"
+			: capability,
+	);
 	const capabilitySource = new Map<string, DataSourceDefinition>();
 	for (const source of dataset.sources) {
 		for (const capability of source.providedCapabilities) {
@@ -380,9 +425,12 @@ function riskReadiness(dataset: AuditReportDataset): ReadinessItem {
 function hasCompleteOrganizationOverview(dataset: AuditReportDataset): boolean {
 	return (
 		dataset.organization.address.trim().length > 0 &&
-		!dataset.organization.address.includes("模拟地址") &&
+		Number.isFinite(dataset.organization.areaSquareMeters) &&
 		dataset.organization.areaSquareMeters > 0 &&
-		dataset.personnel.employeeCount >= 0
+		Number.isSafeInteger(dataset.personnel.employeeCount) &&
+		dataset.personnel.employeeCount >= 0 &&
+		(dataset.personnel.brokerCount === undefined ||
+			(Number.isSafeInteger(dataset.personnel.brokerCount) && dataset.personnel.brokerCount >= 0))
 	);
 }
 
@@ -391,7 +439,9 @@ function organizationOverviewText(dataset: AuditReportDataset, includeAppointmen
 		return `${dataset.organization.fullName}机构概况关键字段尚未完整取得，待从机构主数据及人力系统补充核验后生成。`;
 	}
 	const staffingText = `截至审计期末，营业部共有正式员工${dataset.personnel.employeeCount}名${
-		dataset.personnel.brokerCount > 0 ? `，证券经纪人${dataset.personnel.brokerCount}名` : ""
+		dataset.personnel.brokerCount !== undefined && dataset.personnel.brokerCount > 0
+			? `，证券经纪人${dataset.personnel.brokerCount}名`
+			: ""
 	}。`;
 	const appointmentText = includeAppointmentSummary ? `${appointmentSummary(dataset)}。` : "";
 	const constructedOverview = `${dataset.organization.fullName}位于${dataset.organization.address}，营业面积${dataset.organization.areaSquareMeters}平方米。${staffingText}${appointmentText}`;
@@ -411,14 +461,23 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 				? "营业部主数据与任务机构不匹配。"
 				: organizationOverviewComplete
 					? "营业部主数据与任务机构匹配，地址、面积及人员关键字段完整。"
-					: "营业部地址、面积或人员数量未从权威来源完整取得，禁止使用模拟地址或零值生成机构概况。",
+					: "营业部地址不能为空，营业面积必须为正数，员工人数及已提供的经纪人数必须为非负整数；未知经纪人数省略，不能补零。",
 			unique([...dataset.organization.evidenceIds, ...dataset.personnel.evidenceIds]),
 		),
 		readiness(
 			"common.personnel",
-			dataset.personnel.asOf >= dataset.task.auditEnd ? "VERIFIED_VALUE" : "CONFLICTED",
-			dataset.personnel.asOf < dataset.task.auditEnd,
-			"人员快照应覆盖审计期末。",
+			dataset.personnel.asOf === dataset.task.auditEnd ? "VERIFIED_VALUE" : "CONFLICTED",
+			dataset.personnel.asOf !== dataset.task.auditEnd,
+			"人员快照须对应审计期末，不以其他日期代替。",
+			dataset.personnel.evidenceIds,
+		),
+		readiness(
+			"common.broker_count",
+			dataset.personnel.brokerCount === undefined ? "MISSING" : "VERIFIED_VALUE",
+			false,
+			dataset.personnel.brokerCount === undefined
+				? "经纪人数未提供，正文不生成其人数或无人员结论。"
+				: "已取得经纪人数。",
 			dataset.personnel.evidenceIds,
 		),
 		readiness(
@@ -521,9 +580,28 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 
 	const coverage = assessSourceCoverage(dataset);
 	const blockers = items.filter((item) => item.blocking).map((item) => `${item.fieldId}: ${item.message}`);
-	blockers.push(...workflowErrors(dataset.task), ...businessCheckErrors(dataset));
-	if (dataset.task.reportType === "turnover") {
+	blockers.push(
+		...workflowErrors(dataset.task),
+		...businessCheckErrors(dataset),
+		...buildControlSummary(dataset).errors,
+		...buildPerformanceSummary(dataset).errors,
+		...buildFirstAuditSummary(dataset).errors,
+		...(dataset.task.reportType === "turnover" ? buildCleanPracticeSummary(dataset).errors : []),
+	);
+	if (dataset.task.reportType === "turnover" || dataset.findings.some((finding) => finding.isHistorical)) {
 		const previousAuditComparison = comparePreviousAuditFindings(dataset.findings);
+		if (previousAuditComparison.previousFindings.length > 0 && previousAuditComparison.currentFindings.length === 0)
+			blockers.push("前次审计存在问题，但本次列表为空；须核验本次查询及检查覆盖后才能作出整改判断。");
+		for (const finding of previousAuditComparison.previousFindings) {
+			const policy = finding.policyBasis.trim();
+			const text = finding.factText.trim();
+			const fact = policy && text.startsWith(policy) ? text.slice(policy.length) : text;
+			if ([fact, ...(finding.internalSubitems ?? [])].every((part) => isTitleOnlyFact(part, finding.title))) {
+				blockers.push(
+					`历史问题 ${finding.findingId}（${finding.title}）缺少具体事实，不能仅凭问题标题判断整改情况。`,
+				);
+			}
+		}
 		const narrativeClaimsPreviousAudit = /历次审计发现的问题主要包括|上一次审计发现的问题主要包括/u.test(
 			dataset.fixedFacts.historicalFindingSummary,
 		);
@@ -534,6 +612,8 @@ export function buildFactPack(dataset: AuditReportDataset): ReportFactPack {
 		}
 	}
 	const warnings: string[] = [];
+	if (dataset.personnel.brokerCount === undefined)
+		warnings.push("经纪人数未提供，已省略人数短语；不代表经纪人数为零。");
 	if (coverage.missingCapabilities.length > 0) {
 		warnings.push(`数据源仍缺少能力：${coverage.missingCapabilities.join("、")}`);
 	}
@@ -594,12 +674,19 @@ function appointmentWindow(dataset: AuditReportDataset): { start?: string; end?:
 	return { start, end };
 }
 
+function actingAppointmentSentence(record: AuditReportDataset["appointments"][number], title: string): string {
+	// A title such as 代负责人 already carries the acting role. Preserve that
+	// official title rather than prefixing it with a second acting expression.
+	const verb = /(?:代理|代)(?:负责人|总经理|副总经理)(?:职务)?$/u.test(title) ? "任" : "代为履行";
+	return `${record.personName}同志${verb}${title}`;
+}
+
 function appointmentSentence(record: AuditReportDataset["appointments"][number]): string {
 	const title = (record.fullTitle ?? record.title).replace(/[。；;]+$/u, "").trim();
 	if (record.action === "appoint") return `聘任${record.personName}同志为${title}`;
-	if (record.action === "acting") return `${record.personName}同志代为履行${title}`;
+	if (record.action === "acting") return actingAppointmentSentence(record, title);
 	if (record.action === "transfer") return `调任${record.personName}同志为${title}`;
-	return `免去${record.personName}同志的${title.replace(/职务$/u, "")}`;
+	return `免去${record.personName}同志的${title.replace(/职务$/u, "")}职务`;
 }
 
 function subjectRole(dataset: AuditReportDataset): string {
@@ -685,10 +772,7 @@ function rankingParticipantNote(metrics: readonly OperatingMetric[]): string {
 	if (periods.length === 0 || participants.some((value) => value === undefined)) {
 		return "备注：上述排名剔除已撤销营业部。";
 	}
-	const firstPeriod = periods[0] ?? "";
-	const lastPeriod = periods.at(-1) ?? "";
-	const lastDisplay = lastPeriod.replace(/年1[-—]9月/u, "年9月");
-	return `备注：上述排名剔除已撤销营业部。${firstPeriod}-${lastDisplay}，参与排名的营业部年度家数分别为${participants.join("、")}。`;
+	return `备注：上述排名剔除已撤销营业部。${periods.join("、")}，参与排名的营业部家数分别为${participants.join("、")}。`;
 }
 
 function operatingNarrative(dataset: AuditReportDataset, pack: ReportFactPack): string {
@@ -700,38 +784,65 @@ function operatingNarrative(dataset: AuditReportDataset, pack: ReportFactPack): 
 		"other_revenue",
 	];
 	const revenueMetrics = dataset.operatingMetrics.filter((metric) => revenueCodes.includes(metric.metricCode));
+	const latestPeriod = dataset.operatingMetrics[0]?.points.at(-1)?.period;
 	const latestRevenue = revenueMetrics
-		.map((metric) => ({ metric, value: metric.points.at(-1)?.value ?? 0 }))
+		.map((metric) => ({ metric, value: metric.points.find((point) => point.period === latestPeriod)?.value }))
+		.filter((item): item is { metric: OperatingMetric; value: number } => item.value !== undefined)
 		.sort((a, b) => b.value - a.value)[0];
-	const primary = latestRevenue?.metric.reportLabel.replace(/^其中：/u, "");
+	const primary =
+		revenueCodes.every((code) =>
+			revenueMetrics.some(
+				(metric) => metric.metricCode === code && metric.points.some((point) => point.period === latestPeriod),
+			),
+		) &&
+		latestRevenue &&
+		latestRevenue.value > 0 &&
+		revenueMetrics.filter(
+			(metric) => metric.points.find((point) => point.period === latestPeriod)?.value === latestRevenue.value,
+		).length === 1
+			? latestRevenue.metric.reportLabel.replace(/^其中：/u, "")
+			: undefined;
 	const clientAssets = dataset.operatingMetrics.find((metric) => metric.metricCode === "client_assets");
 	const stockFund = dataset.operatingMetrics.find((metric) => metric.metricCode === "stock_fund_volume");
-	const increasing = (metric: OperatingMetric | undefined): boolean =>
-		(metric?.points.length ?? 0) >= 2 &&
-		(metric?.points.every((point, index, values) => index === 0 || point.value >= (values[index - 1]?.value ?? 0)) ??
-			false);
-	const decreasing = (metric: OperatingMetric | undefined): boolean =>
-		(metric?.points.length ?? 0) >= 2 &&
-		(metric?.points.every((point, index, values) => index === 0 || point.value <= (values[index - 1]?.value ?? 0)) ??
-			false);
-	const trend = (metric: OperatingMetric | undefined): string => {
-		if (increasing(metric)) return "逐年增长";
-		if (decreasing(metric)) return "总体下降";
-		return "";
+	const describe = (metric: OperatingMetric | undefined): string | undefined => {
+		if (!metric) return undefined;
+		const label = metric.reportLabel.replace(/（.*?）/gu, "");
+		const annual = metric.points
+			.filter((point) => /^\d{4}年?$/.test(point.period))
+			.slice()
+			.sort((a, b) => Number(a.period.slice(0, 4)) - Number(b.period.slice(0, 4)));
+		const consecutive =
+			annual.length >= 2 &&
+			annual.every(
+				(point, index) =>
+					index === 0 || Number(point.period.slice(0, 4)) === Number(annual[index - 1]!.period.slice(0, 4)) + 1,
+			);
+		if (consecutive) {
+			const changes = annual.slice(1).map((point, index) => point.value - annual[index]!.value);
+			const trend = changes.every((change) => change > 0)
+				? "逐年增长"
+				: changes.every((change) => change < 0)
+					? "逐年下降"
+					: changes.every((change) => change === 0)
+						? "保持不变"
+						: "有所波动";
+			return `${annual[0]!.period.slice(0, 4)}年至${annual.at(-1)!.period.slice(0, 4)}年${label}${trend}`;
+		}
+		const point = metric.points.at(-1);
+		return point ? `${point.period}${label}为${point.value}${metric.unit}` : undefined;
 	};
 	const bands = unique(pack.derivedRanks.map((rank) => rank.band));
 	const bandText =
-		bands.includes("中下游") && bands.includes("中游")
+		bands.length === 2 && bands.includes("中下游") && bands.includes("中游")
 			? "中游至中下游"
 			: bands.length > 0
 				? bands.join("、")
 				: undefined;
 	const statements: string[] = [];
-	if (primary) statements.push(`财务指标方面，营业部以${primary}为主要收入来源`);
-	const trendStatements = [
-		clientAssets ? `客户资产规模${trend(clientAssets) || "详见上表"}` : undefined,
-		stockFund ? `股基交易量${trend(stockFund) || "详见上表"}` : undefined,
-	].filter((item): item is string => item !== undefined);
+	if (primary) statements.push(`财务指标方面，${latestPeriod}营业部以${primary}为主要收入来源`);
+	const trendStatements = [describe(clientAssets), describe(stockFund)].filter(
+		(item): item is string => item !== undefined,
+	);
 	if (trendStatements.length > 0) statements.push(`业绩指标方面，${trendStatements.join("，")}`);
 	if (bandText) statements.push(`从指标排名情况来看，营业部各项指标排名基本处于公司所有营业部${bandText}水平`);
 	if (statements.length === 0) {
@@ -745,20 +856,7 @@ function operatingNarrative(dataset: AuditReportDataset, pack: ReportFactPack): 
 }
 
 function turnoverOperatingNarrative(dataset: AuditReportDataset, pack: ReportFactPack, subjectName: string): string {
-	const netProfit = dataset.operatingMetrics.find((metric) => metric.metricCode === "net_profit");
-	const fullYearProfitPoints = netProfit?.points.filter((point) => !point.period.includes("月")) ?? [];
-	const profitText =
-		fullYearProfitPoints.length > 0 && fullYearProfitPoints.every((point) => point.value > 0)
-			? "各已覆盖完整年度均实现盈利，"
-			: "";
-	const bands = unique(pack.derivedRanks.map((rank) => rank.band));
-	const bandText =
-		bands.includes("中下游") && bands.includes("中游")
-			? "中游至中下游"
-			: bands.length > 0
-				? bands.join("、")
-				: "待确认";
-	return `${subjectName}同志任职期内，营业部${profitText}以代理买卖证券业务净收入为主要收入来源。完整年度各项业绩指标总体有所波动，整体排名处于公司所有营业部${bandText}水平。`;
+	return operatingNarrative(dataset, pack).replace(/^审计期内，/u, `${subjectName}同志任职期内，`);
 }
 
 function appointmentSummary(dataset: AuditReportDataset): string {
@@ -769,7 +867,7 @@ function appointmentSummary(dataset: AuditReportDataset): string {
 				return `${record.personName}同志自${yearMonth(record.startDate)}至${yearMonth(record.endDate)}任${record.title}`;
 			}
 			if (record.action === "acting") {
-				return `${yearMonth(record.startDate)}，${record.personName}同志代为履行${record.title}`;
+				return `${yearMonth(record.startDate)}，${actingAppointmentSentence(record, record.title.trim())}`;
 			}
 			return `${yearMonth(record.startDate)}，${appointmentSentence(record)}`;
 		})
@@ -803,7 +901,14 @@ function riskParagraphs(dataset: AuditReportDataset): ReportParagraph[] {
 	for (const event of dataset.riskEvents) {
 		if (event.state === "VERIFIED_VALUE" && event.description) {
 			paragraphs.push(
-				paragraph(`risk-${event.eventId}`, event.regularDescription ?? event.description, event.evidenceIds, true),
+				paragraph(
+					`risk-${event.eventId}`,
+					(dataset.task.reportType === "turnover" ? event.turnoverDescription : event.regularDescription) ??
+						event.regularDescription ??
+						event.description,
+					event.evidenceIds,
+					true,
+				),
 			);
 		}
 	}
@@ -833,7 +938,8 @@ function findingSubsections(findings: readonly AuditFinding[]): ReportSubsection
 					finding.evidenceIds,
 				),
 			);
-			paragraphs.push(paragraph(`finding-${finding.findingId}-policy`, finding.policyBasis, finding.evidenceIds));
+			if (finding.policyBasis.trim())
+				paragraphs.push(paragraph(`finding-${finding.findingId}-policy`, finding.policyBasis, finding.evidenceIds));
 			paragraphs.push(paragraph(`finding-${finding.findingId}-fact`, finding.factText, finding.evidenceIds, true));
 			for (const [subitemIndex, subitem] of nonDuplicativeSubitems(finding).entries()) {
 				paragraphs.push(
@@ -857,7 +963,9 @@ function amlFindingSubsections(findings: readonly AuditFinding[]): ReportSubsect
 	return findings.map((finding, index) => ({
 		heading: `${categoryNumerals[index] ?? `（${index + 1}）`}${finding.title}`,
 		paragraphs: [
-			paragraph(`finding-${finding.findingId}-policy`, finding.policyBasis, finding.evidenceIds),
+			...(finding.policyBasis.trim()
+				? [paragraph(`finding-${finding.findingId}-policy`, finding.policyBasis, finding.evidenceIds)]
+				: []),
 			paragraph(`finding-${finding.findingId}-fact`, finding.factText, finding.evidenceIds, true),
 			...nonDuplicativeSubitems(finding).map((subitem, subitemIndex) =>
 				paragraph(`finding-${finding.findingId}-subitem-${subitemIndex + 1}`, subitem, finding.evidenceIds, true),
@@ -872,16 +980,17 @@ function amlRiskClassificationNarrative(aml: NonNullable<AuditReportDataset["aml
 	const periodicTotal = aml.periodicReviewRecords.reduce((sum, record) => sum + record.sampleCount, 0);
 	const periodicExceptions = aml.periodicReviewRecords.reduce((sum, record) => sum + record.exceptionCount, 0);
 	const newAccountSentence =
-		newAccountExceptions > 0
-			? `营业部基本能够按照公司规定完成新开户客户的风险等级划分工作，但审计期内尚存在${newAccountExceptions}笔划分不及时的情况。`
-			: "营业部能够按照公司规定完成新开户客户的风险等级划分工作。";
+		newAccountTotal > 0
+			? `抽查${newAccountTotal}笔新开户客户风险等级划分记录，${newAccountExceptions > 0 ? `其中${newAccountExceptions}笔未在规定期限内完成风险等级划分` : "未发现风险等级划分超期的情况"}。`
+			: "新开户客户风险等级划分记录未返回可核验样本。";
+	const periodicScope = aml.periodicReviewRecords.every((record) => record.riskLevel.trim() === "高风险")
+		? "高风险客户"
+		: "客户";
 	const periodicSentence =
-		periodicExceptions > 0
-			? `营业部基本按规定对不同风险等级客户开展定期审核并记录审核结果，但抽查${periodicTotal}笔高风险客户定期审核记录，发现${periodicExceptions}笔未在规定期限内完成。`
-			: "营业部按规定对不同风险等级客户开展定期审核工作，并记录审核结果。";
-	return `${newAccountSentence}${periodicSentence}${
-		newAccountTotal > 0 ? "" : "新开户客户风险等级划分记录未返回可核验样本。"
-	}`;
+		periodicTotal > 0
+			? `抽查${periodicTotal}笔${periodicScope}定期审核记录，${periodicExceptions > 0 ? `其中${periodicExceptions}笔未在规定期限内完成` : "未发现定期审核超期的情况"}。`
+			: "客户定期审核记录未返回可核验样本。";
+	return `${newAccountSentence}${periodicSentence}`;
 }
 
 function amlLetterNarrative(aml: NonNullable<AuditReportDataset["aml"]>): string {
@@ -963,26 +1072,57 @@ function opinionSubsections(categories: readonly string[]): ReportSubsection[] {
 	}));
 }
 
+function emptyPreviousAuditNarrative(dataset: AuditReportDataset): ReportParagraph | undefined {
+	const firstAudit = buildFirstAuditSummary(dataset);
+	if (firstAudit.errors.length) return undefined;
+	if (firstAudit.text)
+		return paragraph(
+			dataset.task.reportType === "turnover" ? "turnover-historical-findings" : "regular-previous-rectification",
+			firstAudit.text,
+			firstAudit.evidenceIds,
+		);
+	const proofs = dataset.evidence.filter(
+		(e) => e.sourceId === "DS-03" && e.sourceField === "previousQueryReturnedRecordCount",
+	);
+	const proof = proofs[0];
+	if (
+		proofs.length !== 1 ||
+		!proof ||
+		proof.rawValue !== "0" ||
+		proof.normalizedValue !== "0" ||
+		!proof.sourceRecordId ||
+		!proof.dataVersion ||
+		dataset.findings.some((f) => f.isHistorical)
+	)
+		return undefined;
+	return paragraph(
+		dataset.task.reportType === "turnover" ? "turnover-historical-findings" : "regular-previous-rectification",
+		"前次审计问题台账查询返回0条记录。",
+		[proof.evidenceId],
+	);
+}
+
 function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraft {
+	const performance = buildPerformanceSummary(dataset);
+	const previousParagraph =
+		previousAuditNarrative(dataset, comparePreviousAuditFindings(dataset.findings)) ??
+		emptyPreviousAuditNarrative(dataset);
 	const findings = dataset.findings.filter((finding) => pack.disclosedFindingIds.includes(finding.findingId));
+	const noCurrentFindingEvidenceIds = findings.some((finding) => !finding.isHistorical)
+		? []
+		: zeroCurrentFindingEvidenceIds(dataset);
 	const hasMajor =
 		findings.some((finding) => finding.severity === "重大" || finding.majorConfirmed) ||
 		dataset.aml?.majorMatters.some((matter) => matter.confirmedMajor);
 	const findingCategories = unique(findings.map((finding) => finding.category));
 	const periods = dataset.operatingMetrics[0]?.points.map((point) => point.period) ?? [];
-	const regularPeriodEnd = (periods.at(-1) ?? "审计期末").replace(/年1[-—]9月/u, "年9月");
 	const overviewText = organizationOverviewText(dataset, true);
-	const internalControlText = /^经审计[，,]/u.test(dataset.fixedFacts.internalControlSummary)
-		? dataset.fixedFacts.internalControlSummary
-		: `经审计，${dataset.fixedFacts.internalControlSummary}`;
+	const controlSummary = buildControlSummary(dataset);
 	const internalControlParagraphs = [
 		paragraph(
 			"regular-internal-control",
-			internalControlText,
-			unique([
-				...dataset.organization.evidenceIds,
-				...sourceFieldEvidenceIds(dataset, "DS-10", "internalControlSummary"),
-			]),
+			controlSummary.text || "内部控制检查结果或依据尚未完整取得。",
+			controlSummary.evidenceIds,
 		),
 		...riskParagraphs(dataset),
 	];
@@ -1009,7 +1149,7 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 					paragraphs: [
 						paragraph(
 							"regular-operating-period",
-							`营业部${periods[0] ?? "相关期间"}-${regularPeriodEnd}主要经营情况详见下表：`,
+							`营业部${periods.join("、") || "相关期间"}主要经营情况详见下表：`,
 							collectMetricEvidence(dataset.operatingMetrics),
 						),
 						paragraph(
@@ -1031,10 +1171,19 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 					paragraphs: [
 						paragraph(
 							"regular-manager-duty",
-							dataset.fixedFacts.managerDutySummary,
+							`${dataset.fixedFacts.managerDutySummary}${performance.text}`,
 							unique([
 								...dataset.appointments.flatMap((record) => record.evidenceIds),
 								...sourceFieldEvidenceIds(dataset, "DS-10", "managerDutySummary"),
+								...dataset.evidence
+									.filter(
+										(e) =>
+											e.sourceId === "DS-03" &&
+											e.sourceField === "summary" &&
+											e.fileLocation?.startsWith("database:audit_subject_evaluation/"),
+									)
+									.map((e) => e.evidenceId),
+								...performance.evidenceIds,
 							]),
 							true,
 						),
@@ -1043,14 +1192,15 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 				{
 					heading: "（五）前次审计整改情况",
 					paragraphs: [
-						paragraph(
-							"regular-previous-rectification",
-							dataset.fixedFacts.previousRectificationSummary,
-							unique([
-								...findings.filter((finding) => finding.isRepeat).flatMap((finding) => finding.evidenceIds),
-								...sourceFieldEvidenceIds(dataset, "DS-10", "previousRectificationSummary"),
-							]),
-						),
+						previousParagraph ??
+							paragraph(
+								"regular-previous-rectification",
+								dataset.fixedFacts.previousRectificationSummary,
+								unique([
+									...findings.filter((finding) => finding.isRepeat).flatMap((finding) => finding.evidenceIds),
+									...sourceFieldEvidenceIds(dataset, "DS-10", "previousRectificationSummary"),
+								]),
+							),
 					],
 				},
 			],
@@ -1065,7 +1215,7 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 							? `从本次审计情况看，营业部在${findingCategories.join("、")}等内部控制方面存在一般缺陷，主要包括以下问题：`
 							: `从本次审计情况看，营业部在${findingCategories.join("、")}等方面存在以下问题：`
 						: "在本次审计范围内，未发现需列示的问题。",
-					findings.flatMap((finding) => finding.evidenceIds),
+					findings.length ? findings.flatMap((finding) => finding.evidenceIds) : noCurrentFindingEvidenceIds,
 				),
 			],
 			tables: [],
@@ -1081,7 +1231,7 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 							? `本次审计发现${dataset.organization.fullName}在${findingCategories.join("、")}等方面存在问题，应根据上述问题事实及其重要程度采取整改措施，进一步完善业务管理。`
 							: `经审计，未发现${dataset.organization.fullName}经营活动及内部控制存在重大违法违规事项或重大内控缺陷。本次审计发现的问题反映出营业部在${findingCategories.join("、")}等方面工作中，相关人员对规章制度的理解不到位，操作流程执行不规范，业务管理上应进一步完善。`
 						: `在本次审计范围内，未发现${dataset.organization.fullName}需列示的问题。建议持续落实内部控制要求。`,
-					findings.flatMap((finding) => finding.evidenceIds),
+					findings.length ? findings.flatMap((finding) => finding.evidenceIds) : noCurrentFindingEvidenceIds,
 					true,
 				),
 				...(findings.length
@@ -1111,7 +1261,7 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 		addressee: `${dataset.organization.fullName}：`,
 		introduction: paragraph(
 			"regular-introduction",
-			`按照审计工作安排，审计中心于${dataset.task.auditGroupEstablishedMonth}成立审计组，对你单位${chineseDateRange(dataset.task.auditStart, dataset.task.auditEnd)}期间（以下简称“审计期”）经营活动和内部控制的适当性、合法性和有效性等情况进行了审计。审计组依据相关监管规定及公司制度要求，${dataset.fixedFacts.auditProcedures}${dataset.task.workflow?.mode === "linked" && workflowErrors(dataset.task).length === 0 ? "审计工作结束后，审计中心向你单位发出了《审计征求意见书》，并得到了确认和反馈。" : ""}现出具报告如下：`,
+			`按照审计工作安排，审计中心于${dataset.task.auditGroupEstablishedMonth}${dataset.task.reportType === "regular" ? "派出" : "成立"}审计组，对你单位${chineseDateRange(dataset.task.auditStart, dataset.task.auditEnd)}期间（以下简称“审计期”）经营活动和内部控制的适当性、合法性和有效性等情况进行了审计。审计组依据相关监管规定及公司制度要求，${dataset.fixedFacts.auditProcedures}${dataset.task.workflow?.mode === "linked" && workflowErrors(dataset.task).length === 0 ? "审计工作结束后，审计中心向你单位发出了《审计征求意见书》，并得到了确认和反馈。" : ""}现出具报告如下。`,
 			unique([...projectEvidenceIds(dataset), ...sourceFieldEvidenceIds(dataset, "DS-10", "auditProcedures")]),
 		),
 		sections,
@@ -1129,14 +1279,17 @@ function regularDraft(dataset: AuditReportDataset, pack: ReportFactPack): Report
 }
 
 function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraft {
+	const performance = buildPerformanceSummary(dataset);
+	const controlSummary = buildControlSummary(dataset);
+	const cleanPractice = buildCleanPracticeSummary(dataset);
 	const subjectName = dataset.task.subjectPersonName ?? "被审计人员";
-	const subjectId = dataset.task.subjectPersonId;
 	const appointments = subjectAppointments(dataset);
 	const role = subjectRole(dataset);
 	const sourcedAppointmentWindow = appointmentWindow(dataset);
 	const currentFindings = dataset.findings.filter((finding) => pack.disclosedFindingIds.includes(finding.findingId));
 	const previousAuditComparison = comparePreviousAuditFindings(dataset.findings);
-	const historicalFindingsParagraph = previousAuditNarrative(subjectName, previousAuditComparison);
+	const historicalFindingsParagraph =
+		previousAuditNarrative(dataset, previousAuditComparison) ?? emptyPreviousAuditNarrative(dataset);
 	const currentCategories = unique(currentFindings.map((finding) => finding.category));
 	const appointmentParagraphs = appointments.map((record, index) =>
 		paragraph(
@@ -1150,16 +1303,6 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 	const accountability = dataset.riskEvents.find(
 		(event) => event.type === "accountability" && event.state === "VERIFIED_VALUE",
 	);
-	const subjectPerformance = dataset.performance
-		.filter((record) => record.personId === subjectId)
-		.slice()
-		.sort((left, right) => Number(left.year) - Number(right.year));
-	const firstPerformanceYear = String(subjectPerformance.at(0)?.year ?? "");
-	const lastPerformanceYear = String(subjectPerformance.at(-1)?.year ?? "");
-	const performancePeriod =
-		firstPerformanceYear === lastPerformanceYear
-			? firstPerformanceYear
-			: `${firstPerformanceYear}-${lastPerformanceYear}`;
 	const exceptionConclusion =
 		previousAuditComparison.unrectified.length > 0
 			? "但历次审计发现的问题较多，且个别问题未得到有效整改，营业部合规与风险管理水平有待进一步加强。"
@@ -1194,7 +1337,7 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 					paragraphs: [
 						paragraph(
 							"turnover-operating-period",
-							`${subjectName}同志任职期内，营业部近年主要经营情况详见下表：`,
+							`${subjectName}同志任职期内，营业部${dataset.operatingMetrics[0]?.points.map((point) => point.period).join("、") || "相关期间"}主要经营情况详见下表：`,
 							collectMetricEvidence(dataset.operatingMetrics),
 						),
 						paragraph(
@@ -1210,19 +1353,21 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 					paragraphs: [
 						paragraph(
 							"turnover-internal-control",
-							`${subjectName}同志任职期内，其所在营业部岗位设置符合内部控制基本要求，并在业务运行过程中基本落实了不相容职务分离控制、授权审批控制、财产保护控制、预算控制等内部控制措施。从审计情况结合各相关职能部门提供信息来看，其所在营业部未发现重大异常，未发生重大信息安全事故、重大突发事件、未决诉讼、未了结客户投诉等事项。`,
-							unique([
-								...dataset.organization.evidenceIds,
-								...dataset.riskEvents.flatMap((event) => event.evidenceIds),
-								...sourceFieldEvidenceIds(dataset, "DS-10", "internalControlSummary"),
-							]),
+							controlSummary.text || "内部控制检查结果或依据尚未完整取得。",
+							controlSummary.evidenceIds,
 							true,
 						),
+						...riskParagraphs({
+							...dataset,
+							riskEvents: dataset.riskEvents.filter((event) => event !== accountability),
+						}),
 						...(accountability?.description
 							? [
 									paragraph(
 										"turnover-accountability",
-										accountability.turnoverDescription ?? accountability.description,
+										accountability.turnoverDescription ??
+											accountability.regularDescription ??
+											accountability.description,
 										accountability.evidenceIds,
 										true,
 									),
@@ -1235,8 +1380,8 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 					paragraphs: [
 						paragraph(
 							"turnover-clean-practice",
-							`${subjectName}同志任职期内，基本能够贯彻执行国家有关证券市场发展的方针政策，遵守《证券法》《证券公司内部控制指引》《证券经纪业务管理办法》等法律法规以及证券业务规则，执行廉洁从业规定，支持监查员履职，开展廉洁风险防控工作，公司未受理或办理过涉及${subjectName}同志个人的信访及案件，审计组未发现其个人及其所在营业部存在重大违法违规事项。`,
-							unique([...sourceFieldEvidenceIds(dataset, "DS-10", "cleanPracticeSummary")]),
+							cleanPractice.text || "廉洁从业及信访案件检查结果或依据尚未完整取得。",
+							cleanPractice.evidenceIds,
 							true,
 						),
 					],
@@ -1246,10 +1391,8 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 					paragraphs: [
 						paragraph(
 							"turnover-performance",
-							`${performancePeriod}年度，公司对${subjectName}同志绩效考核结果分别为${subjectPerformance
-								.map((record) => record.rating)
-								.join("、")}。`,
-							subjectPerformance.flatMap((record) => record.evidenceIds),
+							performance.text || "负责人年度绩效考核记录或依据尚未完整取得。",
+							performance.evidenceIds,
 						),
 					],
 				},
@@ -1274,10 +1417,7 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 				paragraph(
 					"turnover-conclusion",
 					conclusionText,
-					unique([
-						...currentFindings.flatMap((finding) => finding.evidenceIds),
-						...sourceFieldEvidenceIds(dataset, "DS-10", "internalControlSummary"),
-					]),
+					unique([...currentFindings.flatMap((finding) => finding.evidenceIds), ...controlSummary.evidenceIds]),
 					true,
 				),
 			],
@@ -1293,7 +1433,7 @@ function turnoverDraft(dataset: AuditReportDataset, pack: ReportFactPack): Repor
 		titleLines: [`${dataset.organization.fullName}${role}`, `${subjectName}同志离任审计报告`],
 		introduction: paragraph(
 			"turnover-introduction",
-			`根据财富管理委员会委托，审计中心于${dataset.task.auditGroupEstablishedMonth}成立审计组，对${dataset.organization.fullName}${role}${subjectName}同志自${chineseDateRange(sourcedAppointmentWindow.start ?? dataset.task.auditStart, sourcedAppointmentWindow.end ?? dataset.task.auditEnd)}期间（以下简称“任职期”）的履职情况进行了审计。审计组依据相关监管规定及公司制度要求，${dataset.fixedFacts.auditProcedures}审计工作结束后，审计中心向${subjectName}同志发出了离任审计报告征求意见稿，并收到其对征求意见稿的确认和反馈。现出具报告如下：`,
+			`根据财富管理委员会委托，审计中心于${dataset.task.auditGroupEstablishedMonth}成立审计组，对${dataset.organization.fullName}${role}${subjectName}同志自${chineseDateRange(sourcedAppointmentWindow.start ?? dataset.task.auditStart, sourcedAppointmentWindow.end ?? dataset.task.auditEnd)}期间（以下简称“任职期”）的履职情况进行了审计。审计组依据相关监管规定及公司制度要求，${dataset.fixedFacts.auditProcedures}现出具报告如下：`,
 			unique([
 				...projectEvidenceIds(dataset),
 				...appointments.flatMap((record) => record.evidenceIds),
@@ -1433,8 +1573,8 @@ function amlDraft(dataset: AuditReportDataset, pack: ReportFactPack): ReportDraf
 		addressee: `${dataset.organization.fullName}：`,
 		introduction: paragraph(
 			"aml-introduction",
-			`按照审计工作安排，审计中心于${dataset.task.auditGroupEstablishedMonth}成立审计组，对你单位${chineseDateRange(dataset.task.auditStart, dataset.task.auditEnd)}期间（以下简称“审计期”）反洗钱工作情况进行了审计，${dataset.fixedFacts.auditProcedures}检查内容包括内控机制建设、客户身份识别、客户风险分类管理、大额交易和可疑交易报告、客户身份资料和交易记录保存、培训与宣传等情况。现出具报告如下：`,
-			unique([...projectEvidenceIds(dataset), ...sourceFieldEvidenceIds(dataset, "DS-10", "auditProcedures")]),
+			`按照审计工作安排，审计中心于${dataset.task.auditGroupEstablishedMonth}派出审计组，对${dataset.organization.fullName}${chineseDateRange(dataset.task.auditStart, dataset.task.auditEnd)}期间（以下简称“审计期”）反洗钱工作进行了审计，检查内容主要包括内控机制建设、客户身份识别、客户风险分类管理、大额交易和可疑交易报告、客户身份资料和交易记录保存、培训与宣传等方面。现出具报告如下。`,
+			unique([...projectEvidenceIds(dataset), ...dataset.organization.evidenceIds]),
 		),
 		sections,
 		closingOrganization: dataset.task.closingOrganization,
@@ -1462,11 +1602,11 @@ export function generateReportDraft(dataset: AuditReportDataset, pack = buildFac
 			reportType: "consultation",
 			workflow: dataset.task.workflow,
 			titleLines: [dataset.organization.fullName, "审计征求意见书"],
-			introduction: {
-				...draft.introduction,
-				paragraphId: "consultation-introduction",
-				text: draft.introduction.text.replace("现出具报告如下：", "现就以下审计情况征求你单位意见："),
-			},
+			introduction: paragraph(
+				"consultation-introduction",
+				`按照审计工作安排，审计中心于${dataset.task.auditGroupEstablishedMonth}成立审计组，对你单位${chineseDateRange(dataset.task.auditStart, dataset.task.auditEnd)}期间（以下简称“审计期”）经营活动和内部控制的适当性、合法性和有效性等情况进行了审计。现就相关情况征求你单位意见：`,
+				projectEvidenceIds(dataset),
+			),
 			sections: [
 				...draft.sections.slice(0, 2),
 				{
@@ -1476,8 +1616,16 @@ export function generateReportDraft(dataset: AuditReportDataset, pack = buildFac
 					paragraphs: [
 						paragraph(
 							"consultation-feedback",
-							`${dataset.task.workflow?.feedbackRequirement ?? "反馈及整改计划要求待补充。"}${deadline ? `请于${chineseFullDate(deadline)}前反馈书面意见及整改计划。` : "反馈期限待补充。"}`,
-							projectEvidenceIds(dataset),
+							`${dataset.task.workflow?.feedbackRequirement ?? "反馈及整改计划要求待补充。"}${deadline ? `反馈截止日期为${chineseFullDate(deadline)}。` : "反馈期限待补充。"}`,
+							unique([
+								...projectEvidenceIds(dataset),
+								...reportFieldEvidence(
+									dataset,
+									"feedbackRequirement",
+									dataset.task.workflow?.feedbackRequirement ?? "",
+								),
+								...(deadline ? reportFieldEvidence(dataset, "feedbackDeadline", deadline) : []),
+							]),
 						),
 					],
 				},

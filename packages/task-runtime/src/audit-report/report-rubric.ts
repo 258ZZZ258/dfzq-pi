@@ -8,6 +8,7 @@ import type {
 } from "./report-contracts.ts";
 import { comparePreviousAuditFindings, findAdjacentRepeatedPhrase } from "./report-pipeline.ts";
 import { scoreStrictReportClaims } from "./report-strict-rubric.ts";
+import { taskDateEvidence } from "./report-task-evidence.ts";
 import { workflowErrors } from "./report-workflow.ts";
 
 interface RubricDefinition {
@@ -173,7 +174,7 @@ for (const [id, description, critical] of [
 	["AML-012", "无问题版仅依据完整问题查询结果选择", true],
 	["AML-013", "有问题时保留主要问题章节", true],
 	["AML-014", "基本情况与问题章节不存在及时或超期矛盾", true],
-	["AML-015", "个别或部分等数量词符合配置阈值", false],
+	["AML-015", "问题标题中的个别或部分表述与来源一致，不由问题统计数量推断", false],
 ] as const) {
 	define(id, "AML", description, critical, ["regular"]);
 }
@@ -299,7 +300,10 @@ function hasAllRanks(dataset: AuditReportDataset, draft: ReportDraft): boolean {
 }
 
 function noUnresolvedAsNone(pack: ReportFactPack, text: string): boolean {
-	const unresolved = pack.readiness.some((item) => item.state === "MISSING" || item.state === "CONFLICTED");
+	// Optional headcount omission does not invalidate independently sourced risk-event absences.
+	const unresolved = pack.readiness.some(
+		(item) => item.fieldId !== "common.broker_count" && (item.state === "MISSING" || item.state === "CONFLICTED"),
+	);
 	return !unresolved || !/(?:未发生|不存在|无相关事项)/u.test(text);
 }
 
@@ -341,32 +345,13 @@ function riskNarrativeConsistent(dataset: AuditReportDataset, text: string): boo
 	});
 }
 
-function expectedOperatingNarrative(
-	dataset: AuditReportDataset,
-	pack: ReportFactPack,
-): {
-	trends: readonly string[];
+function expectedOperatingNarrative(pack: ReportFactPack): {
 	bandText: string;
 } {
-	const trend = (metricCode: string): string => {
-		const metric = dataset.operatingMetrics.find((item) => item.metricCode === metricCode);
-		const increasing =
-			metric?.points.every(
-				(point, index, values) => index === 0 || point.value >= (values[index - 1]?.value ?? 0),
-			) ?? false;
-		const decreasing =
-			metric?.points.every(
-				(point, index, values) => index === 0 || point.value <= (values[index - 1]?.value ?? 0),
-			) ?? false;
-		if (increasing) return "逐年增长";
-		if (decreasing) return "总体下降";
-		return "有所波动";
-	};
 	const bands = unique(pack.derivedRanks.map((rank) => rank.band));
 	return {
-		trends: [`客户资产规模${trend("client_assets")}`, `股基交易量${trend("stock_fund_volume")}`],
 		bandText:
-			bands.includes("中下游") && bands.includes("中游")
+			bands.length === 2 && bands.includes("中下游") && bands.includes("中游")
 				? "中游至中下游"
 				: bands.length > 0
 					? bands.join("、")
@@ -435,11 +420,7 @@ function evaluateItem(
 			return pass(dataset.organization.evidenceIds.length > 0, "机构名称证据核对");
 		case "DATA-004":
 			return pass(
-				dataset.evidence.some(
-					(item) =>
-						item.sourceId === "DS-01" &&
-						(item.sourceRecordId === dataset.task.taskId || item.normalizedValue === dataset.task.projectId),
-				),
+				taskDateEvidence(dataset, "auditStart").length > 0 && taskDateEvidence(dataset, "auditEnd").length > 0,
 				"期间证据核对",
 			);
 		case "DATA-005":
@@ -527,14 +508,16 @@ function evaluateItem(
 				dataset.task.reportType !== "regular" || text.includes(`正式员工${dataset.personnel.employeeCount}名`),
 				"员工数核对",
 			);
-		case "FACT-007":
+		case "FACT-007": {
+			const overview = allParagraphs(draft).find((p) => p.paragraphId === "regular-overview")?.text ?? "";
 			return pass(
-				dataset.task.reportType !== "regular" ||
-					(dataset.personnel.brokerCount === 0
-						? !text.includes("证券经纪人0名")
-						: text.includes(`证券经纪人${dataset.personnel.brokerCount}名`)),
+				dataset.task.reportType === "turnover" ||
+					(dataset.personnel.brokerCount === undefined || dataset.personnel.brokerCount === 0
+						? !overview.includes("证券经纪人")
+						: overview.includes(`证券经纪人${dataset.personnel.brokerCount}名`)),
 				"经纪人数核对",
 			);
+		}
 		case "FACT-008":
 			return pass(hasAllMetricValues(dataset, draft), "经营金额逐项核对");
 		case "FACT-009":
@@ -546,29 +529,17 @@ function evaluateItem(
 				),
 				"指标单位核对",
 			);
-		case "FACT-011":
-			if (dataset.task.reportType === "turnover") {
-				const performanceMetrics = dataset.operatingMetrics.filter((metric) => metric.table === "performance");
-				const hasFullYearFluctuation = performanceMetrics.some((metric) => {
-					const values = metric.points.filter((point) => !point.period.includes("月")).map((point) => point.value);
-					const increasing = values.every((value, index) => index === 0 || value >= (values[index - 1] ?? value));
-					const decreasing = values.every((value, index) => index === 0 || value <= (values[index - 1] ?? value));
-					return values.length >= 2 && !increasing && !decreasing;
-				});
-				return pass(
-					!hasFullYearFluctuation || text.includes("完整年度各项业绩指标总体有所波动"),
-					"离任报告完整年度趋势核对",
-				);
-			}
-			{
-				const expected = expectedOperatingNarrative(dataset, pack);
-				return pass(
-					expected.trends.every((phrase) => text.includes(phrase)),
-					"趋势核对",
-				);
-			}
+		case "FACT-011": {
+			const operating = scoreStrictReportClaims(dataset, draft).sentences.filter((sentence) =>
+				/paragraph\[(?:regular|turnover)-operating-analysis\]/u.test(sentence.location),
+			);
+			return pass(
+				operating.length > 0 && operating.every((sentence) => sentence.value === 1),
+				"经营期间、趋势及原始指标独立核对",
+			);
+		}
 		case "FACT-012":
-			return pass(text.includes(expectedOperatingNarrative(dataset, pack).bandText), "五档排名文字核对");
+			return pass(text.includes(expectedOperatingNarrative(pack).bandText), "五档排名文字核对");
 		case "FACT-013":
 			return pass(
 				reportFindings.length === generatedFindings.length &&
@@ -577,8 +548,12 @@ function evaluateItem(
 			);
 		case "FACT-014":
 			return pass(
-				dataset.findings.every((finding) => finding.issueCount > 0),
-				"问题数量口径核对",
+				dataset.findings.every(
+					(finding) =>
+						finding.issueCount === undefined ||
+						(Number.isSafeInteger(finding.issueCount) && finding.issueCount > 0),
+				),
+				"已知问题数量有效；未知省略，正文数量另由逐句证据核验",
 			);
 		case "FACT-015":
 			return pass(
@@ -679,7 +654,7 @@ function evaluateItem(
 		case "RULE-016":
 			return pass(
 				draft.introduction.text.includes(
-					dataset.task.reportType === "consultation" ? "现就以下审计情况征求" : "现出具报告如下",
+					dataset.task.reportType === "consultation" ? "现就相关情况征求你单位意见：" : "现出具报告如下",
 				),
 				"固定文本核对",
 			);
@@ -699,7 +674,11 @@ function evaluateItem(
 				"概况字段核对",
 			);
 		case "REG-002":
-			return pass(dataset.personnel.brokerCount > 0 || !text.includes("证券经纪人0名"), "经纪人条件短语核对");
+			return pass(
+				(dataset.personnel.brokerCount !== undefined && dataset.personnel.brokerCount > 0) ||
+					!text.includes("证券经纪人0名"),
+				"经纪人条件短语核对",
+			);
 		case "REG-003":
 			return pass(
 				dataset.appointments.every((record) => text.includes(record.personName)),
@@ -794,7 +773,13 @@ function evaluateItem(
 		}
 		case "TUR-010":
 			return pass(
-				dataset.performance.length > 0 &&
+				(dataset.performance.length > 0 ||
+					(dataset.performanceAvailability !== undefined &&
+						scoreStrictReportClaims(dataset, draft).sentences.some(
+							(sentence) =>
+								sentence.value === 1 &&
+								sentence.claims.some((claim) => claim.claimId.startsWith("performance-availability@")),
+						))) &&
 					dataset.fixedFacts.cleanPracticeSummary.trim().length > 0 &&
 					riskReadinessComplete(dataset),
 				"高风险数据状态核对",
@@ -887,19 +872,20 @@ function evaluateItem(
 			return pass(!/均及时完成[\s\S]{0,200}超期/u.test(text), "反洗钱段落矛盾核对", "semantic-heuristic");
 		case "AML-015":
 			return pass(
-				dataset.findings.every((finding) => {
-					if (!text.includes(finding.title)) {
-						return true;
-					}
-					if (finding.title.includes("个别")) {
-						return finding.issueCount <= 2;
-					}
-					if (finding.title.includes("部分")) {
-						return finding.issueCount > 2;
-					}
-					return true;
-				}),
-				"数量词阈值核对",
+				dataset.findings
+					.filter((finding) => reportFindings.includes(finding.findingId))
+					.every((finding) => {
+						const title = allParagraphs(draft).find(
+							(paragraph) => paragraph.paragraphId === `finding-${finding.findingId}-title`,
+						);
+						// A system issue count has no customer/sample denominator and cannot establish these words.
+						return (
+							title !== undefined &&
+							JSON.stringify(title.text.match(/个别|部分/gu) ?? []) ===
+								JSON.stringify(finding.title.match(/个别|部分/gu) ?? [])
+						);
+					}),
+				"逐问题标题数量词与来源核对；新增、替换或缺失标题不通过",
 			);
 		case "OPIN-001":
 			return pass(

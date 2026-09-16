@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { access, readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -11,12 +13,20 @@ import {
 } from "./report-context.ts";
 import type { AuditFinding, AuditReportDataset, ReportDraft } from "./report-contracts.ts";
 import { reportDocumentMatches, toAuditReportJavaDocument } from "./report-java-contract.ts";
+import type { ReportNarrativeProcessor } from "./report-narrative-processing.ts";
 import {
 	buildFactPack,
 	comparePreviousAuditFindings,
 	generateReportDraft,
 	normalizeChineseProse,
 } from "./report-pipeline.ts";
+import {
+	applyReportSemantics,
+	parseSemanticPolicy,
+	planReportSemantics,
+	submitReportSemantics,
+} from "./report-semantic.ts";
+import { scoreStrictReportClaims } from "./report-strict-rubric.ts";
 
 function result(text: string, details: Record<string, unknown>) {
 	return {
@@ -65,6 +75,26 @@ function reportTables(draft: ReportDraft) {
 		...section.tables,
 		...section.subsections.flatMap((subsection) => subsection.tables ?? []),
 	]);
+}
+
+function reportContentErrors(dataset: AuditReportDataset, draft: ReportDraft): string[] {
+	const errors = reportParagraphs(draft).flatMap((p) =>
+		!p.text.trim() || /已转交大模型|规则比对未形成确定结论|语义一致性判断/u.test(p.text)
+			? [`Empty paragraph or internal processing status: ${p.paragraphId}`]
+			: [],
+	);
+	if (draft.status === "ready-for-review") {
+		const operating = scoreStrictReportClaims(dataset, draft).sentences.filter((sentence) =>
+			/paragraph\[(?:regular|turnover)-operating-analysis\]/u.test(sentence.location),
+		);
+		if (!operating.length) errors.push("Operating analysis has no verifiable claims");
+		errors.push(
+			...operating
+				.filter((sentence) => sentence.value === 0)
+				.map((sentence) => `${sentence.location}: ${sentence.reason}`),
+		);
+	}
+	return errors;
 }
 
 function reportEvidenceIds(draft: ReportDraft): string[] {
@@ -120,11 +150,7 @@ const ParagraphChangesSchema = Type.Array(
 	),
 );
 
-const llmEditableParagraphIds = new Set([
-	"regular-operating-analysis",
-	"turnover-operating-analysis",
-	"turnover-historical-findings",
-]);
+const llmEditableParagraphIds = new Set(["regular-operating-analysis", "turnover-operating-analysis"]);
 
 export function createAuditReportRestrictedReadTool(skillRoot: string): ToolDefinition {
 	return defineTool({
@@ -399,12 +425,46 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 			const context = requireAuditReportRequestContext();
 			context.factPack ??= buildFactPack(context.dataset);
 			context.draft = generateReportDraft(context.dataset, context.factPack);
+			context.semantic ??= planReportSemantics(
+				context.dataset,
+				context.draft,
+				parseSemanticPolicy(JSON.parse(await readFile(resolve(skillRoot, "semantic-policy.json"), "utf8"))),
+			);
+			const pending = context.semantic.jobs.filter((job) => job.status === "pending");
+			if (pending.length) {
+				context.deliveryToken = undefined;
+				const progress = {
+					status: "semantic-pending",
+					jobs: pending.map(({ id, kind, reason }) => ({ id, kind, reason })),
+				};
+				return result(JSON.stringify(progress), progress);
+			}
+			context.draft = applyReportSemantics(context.draft, context.semantic);
+			context.deliveryToken = undefined;
+			if (context.narrativeProcessor) {
+				if (!context.narrativeCache || !isDeepStrictEqual(context.narrativeCache.baseline, context.draft)) {
+					const baseline = structuredClone(context.draft);
+					const processed = await context.narrativeProcessor(context.dataset, structuredClone(baseline));
+					context.narrativeCache = { baseline, result: processed };
+				}
+				context.draft = structuredClone(context.narrativeCache.result.draft);
+			}
+			const contentErrors = reportContentErrors(context.dataset, context.draft);
+			if (contentErrors.length) throw new Error(`Report content validation failed: ${contentErrors.join("; ")}`);
 			const document = toAuditReportJavaDocument(context.dataset, context.draft);
 			recordReportToolTrace("generate_report_draft", [context.draft.taskId]);
-			return result(JSON.stringify(document, null, 2), {
-				draft: context.draft,
-				document,
-			});
+			context.deliveryToken = randomUUID();
+			return result(
+				JSON.stringify({
+					schemaVersion: "audit-report-result-ref.v1",
+					taskId: context.draft.taskId,
+					documentToken: context.deliveryToken,
+				}),
+				{
+					draft: context.draft,
+					document,
+				},
+			);
 		},
 	});
 
@@ -412,9 +472,9 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 		name: "revise_report_draft",
 		label: "Revise model-editable report paragraphs",
 		description:
-			"Patch only allowlisted semantic-analysis paragraphs and return the complete evidence-bound draft. Template text is locked. Final output validation belongs to the Runtime output contract.",
+			"Patch only allowlisted semantic-analysis paragraphs and return a new completion reference. Template text is locked. Final output validation belongs to the Runtime output contract.",
 		promptSnippet:
-			"Call this tool only when semantic processing is necessary. It may change only regular-operating-analysis, turnover-operating-analysis, or turnover-historical-findings; never alter template-locked content.",
+			"Call this tool only when semantic processing is necessary. It may change only regular-operating-analysis or turnover-operating-analysis; historical comparisons must use compare jobs, never free rewriting.",
 		parameters: Type.Object({
 			paragraphChangesJson: Type.String({ minLength: 2, maxLength: 50000 }),
 		}),
@@ -423,6 +483,14 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 			const context = requireAuditReportRequestContext();
 			context.factPack ??= buildFactPack(context.dataset);
 			const baseline = context.draft ?? generateReportDraft(context.dataset, context.factPack);
+			if (
+				baseline.reportType === "turnover" &&
+				comparePreviousAuditFindings(context.dataset.findings).needsReview.length &&
+				!context.deliveryToken
+			)
+				return result("Complete historical comparison jobs before revision.", { valid: false });
+			if (context.semantic && !context.deliveryToken)
+				return result("Complete semantic jobs and generate the draft before optional revision.", { valid: false });
 			context.draft = baseline;
 			let parsed: unknown;
 			{
@@ -512,6 +580,7 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 			const cited = reportEvidenceIds(draft);
 			const unknown = cited.filter((id) => !knownEvidence.has(id));
 			const errors = [
+				...reportContentErrors(context.dataset, draft),
 				...(draft.taskId === context.dataset.task.taskId ? [] : ["taskId does not match current task"]),
 				...(unknown.length === 0 ? [] : [`unknown evidence IDs: ${unknown.join(", ")}`]),
 				...baselineCompletenessErrors(baseline, draft),
@@ -525,11 +594,132 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 			context.draft = draft;
 			const document = toAuditReportJavaDocument(context.dataset, draft);
 			recordReportToolTrace("revise_report_draft", [draft.taskId]);
-			return result(JSON.stringify(document, null, 2), { valid: true, draft, document });
+			context.deliveryToken = randomUUID();
+			return result(
+				JSON.stringify({
+					schemaVersion: "audit-report-result-ref.v1",
+					taskId: draft.taskId,
+					documentToken: context.deliveryToken,
+				}),
+				{ valid: true, draft, document },
+			);
 		},
 	});
 
 	return [
+		defineTool({
+			name: "get_report_semantic_job",
+			label: "Read pending semantic job",
+			description:
+				"Read a semantic job before submission. A compare job contains one historical atom followed by ALL current finding atoms. Submit one comparisons array covering every currentFindingId exactly once; for other jobs submit groups of IDs.",
+			parameters: Type.Object({ jobId: Type.String() }),
+			async execute(_id, params) {
+				const context = requireAuditReportRequestContext();
+				const job = context.semantic?.jobs.find((job) => job.id === params.jobId);
+				if (!job) throw new Error("Unknown semantic job");
+				recordReportToolTrace("get_report_semantic_job", [job.id]);
+				return result(JSON.stringify(job), { job });
+			},
+		}),
+		defineTool({
+			name: "submit_report_semantic_job",
+			label: "Validate semantic organization",
+			description:
+				"For compare, proposalJson must encode {comparisons:[{currentFindingId:string,sameProblem:boolean,rationale:string,previousFactQuote:string,currentFactQuote:string,identity:{previousObject:string,currentObject:string,previousFailure:string,currentFailure:string,objectRelation:string,failureRelation:string}}]}. Identity phrases must be verbatim substrings (at least 4 characters) of the corresponding fact quote. Relations are same/different/insufficient: any different requires false; both same permits true; otherwise stop as unresolved. Compare concrete business objects and unfulfilled duties, not broad headings. Include ALL current IDs exactly once, including false decisions; multiple matches are allowed. Quote factText or internalSubitems (at least 8 characters), never title-only text or policy. Otherwise submit {groups:[[sourceAtomId,...],...]}. Read each job first; generate again after all jobs finish.",
+			parameters: Type.Object({ jobId: Type.String(), proposalJson: Type.String({ maxLength: 50000 }) }),
+			executionMode: "sequential",
+			async execute(_id, params) {
+				const context = requireAuditReportRequestContext();
+				if (!context.semantic) throw new Error("Generate a draft first");
+				let proposal: unknown;
+				try {
+					proposal = JSON.parse(params.proposalJson);
+				} catch {
+					proposal = null;
+				}
+				const job = submitReportSemantics(context.semantic, params.jobId, proposal, context.dataset);
+				context.deliveryToken = undefined;
+				recordReportToolTrace("submit_report_semantic_job", [job.id]);
+				const progress = { id: job.id, status: job.status, errors: job.errors, attempts: job.attempts };
+				return result(JSON.stringify(progress), { ...progress, job });
+			},
+		}),
+		defineTool({
+			name: "retain_report_semantic_job",
+			label: "Keep original when organization is uncertain",
+			description:
+				"Explicitly retain source wording when meaningful safe grouping is not possible. Does not mark the job as successfully improved.",
+			parameters: Type.Object({ jobId: Type.String() }),
+			async execute(_id, params) {
+				const context = requireAuditReportRequestContext();
+				const job = context.semantic?.jobs.find((job) => job.id === params.jobId && job.status === "pending");
+				if (!job) throw new Error("Unknown or finished semantic job");
+				if (job.kind === "compare")
+					throw new Error("Historical comparison cannot be skipped; submit an evidence-based decision");
+				job.status = "retained";
+				job.errors = ["Model retained the original rather than providing uncertain grouping"];
+				recordReportToolTrace("retain_report_semantic_job", [job.id]);
+				return result(JSON.stringify({ id: job.id, status: job.status }), { job });
+			},
+		}),
+		defineTool({
+			name: "get_report_paragraph",
+			label: "Read one draft paragraph",
+			description:
+				"Read a paragraph and its evidence IDs before an optional semantic revision. Does not return the full document.",
+			parameters: Type.Object({ paragraphId: Type.String() }),
+			async execute(_id, params) {
+				const context = requireAuditReportRequestContext();
+				if (!context.draft) throw new Error("Generate a draft first");
+				const paragraph = reportParagraphs(context.draft).find((item) => item.paragraphId === params.paragraphId);
+				if (!paragraph) throw new Error("Unknown paragraph in current report");
+				const view = { ...paragraph, modelEditable: llmEditableParagraphIds.has(paragraph.paragraphId) };
+				return result(JSON.stringify(view), view);
+			},
+		}),
+		defineTool({
+			name: "begin_report_run",
+			label: "Reset private report delivery state",
+			description: "Runtime-only run boundary.",
+			parameters: Type.Object({}),
+			async execute() {
+				const context = requireAuditReportRequestContext();
+				context.draft = undefined;
+				context.factPack = undefined;
+				context.deliveryToken = undefined;
+				context.trace = [];
+				context.semantic = undefined;
+				context.narrativeCache = undefined;
+				return result("{}", {});
+			},
+		}),
+		defineTool({
+			name: "resolve_report_document",
+			label: "Resolve private current document",
+			description: "Runtime-only output resolution.",
+			parameters: Type.Object({ referenceJson: Type.String() }),
+			async execute(_id, params) {
+				const context = requireAuditReportRequestContext();
+				const candidate: unknown = JSON.parse(params.referenceJson);
+				const expected = {
+					schemaVersion: "audit-report-result-ref.v1",
+					taskId: context.dataset.task.taskId,
+					documentToken: context.deliveryToken,
+				};
+				if (
+					!context.draft ||
+					!context.deliveryToken ||
+					reportContentErrors(context.dataset, context.draft).length > 0 ||
+					context.semantic?.jobs.some(
+						(job) => job.status === "pending" || (job.kind === "compare" && job.status !== "accepted"),
+					) ||
+					!isDeepStrictEqual(expected, candidate)
+				)
+					throw new Error("Unknown, stale or cross-task report completion reference");
+				const document = toAuditReportJavaDocument(context.dataset, context.draft);
+				return result(JSON.stringify(document), { document });
+			},
+		}),
 		defineTool({
 			name: "validate_report_document",
 			label: "Validate final report consistency",
@@ -547,7 +737,9 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 				}
 				if (!context.draft) return result('{"valid":false}', { valid: false });
 				const expected = toAuditReportJavaDocument(context.dataset, context.draft);
-				const valid = reportDocumentMatches(expected, candidate);
+				const valid =
+					reportContentErrors(context.dataset, context.draft).length === 0 &&
+					reportDocumentMatches(expected, candidate);
 				return result(JSON.stringify({ valid }), { valid });
 			},
 		}),
@@ -569,8 +761,13 @@ export function createAuditReportTools(skillRoot: string): ToolDefinition[] {
 }
 
 /** Bind one immutable source dataset and one mutable drafting context to a single runtime/toolset. */
-export function createBoundAuditReportTools(dataset: AuditReportDataset, skillRoot: string): ToolDefinition[] {
+export function createBoundAuditReportTools(
+	dataset: AuditReportDataset,
+	skillRoot: string,
+	narrativeProcessor?: ReportNarrativeProcessor,
+): ToolDefinition[] {
 	const context = createAuditReportRequestContext(dataset);
+	context.narrativeProcessor = narrativeProcessor;
 	return createAuditReportTools(skillRoot).map((tool) => ({
 		...tool,
 		execute: async (...args: Parameters<typeof tool.execute>) =>

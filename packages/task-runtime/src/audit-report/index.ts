@@ -1,3 +1,5 @@
+export type { AuditReportTaskExtension } from "./business-task-adapter.ts";
+export { toAuditBusinessTaskRecord, toAuditReportTask } from "./business-task-adapter.ts";
 export type {
 	AuditFinding,
 	AuditReportDataset,

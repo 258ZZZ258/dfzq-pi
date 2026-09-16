@@ -1,4 +1,5 @@
 import { Type } from "typebox";
+import type { OrganizationScopedTask } from "../business-data/contracts.ts";
 
 export type AuditReportType = "consultation" | "regular" | "turnover";
 
@@ -44,9 +45,7 @@ export interface ReportAccessScope {
 	allowedSourceIds: readonly string[];
 }
 
-export interface ReportTask {
-	taskId: string;
-	organizationId: string;
+export interface ReportTask extends OrganizationScopedTask {
 	projectId: string;
 	reportType: AuditReportType;
 	auditStart: string;
@@ -100,7 +99,8 @@ export interface OrganizationSnapshot {
 export interface PersonnelSnapshot {
 	organizationId: string;
 	employeeCount: number;
-	brokerCount: number;
+	/** Omitted when unknown; zero requires a verified count. */
+	brokerCount?: number;
 	asOf: string;
 	evidenceIds: readonly string[];
 }
@@ -163,7 +163,8 @@ export interface AuditFinding {
 	majorType?: "重大违法违规" | "重大内控缺陷";
 	majorConfirmed?: boolean;
 	sourceOrder?: number;
-	issueCount: number;
+	/** Source-calibre statistic; omitted when unknown, never inferred from subitems or affected objects. */
+	issueCount?: number;
 	foundDate: string;
 	status: "open" | "rectifying" | "closed";
 	isHistorical: boolean;
@@ -175,7 +176,19 @@ export interface AuditFinding {
 
 export interface RiskEvent {
 	eventId: string;
-	type: "regulatory-letter" | "complaint" | "lawsuit" | "accountability" | "security-incident" | "major-emergency";
+	/** Explicit scope of a VERIFIED_NONE declaration; does not describe historical event occurrence. */
+	absenceScope?: "all" | "unresolved-during-period";
+	type:
+		| "regulatory-letter"
+		| "complaint"
+		| "lawsuit"
+		| "accountability"
+		| "security-incident"
+		| "major-emergency"
+		| "regulatory-inspection"
+		| "regulatory-penalty"
+		| "petition"
+		| "case";
 	state: Exclude<ReportValueState, "NOT_APPLICABLE">;
 	description?: string;
 	regularDescription?: string;
@@ -281,6 +294,14 @@ export interface PerformanceRecord {
 	evidenceIds: readonly string[];
 }
 
+export interface PerformanceAvailability {
+	status: "not-published";
+	personId: string;
+	periodStart: string;
+	periodEnd: string;
+	evidenceIds: readonly string[];
+}
+
 export interface ManualDecision {
 	decisionId: string;
 	fieldId: string;
@@ -306,6 +327,7 @@ export interface AuditReportDataset {
 	riskEvents: readonly RiskEvent[];
 	aml?: AmlSummary;
 	performance: readonly PerformanceRecord[];
+	performanceAvailability?: PerformanceAvailability;
 	manualDecisions: readonly ManualDecision[];
 	evidence: readonly EvidenceRecord[];
 	fixedFacts: {

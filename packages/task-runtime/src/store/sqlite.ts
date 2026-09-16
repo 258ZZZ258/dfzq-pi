@@ -189,6 +189,10 @@ export function createSqliteRunStore(path: string): RunStore {
 			const row = byRunId.get(runId) as RunRow | undefined;
 			return row ? toRecord(row) : undefined;
 		},
+		findByClientRequestId(clientRequestId: string) {
+			const row = byClientReq.get(clientRequestId) as RunRow | undefined;
+			return row ? toRecord(row) : undefined;
+		},
 		markRunning(runId: string, startedAt: number) {
 			// changes === 0 说明 runId 不存在,响亮失败而不是静默 no-op
 			// (与 insertQueued 的「读不到行就抛」同一哲学;RunManager 会真的传坏 runId 进来)。

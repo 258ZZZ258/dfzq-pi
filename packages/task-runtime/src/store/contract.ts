@@ -82,6 +82,7 @@ export interface RunStore<Async extends boolean = false> {
 	 */
 	insertQueued(rec: NewRun): MaybePromise<{ inserted: boolean; run: RunRecord }, Async>;
 	findByRunId(runId: string): MaybePromise<RunRecord | undefined, Async>;
+	findByClientRequestId(clientRequestId: string): MaybePromise<RunRecord | undefined, Async>;
 	markRunning(runId: string, startedAt: number): MaybePromise<void, Async>;
 	finish(runId: string, result: RunResult, finishedAt: number): MaybePromise<void, Async>;
 	markError(runId: string, message: string, finishedAt: number): MaybePromise<void, Async>;

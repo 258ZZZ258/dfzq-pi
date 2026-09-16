@@ -22,7 +22,13 @@ export function validateSpec(spec: RuntimeSpec, ctx: ValidateContext): void {
 		throw new Error(`RuntimeSpec "${spec.id}": toolset "${spec.toolset}" is not registered`);
 	}
 
-	if (!Array.isArray(spec.tools) || spec.tools.length === 0) {
+	if (spec.toolMode !== undefined && spec.toolMode !== "none")
+		throw new Error(`RuntimeSpec "${spec.id}": unknown toolMode`);
+	if (spec.toolMode === "none" && (!Array.isArray(spec.tools) || spec.tools.length > 0 || spec.excludeTools?.length))
+		throw new Error(
+			`RuntimeSpec "${spec.id}": toolMode none requires an explicit empty tools list and no exclusions`,
+		);
+	if (!Array.isArray(spec.tools) || (spec.tools.length === 0 && spec.toolMode !== "none")) {
 		throw new Error(
 			`RuntimeSpec "${spec.id}": tools must be a non-empty whitelist ` +
 				`(pi activates zero tools when noTools:"all" is set and tools is omitted)`,

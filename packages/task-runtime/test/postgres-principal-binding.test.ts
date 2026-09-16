@@ -12,8 +12,10 @@ vi.mock("postgres", () => ({
 				if (columns.length !== values.length) throw new Error("INSERT has more expressions than target columns");
 				const row: Record<string, unknown> = {};
 				for (let i = 0; i < columns.length; i++)
-					row[columns[i]] = values[i].startsWith("$") ? params[Number(values[i].slice(1)) - 1] : "queued";
-				for (const key of ["principal_json", "filters_json"])
+					row[columns[i]] = values[i].startsWith("$")
+						? params[Number.parseInt(values[i].slice(1), 10) - 1]
+						: "queued";
+				for (const key of ["principal_json", "filters_json", "payload_json"])
 					if (typeof row[key] === "string") row[key] = JSON.parse(row[key]);
 				return [row];
 			},
@@ -36,6 +38,27 @@ it("binds the independent principal into the PostgreSQL INSERT column and value 
 			input: "q",
 		});
 		expect(result.run.principalJson).toBe(principalJson);
+	} finally {
+		await store.close();
+	}
+});
+
+it.each(["123", '{"looks":"like JSON"}'])("preserves a legitimate JSONB string payload: %s", async (payload) => {
+	const store = await createPostgresRunStore("test-only");
+	try {
+		const payloadJson = JSON.stringify(payload);
+		const result = await store.insertQueued({
+			runId: "r",
+			clientRequestId: "c",
+			specId: "s",
+			taskKind: "s",
+			sessionId: "session",
+			filtersJson: '{"corpusTypes":["internal"]}',
+			payloadJson,
+			createdAt: 1,
+			input: "q",
+		});
+		expect(result.run.payloadJson).toBe(payloadJson);
 	} finally {
 		await store.close();
 	}

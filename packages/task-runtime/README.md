@@ -1,5 +1,10 @@
 # @dfzq/task-runtime
 
+## 运行历史数据库初始化
+
+Server 使用 `PIPELINE_DB_DSN` 指向 PostgreSQL。同仓部署统一使用 `services/audit-ai/alembic` 迁移链，先审阅离线 SQL，再显式执行初始化；启动服务不会自动迁移。`migrations/001_task_runs.postgresql.sql` 仅用于独立运行时的空库初始化，不能与 Alembic 重复执行。
+已有同名表须核对运行记录、事件、授权主体、交付回执及 CAS 状态字段，不删除现有记录。Durable Worker 使用租约与 fence 恢复任务；不支持恢复的业务草稿不会自动续跑。不同环境必须隔离数据库与索引。
+
 ## 审计报告任务
 
 审计报告使用统一 RuntimeSpec：`specs/audit-report.json`。模型由 ProviderProfile 的 `main`

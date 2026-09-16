@@ -12,8 +12,10 @@ import {
 	scoreReport,
 	toAuditReportJavaDocument,
 } from "../src/audit-report/index.ts";
+import { auditReportDelivery } from "../src/audit-report/report-delivery.ts";
 import { parseReportInput } from "../src/audit-report/report-input.ts";
 import { reportBasisNeedsRecheck, reportDocumentMatches } from "../src/audit-report/report-java-contract.ts";
+import { scoreStrictReportClaims } from "../src/audit-report/report-strict-rubric.ts";
 import { createBoundAuditReportTools } from "../src/audit-report/report-tools.ts";
 import { businessCheckErrors, TURNOVER_CHECKS, workflowErrors } from "../src/audit-report/report-workflow.ts";
 import type { ProviderProfile } from "../src/env/provider-profile.ts";
@@ -58,8 +60,9 @@ afterEach(async () => {
 	cleanups.length = 0;
 });
 
-async function loadSourceDataset() {
+async function loadSourceDataset(prepare?: (fixture: Fixture) => void) {
 	const fixture = JSON.parse(await readFile(fixturePath, "utf8")) as Fixture;
+	prepare?.(fixture);
 	const root = await mkdtemp(join(tmpdir(), "audit-report-source-"));
 	cleanups.push(() => rm(root, { recursive: true, force: true }));
 	const workbook = XLSX.utils.book_new();
@@ -85,6 +88,120 @@ async function loadSourceDataset() {
 }
 
 describe("audit-report RuntimeSpec", () => {
+	it("reads exception explanations from the checks endpoint and exposes their actual paragraph basis", async () => {
+		const { dataset } = await loadSourceDataset((fixture) => {
+			const check = fixture.业务检查?.find((row) => row.code === "岗位设置");
+			if (!check) throw new Error("Missing checklist test record");
+			check.result = "exception";
+			check.factText = "抽查发现审批记录不完整。";
+		});
+		const check = dataset.checks?.find((row) => row.code === "岗位设置");
+		const proof = dataset.evidence.find(
+			(item) => check?.evidenceIds.includes(item.evidenceId) && item.sourceField === "factText",
+		);
+		expect(proof?.rawValue).toBe("抽查发现审批记录不完整。");
+		expect(proof?.sourceId).toBe("DS-03");
+		expect(
+			dataset.evidence.some((item) => item.sourceId === "DS-10" && item.sourceField === "internalControlSummary"),
+		).toBe(false);
+		const draft = generateReportDraft(dataset);
+		const doc = toAuditReportJavaDocument(dataset, draft);
+		const paragraph = doc.nodes.find((node) => node.nodeId === "regular-internal-control");
+		expect(paragraph?.text).toBe(dataset.fixedFacts.internalControlSummary);
+		expect(paragraph?.citationIds).toContain(proof?.evidenceId);
+		expect(paragraph?.basis?.sourceGroups.some((group) => group.citationIds.includes(proof?.evidenceId ?? ""))).toBe(
+			true,
+		);
+		const scores = scoreStrictReportClaims(dataset, draft).sentences.filter((sentence) =>
+			sentence.location.includes("regular-internal-control"),
+		);
+		expect(scores.length).toBeGreaterThan(0);
+		expect(scores.every((sentence) => sentence.value === 1)).toBe(true);
+	});
+	it("accepts embedded policy text and gates delivery until semantic work finishes", async () => {
+		const { dataset } = await loadSourceDataset((fixture) => {
+			const finding = fixture.审计发现![0]!;
+			finding.factText = `${finding.policyBasis}审计发现以下问题：（1）人数缺失。未登记人数。（2）对象缺失。另有记录未登记对象。`;
+			finding.policyBasis = "";
+			finding.internalSubitems = "";
+		});
+		expect(dataset.findings[0]!.policyBasis).toBe("");
+		const tools = createBoundAuditReportTools(dataset, join(packageRoot, "specs", "audit-report", "skills"));
+		const call = async (name: string, params: Record<string, unknown> = {}) => {
+			const tool = tools.find((item) => item.name === name)!;
+			return tool.execute("test", params, undefined, undefined, {} as never);
+		};
+		const content = (response: Awaited<ReturnType<typeof call>>) =>
+			JSON.parse(
+				response.content
+					.filter((item) => item.type === "text")
+					.map((item) => item.text)
+					.join(""),
+			);
+		const initial = content(await call("generate_report_draft"));
+		expect(initial.status).toBe("semantic-pending");
+		const id = initial.jobs[0].id as string;
+		await expect(call("resolve_report_document", { referenceJson: "{}" })).rejects.toThrow("reference");
+		expect((await call("revise_report_draft", { paragraphChangesJson: "[]" })).details).toMatchObject({
+			valid: false,
+		});
+		const job = content(await call("get_report_semantic_job", { jobId: id }));
+		const groups = job.atoms.map((atom: { id: string }) => [atom.id]);
+		expect(
+			content(await call("submit_report_semantic_job", { jobId: id, proposalJson: JSON.stringify({ groups }) }))
+				.status,
+		).toBe("accepted");
+		const reference = content(await call("generate_report_draft"));
+		const document = content(await call("resolve_report_document", { referenceJson: JSON.stringify(reference) }));
+		expect(
+			document.nodes.find(
+				(node: { nodeId: string }) => node.nodeId === `finding-${dataset.findings[0]!.findingId}-fact`,
+			).text,
+		).toContain("\n");
+		expect(
+			(await call("validate_report_document", { documentJson: JSON.stringify(document) })).details,
+		).toMatchObject({ valid: true });
+		expect(
+			document.nodes.some(
+				(node: { nodeType: string; text?: string }) => node.nodeType === "paragraph" && !node.text?.trim(),
+			),
+		).toBe(false);
+		await call("begin_report_run");
+		await expect(call("resolve_report_document", { referenceJson: JSON.stringify(reference) })).rejects.toThrow(
+			"reference",
+		);
+		expect(content(await call("generate_report_draft")).status).toBe("semantic-pending");
+		expect(content(await call("submit_report_semantic_job", { jobId: id, proposalJson: "invalid" })).status).toBe(
+			"pending",
+		);
+		expect(content(await call("submit_report_semantic_job", { jobId: id, proposalJson: "invalid" })).status).toBe(
+			"retained",
+		);
+		const fallbackRef = content(await call("generate_report_draft"));
+		const fallback = content(await call("resolve_report_document", { referenceJson: JSON.stringify(fallbackRef) }));
+		expect(fallback).toEqual(toAuditReportJavaDocument(dataset, generateReportDraft(dataset)));
+	});
+	it("mock endpoints scope performance by person and select the latest previous project", async () => {
+		const mock = await startAuditReportMockSystem({
+			绩效考核: [
+				{ personId: "A", year: 2025, rating: "A" },
+				{ personId: "B", year: 2025, rating: "B" },
+			],
+			审计项目: [
+				{ taskId: "old", organizationId: "ORG", auditEnd: "2023-01-01" },
+				{ taskId: "latest", organizationId: "ORG", auditEnd: "2024-01-01" },
+				{ taskId: "other", organizationId: "OTHER", auditEnd: "2024-12-31" },
+				{ taskId: "current", organizationId: "ORG", auditEnd: "2025-12-31" },
+			],
+		});
+		cleanups.push(mock.close);
+		const performance = await (await fetch(`${mock.baseUrl}/api/performance?personId=A`)).json();
+		expect(performance).toMatchObject({ data: [{ personId: "A", year: 2025, rating: "A" }] });
+		const previous = await (
+			await fetch(`${mock.baseUrl}/api/audit/projects/previous?organizationId=ORG&before=2025-01-01`)
+		).json();
+		expect(previous).toMatchObject({ data: { taskId: "latest" } });
+	});
 	it("requires a generated baseline and isolates it from caller mutation", async () => {
 		const { dataset } = await loadSourceDataset();
 		const expected = toAuditReportJavaDocument(dataset, generateReportDraft(dataset));
@@ -132,6 +249,9 @@ describe("audit-report RuntimeSpec", () => {
 		expect(draft.blockers).toEqual([]);
 		expect(draft.titleLines).toContain("审计征求意见书");
 		expect(draft.sections.at(-1)?.paragraphs[0]?.text).toContain("2026年2月15日");
+		expect(draft.sections.at(-1)?.paragraphs[0]?.text).toBe(
+			"应认真制定整改计划并反馈书面意见。反馈截止日期为2026年2月15日。",
+		);
 		expect(draft.sections).toHaveLength(3);
 		expect(JSON.stringify(draft)).not.toContain("attachment-aml");
 	});
@@ -212,12 +332,25 @@ describe("audit-report RuntimeSpec", () => {
 	});
 
 	it("requires 18 turnover business checks and does not attach a separate AML report", async () => {
-		const { dataset } = await loadSourceDataset();
+		const { dataset } = await loadSourceDataset((fixture) => {
+			fixture.业务检查?.push({ taskId: "TASK-001", code: "信访及案件", result: "conforming" });
+			fixture.绩效考核 = [{ personId: "PERSON-001", year: 2025, rating: "A" }];
+		});
+		const originalChecks = dataset.checks ?? [];
 		dataset.task.reportType = "turnover";
+		dataset.task.subjectPersonId = "PERSON-001";
+		dataset.task.subjectPersonName = "张三";
 		dataset.task.workflow = { mode: "turnover", matchingCompleted: true, consultationExists: false };
 		dataset.checks = TURNOVER_CHECKS.map((code) => ({ code, result: "conforming", evidenceIds: [] }));
 		expect(TURNOVER_CHECKS).toHaveLength(18);
 		expect(businessCheckErrors(dataset)).toEqual([]);
+		expect(
+			generateReportDraft(dataset).blockers.filter((message) => message.startsWith("control-summary:")),
+		).toHaveLength(12);
+		dataset.checks = TURNOVER_CHECKS.map(
+			(code) =>
+				originalChecks.find((check) => check.code === code) ?? { code, result: "conforming", evidenceIds: [] },
+		);
 		expect(generateReportDraft(dataset).blockers).toEqual([]);
 		expect(JSON.stringify(generateReportDraft(dataset))).not.toContain("附件：反洗钱审计情况");
 	});
@@ -259,17 +392,19 @@ describe("audit-report RuntimeSpec", () => {
 	});
 
 	it("binds turnover performance evidence only to the audited subject", async () => {
-		const loaded = await loadSourceDataset();
+		const loaded = await loadSourceDataset((fixture) => {
+			fixture.绩效考核 = [{ personId: "PERSON-001", year: 2025, rating: "A" }];
+		});
 		const draft = generateReportDraft({
 			...loaded.dataset,
 			task: {
 				...loaded.dataset.task,
 				reportType: "turnover",
-				subjectPersonId: "PERSON-SUBJECT",
+				subjectPersonId: "PERSON-001",
 				subjectPersonName: "张三",
 			},
 			performance: [
-				{ personId: "PERSON-SUBJECT", year: 2025, rating: "A", evidenceIds: ["E-SUBJECT-2025"] },
+				...loaded.dataset.performance,
 				{ personId: "PERSON-OTHER", year: 2025, rating: "B", evidenceIds: ["E-OTHER-2025"] },
 			],
 		});
@@ -278,9 +413,191 @@ describe("audit-report RuntimeSpec", () => {
 			.flatMap((subsection) => subsection.paragraphs)
 			.find((item) => item.paragraphId === "turnover-performance");
 
-		expect(performanceParagraph?.text).toContain("张三同志绩效考核结果分别为A");
-		expect(performanceParagraph?.evidenceIds).toEqual(["E-SUBJECT-2025"]);
+		expect(performanceParagraph?.text).toBe("2025年度，公司对张三同志的绩效考核结果为A。");
+		expect(performanceParagraph?.evidenceIds).toEqual(
+			expect.arrayContaining([...loaded.dataset.performance[0]!.evidenceIds]),
+		);
+		expect(performanceParagraph?.evidenceIds).not.toContain("E-OTHER-2025");
+		expect(loaded.requests.some((request) => request.includes("/api/performance"))).toBe(true);
 	});
+	it.each(["regular", "consultation", "turnover"] as const)(
+		"checks annual performance against source fields for %s",
+		async (reportType) => {
+			const { dataset } = await loadSourceDataset((fixture) => {
+				fixture.绩效考核 = [{ personId: "PERSON-001", year: 2025, rating: "A" }];
+			});
+			dataset.task.reportType = reportType;
+			dataset.task.subjectPersonId = "PERSON-001";
+			dataset.task.subjectPersonName = "张三";
+			const draft = generateReportDraft(dataset);
+			const paragraph = draft.sections
+				.flatMap((s) => s.subsections.flatMap((sub) => sub.paragraphs))
+				.find(
+					(p) => p.paragraphId === (reportType === "turnover" ? "turnover-performance" : "regular-manager-duty"),
+				);
+			if (!paragraph) throw new Error("Missing performance paragraph");
+			const ratings = () =>
+				scoreStrictReportClaims(dataset, draft).sentences.filter((s) => s.text.includes("绩效考核结果"));
+			expect(ratings()).toHaveLength(1);
+			expect(ratings().every((s) => s.value === 1)).toBe(true);
+			const original = paragraph.text;
+			for (const [before, after] of [
+				["结果为A", "结果为B"],
+				["2025年度", "2024年度"],
+				["张三同志", "李四同志"],
+			]) {
+				paragraph.text = original.replace(before!, after!);
+				expect(ratings().some((s) => s.value === 0)).toBe(true);
+			}
+			paragraph.text = original;
+			const proof = dataset.evidence.find((e) => e.sourceId === "DS-09" && e.sourceField === "rating");
+			if (!proof) throw new Error("Missing performance evidence");
+			const originalProof = { ...proof };
+			for (const field of ["dataVersion", "normalizedValue", "sourceRecordId"] as const) {
+				proof[field] = "changed";
+				expect(ratings().some((s) => s.value === 0)).toBe(true);
+				Object.assign(proof, originalProof);
+			}
+			paragraph.evidenceIds = paragraph.evidenceIds.filter((id) => id !== proof.evidenceId);
+			expect(ratings().some((s) => s.value === 0)).toBe(true);
+		},
+	);
+
+	it.each(["regular", "consultation"] as const)(
+		"binds database duty facts to the %s paragraph",
+		async (reportType) => {
+			const { dataset } = await loadSourceDataset();
+			dataset.task.reportType = reportType;
+			const summary = "负责人组织了业务讨论，但两次会议记录未留存。";
+			dataset.fixedFacts.managerDutySummary = summary;
+			dataset.evidence = [
+				...dataset.evidence,
+				{
+					evidenceId: "duty-summary",
+					sourceId: "DS-03",
+					sourceRecordId: "evaluation-1",
+					sourceField: "summary",
+					rawValue: summary,
+					normalizedValue: summary,
+					asOf: "2025-12-31",
+					queryTime: "2026-09-11T00:00:00Z",
+					dataVersion: "evaluation-v1",
+					fileLocation: "database:audit_subject_evaluation/evaluation-1",
+				},
+			];
+			const draft = generateReportDraft(dataset);
+			const paragraph = draft.sections
+				.flatMap((s) => s.subsections.flatMap((sub) => sub.paragraphs))
+				.find((p) => p.paragraphId === "regular-manager-duty");
+			expect(paragraph?.text).toBe(summary);
+			expect(paragraph?.evidenceIds).toContain("duty-summary");
+			expect(
+				scoreStrictReportClaims(dataset, draft).sentences.filter(
+					(s) => s.location.includes("regular-manager-duty") && s.value === 0,
+				),
+			).toEqual([]);
+			const document = toAuditReportJavaDocument(dataset, draft);
+			expect(document.nodes.find((n) => n.nodeId === "regular-manager-duty")?.citationIds).toContain("duty-summary");
+			if (!paragraph) throw new Error("Missing duty paragraph");
+			paragraph.text = "负责人落实了全部管理要求。";
+			expect(
+				scoreStrictReportClaims(dataset, draft).sentences.some(
+					(s) => s.location.includes("regular-manager-duty") && s.value === 0,
+				),
+			).toBe(true);
+			paragraph.text = summary;
+			paragraph.evidenceIds = paragraph.evidenceIds.filter((id) => id !== "duty-summary");
+			expect(
+				scoreStrictReportClaims(dataset, draft).sentences.some(
+					(s) => s.location.includes("regular-manager-duty") && s.value === 0,
+				),
+			).toBe(true);
+		},
+	);
+
+	it.each(["regular", "consultation", "turnover"] as const)(
+		"renders a sourced zero historical query without rectification claims for %s",
+		async (reportType) => {
+			const { dataset } = await loadSourceDataset();
+			dataset.task.reportType = reportType;
+			dataset.findings = dataset.findings.filter((f) => !f.isHistorical);
+			const proof = {
+				evidenceId: "history-zero",
+				sourceId: "DS-03",
+				sourceRecordId: "previous-project",
+				sourceField: "previousQueryReturnedRecordCount",
+				rawValue: "0",
+				normalizedValue: "0",
+				dataVersion: "query-v1",
+				asOf: "2024-12-31",
+				queryTime: "2026-09-11T00:00:00Z",
+				fileLocation: "database:audit_finding/query/previous-project",
+			};
+			dataset.evidence = [...dataset.evidence, proof];
+			const draft = generateReportDraft(dataset);
+			const paragraphs = draft.sections.flatMap((s) => [
+				...s.paragraphs,
+				...s.subsections.flatMap((sub) => sub.paragraphs),
+			]);
+			const paragraph = paragraphs.find(
+				(p) =>
+					p.paragraphId ===
+					(reportType === "turnover" ? "turnover-historical-findings" : "regular-previous-rectification"),
+			);
+			if (!paragraph) throw new Error("Missing historical query paragraph");
+			expect(paragraph.text).toBe("前次审计问题台账查询返回0条记录。");
+			expect(paragraph.evidenceIds).toEqual(["history-zero"]);
+			const score = () =>
+				scoreStrictReportClaims(dataset, draft).sentences.find((s) => s.text.includes("前次审计问题台账查询返回"));
+			expect(score()?.value).toBe(1);
+			proof.normalizedValue = "1";
+			expect(score()?.value).toBe(0);
+			proof.normalizedValue = "0";
+			paragraph.evidenceIds = [];
+			expect(score()?.value).toBe(0);
+		},
+	);
+
+	it.each(["regular", "consultation", "turnover"] as const)(
+		"keeps all risk events and complete branch disclosures for %s",
+		async (reportType) => {
+			const types = [
+				"regulatory-inspection",
+				"regulatory-penalty",
+				"petition",
+				"case",
+				"accountability",
+				"accountability",
+			];
+			const { dataset } = await loadSourceDataset((fixture) => {
+				fixture.风险事项 = types.map((type, index) => ({
+					organizationId: "ORG-001",
+					eventId: `EVENT-${index}`,
+					type,
+					state: "VERIFIED_VALUE",
+					description: `事项${index}的原始事实。`,
+					regularDescription: `事项${index}的原始事实。相关文书：测试决定${index}。处理结果：已完成记录${index}。`,
+				}));
+			});
+			dataset.task.reportType = reportType;
+			const draft = generateReportDraft(dataset);
+			const paragraphs = draft.sections.flatMap((s) => [
+				...s.paragraphs,
+				...s.subsections.flatMap((sub) => sub.paragraphs),
+			]);
+			for (const [index, type] of types.entries()) {
+				const event = dataset.riskEvents.find((e) => e.eventId === `EVENT-${index}`);
+				expect(event?.type).toBe(type);
+				const matching = paragraphs.filter((p) => p.text.includes(`事项${index}的原始事实。`));
+				expect(matching).toHaveLength(1);
+				expect(matching[0]?.text).toBe(event?.regularDescription);
+				expect(matching[0]?.evidenceIds).toEqual(event?.evidenceIds);
+			}
+			const document = toAuditReportJavaDocument(dataset, draft);
+			for (const event of dataset.riskEvents)
+				expect(document.nodes.some((n) => n.text === event.regularDescription)).toBe(true);
+		},
+	);
 
 	it("builds a Java document with stable paragraph nodes and evidence citations", async () => {
 		const loaded = await loadSourceDataset();
@@ -313,10 +630,7 @@ describe("audit-report RuntimeSpec", () => {
 		"runs final consistency gate (tampered=%s)",
 		async (tampered) => {
 			const loaded = await loadSourceDataset();
-			const draft = generateReportDraft(loaded.dataset);
-			const document = toAuditReportJavaDocument(loaded.dataset, draft);
 			const spec = JSON.parse(await readFile(specPath, "utf8")) as RuntimeSpec;
-			if (tampered) document.report.introduction.text += "伪造的最终改写。";
 			await resolveSpecPromptPaths(spec, dirname(specPath));
 			const outputContractSchema = JSON.parse(
 				await readFile(join(packageRoot, "specs", "audit-report", "output-contract.schema.json"), "utf8"),
@@ -325,14 +639,25 @@ describe("audit-report RuntimeSpec", () => {
 			cleanups.push(harness.cleanup);
 			harness.faux.setResponses([
 				fauxAssistantMessage([fauxToolCall("generate_report_draft", {})], { stopReason: "toolUse" }),
-				fauxAssistantMessage(`\`\`\`json\n${JSON.stringify(document)}\n\`\`\``),
-				fauxAssistantMessage(`\`\`\`json\n${JSON.stringify(document)}\n\`\`\``),
+				(context) => {
+					const message = context.messages.at(-1);
+					if (message?.role !== "toolResult") throw new Error("Missing generation result");
+					const text = message.content
+						.filter((item) => item.type === "text")
+						.map((item) => item.text)
+						.join("");
+					expect(text.length).toBeLessThan(512);
+					const reference = JSON.parse(text);
+					if (tampered) reference.documentToken = "forged";
+					return fauxAssistantMessage(JSON.stringify(reference));
+				},
 			]);
 			const toolsets = new ToolsetRegistry();
 			toolsets.register("audit-report", async () =>
 				createBoundAuditReportTools(loaded.dataset, join(packageRoot, "specs", "audit-report", "skills")),
 			);
 			const runtime = await createSessionRuntime({
+				...auditReportDelivery,
 				spec,
 				profile,
 				registry: createDefaultPluginRegistry(),
@@ -355,6 +680,72 @@ describe("audit-report RuntimeSpec", () => {
 			expect(result.output).not.toContain("matchScore");
 		},
 		15000,
+	);
+
+	it("keeps documents private and rejects stale, cross-task and forged completion references", async () => {
+		const { dataset } = await loadSourceDataset();
+		const tools = createBoundAuditReportTools(dataset, join(packageRoot, "specs", "audit-report", "skills"));
+		const call = async (name: string, params: Record<string, unknown> = {}) => {
+			const tool = tools.find((item) => item.name === name)!;
+			return tool.execute("test", params, undefined, undefined, {} as never);
+		};
+		const ref = (response: Awaited<ReturnType<typeof call>>) =>
+			JSON.parse(
+				response.content
+					.filter((item) => item.type === "text")
+					.map((item) => item.text)
+					.join(""),
+			);
+		const first = ref(await call("generate_report_draft"));
+		expect(Object.keys(first).sort()).toEqual(["documentToken", "schemaVersion", "taskId"]);
+		const resolved = ref(await call("resolve_report_document", { referenceJson: JSON.stringify(first) }));
+		expect(resolved).toEqual(toAuditReportJavaDocument(dataset, generateReportDraft(dataset)));
+		for (const invalid of [
+			{ ...first, taskId: "OTHER" },
+			{ ...first, extra: true },
+			{ ...first, documentToken: "forged" },
+		]) {
+			await expect(call("resolve_report_document", { referenceJson: JSON.stringify(invalid) })).rejects.toThrow(
+				"reference",
+			);
+		}
+		const second = ref(await call("generate_report_draft"));
+		expect(second.documentToken).not.toBe(first.documentToken);
+		await expect(call("resolve_report_document", { referenceJson: JSON.stringify(first) })).rejects.toThrow(
+			"reference",
+		);
+		await call("begin_report_run");
+		await expect(call("resolve_report_document", { referenceJson: JSON.stringify(second) })).rejects.toThrow(
+			"reference",
+		);
+		const spec = JSON.parse(await readFile(specPath, "utf8")) as RuntimeSpec;
+		for (const name of ["begin_report_run", "resolve_report_document", "validate_report_document"])
+			expect(spec.tools).not.toContain(name);
+	});
+
+	it.each(["valid", "historical", "other-project", "other-organization", "missing-citation"])(
+		"verifies AML presence against scoped current findings (%s)",
+		async (scenario) => {
+			const { dataset } = await loadSourceDataset();
+			const finding = dataset.findings[0]!;
+			dataset.findings = [
+				{
+					...finding,
+					category: "反洗钱工作",
+					isHistorical: scenario === "historical",
+					projectId: scenario === "other-project" ? "OTHER" : dataset.task.projectId,
+					organizationId: scenario === "other-organization" ? "OTHER" : dataset.task.organizationId,
+				},
+			];
+			const draft = generateReportDraft(dataset);
+			draft.introduction.text = "审计期内，营业部反洗钱工作存在以下问题：";
+			draft.introduction.evidenceIds = scenario === "missing-citation" ? [] : finding.evidenceIds;
+			const sentence = scoreStrictReportClaims(dataset, draft).sentences.find(
+				(item) => item.text === draft.introduction.text,
+			);
+			expect(sentence).toBeDefined();
+			expect(sentence?.value).toBe(scenario === "valid" ? 1 : 0);
+		},
 	);
 
 	it("groups only this paragraph's fields by record and keeps versions separate", async () => {

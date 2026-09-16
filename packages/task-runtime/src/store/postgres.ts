@@ -11,6 +11,12 @@ const RUN_COLUMNS = `
 
 type Row = Record<string, unknown>;
 
+// Previous JSONB parameters were serialized twice by the driver. Decode that one extra layer
+// when reading existing receipts; never replace an unreadable authorization scope with {}.
+function storedJson(value: unknown): unknown {
+	return typeof value === "string" ? JSON.parse(value) : value;
+}
+
 function dateMs(value: unknown): number | undefined {
 	return value instanceof Date ? value.getTime() : undefined;
 }
@@ -28,8 +34,10 @@ function arrayJson(value: unknown): Array<Record<string, unknown>> | undefined {
 }
 
 function toRecord(row: Row): RunRecord {
+	const filters = objectJson(storedJson(row.filters_json));
+	if (!filters) throw new Error("Stored run authorization scope is not an object");
 	return {
-		principalJson: row.principal_json == null ? undefined : JSON.stringify(row.principal_json),
+		principalJson: row.principal_json == null ? undefined : JSON.stringify(storedJson(row.principal_json)),
 		runId: String(row.run_id),
 		clientRequestId: String(row.client_request_id),
 		requestId: typeof row.request_id === "string" ? row.request_id : undefined,
@@ -37,19 +45,24 @@ function toRecord(row: Row): RunRecord {
 		taskKind: String(row.task_kind),
 		sessionId: String(row.session_id),
 		sessionIdExplicit: typeof row.session_id_explicit === "boolean" ? row.session_id_explicit : undefined,
-		filtersJson: JSON.stringify(objectJson(row.filters_json) ?? {}),
-		optionsJson: row.options_json === null ? undefined : JSON.stringify(row.options_json),
-		payloadJson: row.payload_json === null ? undefined : JSON.stringify(row.payload_json),
+		filtersJson: JSON.stringify(filters),
+		optionsJson: row.options_json === null ? undefined : JSON.stringify(storedJson(row.options_json)),
+		// Filters are always objects: a string identifies a legacy double-encoded row.
+		// New payloads may legitimately be strings, including text that looks like JSON.
+		payloadJson:
+			row.payload_json === null
+				? undefined
+				: JSON.stringify(typeof row.filters_json === "string" ? storedJson(row.payload_json) : row.payload_json),
 		status: String(row.status) as StoredRunStatus,
 		input: String(row.input),
 		output: typeof row.output === "string" ? row.output : undefined,
 		errorMessage: typeof row.error_message === "string" ? row.error_message : undefined,
 		stopReason: typeof row.stop_reason === "string" ? row.stop_reason : undefined,
 		limitHit: typeof row.limit_hit === "string" ? (row.limit_hit as LimitKind) : undefined,
-		usageJson: row.usage_json === null ? undefined : JSON.stringify(row.usage_json),
-		deliveryJson: row.delivery_json == null ? undefined : JSON.stringify(row.delivery_json),
+		usageJson: row.usage_json === null ? undefined : JSON.stringify(storedJson(row.usage_json)),
+		deliveryJson: row.delivery_json == null ? undefined : JSON.stringify(storedJson(row.delivery_json)),
 		turns: typeof row.turns === "number" ? row.turns : undefined,
-		sourceDetails: arrayJson(row.source_details_json) as RunRecord["sourceDetails"],
+		sourceDetails: arrayJson(storedJson(row.source_details_json)) as RunRecord["sourceDetails"],
 		createdAt: dateMs(row.created_at) ?? 0,
 		startedAt: dateMs(row.started_at),
 		finishedAt: dateMs(row.finished_at),
@@ -86,7 +99,7 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 				`INSERT INTO task_runs (
           run_id, client_request_id, request_id, spec_id, task_kind, session_id,
           filters_json, options_json, payload_json, status, input, session_id_explicit, principal_json
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'queued', $10, $11, $12)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::text::jsonb, $8::text::jsonb, $9::text::jsonb, 'queued', $10, $11, $12::text::jsonb)
         ON CONFLICT (client_request_id) DO NOTHING
         RETURNING ${RUN_COLUMNS}`,
 				[
@@ -115,6 +128,12 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 			const rows = await sql.unsafe(`SELECT ${RUN_COLUMNS} FROM task_runs WHERE run_id = $1`, [runId]);
 			return rows.length === 0 ? undefined : toRecord(rows[0] as Row);
 		},
+		async findByClientRequestId(clientRequestId) {
+			const rows = await sql.unsafe(`SELECT ${RUN_COLUMNS} FROM task_runs WHERE client_request_id = $1`, [
+				clientRequestId,
+			]);
+			return rows.length === 0 ? undefined : toRecord(rows[0] as Row);
+		},
 		async markRunning(runId, startedAt) {
 			const rows = await sql.unsafe(
 				"UPDATE task_runs SET status = 'running', started_at = to_timestamp($1 / 1000.0), updated_at = now() WHERE run_id = $2 RETURNING run_id",
@@ -126,8 +145,8 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 			const rows = await sql.unsafe(
 				`UPDATE task_runs SET
           status = $1, output = $2, error_message = $3, stop_reason = $4, limit_hit = $5,
-          usage_json = $6, turns = $7, source_details_json = $8,
-          finished_at = to_timestamp($9 / 1000.0), updated_at = now(), delivery_json = $11
+          usage_json = $6::text::jsonb, turns = $7, source_details_json = $8::text::jsonb,
+          finished_at = to_timestamp($9 / 1000.0), updated_at = now(), delivery_json = $11::text::jsonb
         WHERE run_id = $10 RETURNING run_id`,
 				[
 					result.status,
@@ -158,7 +177,7 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 					message,
 				);
 				const rows = await transaction.unsafe(
-					"UPDATE task_runs SET status = 'error', error_message = $1, finished_at = to_timestamp($2 / 1000.0), updated_at = now(), delivery_json = $4 WHERE run_id = $3 RETURNING run_id",
+					"UPDATE task_runs SET status = 'error', error_message = $1, finished_at = to_timestamp($2 / 1000.0), updated_at = now(), delivery_json = $4::text::jsonb WHERE run_id = $3 RETURNING run_id",
 					[message, finishedAt, runId, JSON.stringify(delivery)],
 				);
 				requireUpdated(rows as Row[], runId);
@@ -177,7 +196,7 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 					message,
 				);
 				await transaction.unsafe(
-					"UPDATE task_runs SET status='error',error_message=$1,finished_at=to_timestamp($2 / 1000.0),delivery_json=$3,updated_at=now() WHERE run_id=$4",
+					"UPDATE task_runs SET status='error',error_message=$1,finished_at=to_timestamp($2 / 1000.0),delivery_json=$3::text::jsonb,updated_at=now() WHERE run_id=$4",
 					[message, finishedAt, JSON.stringify(delivery), runId],
 				);
 				return true;
@@ -198,7 +217,7 @@ export async function createPostgresRunStore(dsn: string): Promise<RunStore<true
 						"process restarted",
 					);
 					await transaction.unsafe(
-						"UPDATE task_runs SET status='error',error_message='process restarted',finished_at=to_timestamp($1 / 1000.0),updated_at=now(),delivery_json=$2 WHERE run_id=$3",
+						"UPDATE task_runs SET status='error',error_message='process restarted',finished_at=to_timestamp($1 / 1000.0),updated_at=now(),delivery_json=$2::text::jsonb WHERE run_id=$3",
 						[now, JSON.stringify(delivery), row.runId],
 					);
 				}

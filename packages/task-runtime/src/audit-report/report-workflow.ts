@@ -60,8 +60,7 @@ export function workflowErrors(task: ReportTask): string[] {
 		errors.push("workflow: 征求意见书缺少反馈期限或整改计划要求。");
 	if (w.feedbackDeadline && w.feedbackDeadline < task.reportDate && task.reportType === "consultation")
 		errors.push("workflow: 反馈期限不得早于征求意见书日期。");
-	if (task.reportType === "turnover" && !task.feedbackCompleted) errors.push("workflow: 离任负责人反馈尚未完成。");
-	if (w.feedbackCompletedAt && w.feedbackCompletedAt.slice(0, 10) > task.reportDate)
+	if (task.reportType !== "turnover" && w.feedbackCompletedAt && w.feedbackCompletedAt.slice(0, 10) > task.reportDate)
 		errors.push("workflow: 报告日期早于反馈处理完成日期。");
 	return errors;
 }

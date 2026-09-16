@@ -44,7 +44,7 @@
 - After code changes (not docs): `npm run check` (full output, no tail). Fix all errors, warnings, and infos before committing. Does not run tests.
 - Never run `npm run build` or `npm test` unless requested by the user.
 - Never run the full vitest suite directly: it includes e2e tests that activate when endpoint/auth env vars are present. For all non-e2e tests, run `./test.sh` from the repo root. Otherwise run specific tests from the package root: `node ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`.
-- If you create or modify a test file, run it and iterate on test or implementation until it passes.
+- Creating or modifying a test file does not by itself require executing it. Follow the 避免过度测试 policy below; prioritize compilation/type checking and obtain the user's decision before expanding test execution.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` + the faux provider. No real provider APIs, keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` named `<issue-number>-<short-slug>.test.ts`.
 - For ad-hoc scripts, `write` them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
@@ -174,5 +174,19 @@ Attribution:
 5. **If CI publish fails**: inspect the failed `publish-npm` job. The publish helper is idempotent and skips package versions already present on npm, so rerun the tag workflow after fixing CI or transient npm issues. Do not rerun `npm run release:patch` or `npm run release:minor` for the same version.
 
 ## User Override
+
+## 避免过度测试
+
+优先从代码实现本身解决问题，选择代码层面的最优方案，尽量一次性完成。
+
+不要为了显得验证充分而编写大量低价值测试用例，也不要反复运行已经通过、无法带来新信息的测试。
+
+先确保受影响代码能够编译或构建通过。只有任务明确要求、仓库规则强制规定，或出现具体失败信号时，才增加必要测试。
+
+编译或构建通过后，没有具体失败信号就停止。
+
+如果当前环境确实无法确认某些部分，交付时说明未验证项和原因，并给出最小手动验证步骤、预期结果和注意事项。需要继续测试时，先说明测试思路和范围，等用户决定，不要自行扩大测试。
+
+以上是用户明确指定的测试范围约束；保留必要的编译、类型检查和仓库明确要求的其他检查，不以旧的“修改测试文件即必须运行”规则扩大测试范围。
 
 If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.

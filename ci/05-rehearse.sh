@@ -60,6 +60,13 @@ $COMPOSE $COMPOSE_FILES down -v --remove-orphans || true
 # 🔴 刻意不写 TASK_RUNTIME_SPECS_DIR/PROFILE/WORK_ROOT:镜像 ENV 已有自洽的一套,
 #    env_file 优先级更高,重复只会制造对不上的机会。同理不写端口与 project 名。
 # ⚠ 行尾不要写注释:env_file 的解析**不剥**行尾注释。
+# 授权 keys 是 RSA 公钥 PEM(RS256 验签)—— 排练现生成一次性密钥对,公钥按 JSON
+# 字符串转义(\n)后单行塞进 env。私钥用完即弃:排练不签发任何 grant。
+REH_KEY_DIR="$(mktemp -d)"
+openssl genrsa -out "$REH_KEY_DIR/k.pem" 2048 2>/dev/null
+REH_PUB_ESC="$(openssl rsa -in "$REH_KEY_DIR/k.pem" -pubout 2>/dev/null | awk 'BEGIN{ORS="\\n"} {print}')"
+rm -rf "$REH_KEY_DIR"
+
 cat > deploy/.env <<REHEARSAL_ENV
 PI_IMAGE=${PI_IMAGE}
 TASK_RUNTIME_INTERNAL_TOKEN=dfzq-rehearsal-no-auth
@@ -76,7 +83,7 @@ QUERY_LLM_BACKEND=stub
 PG_PASSWORD=rehearsal
 AUTH_ISSUER=rehearsal
 AUTH_AUDIENCE=rehearsal
-AUTH_KEYS_JSON={"r1":"rehearsal-secret-never-used"}
+AUTH_KEYS_JSON={"r1":"${REH_PUB_ESC}"}
 REHEARSAL_ENV
 chmod 600 deploy/.env
 

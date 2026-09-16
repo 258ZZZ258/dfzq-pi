@@ -97,6 +97,7 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 			grants,
 			memory: new MemoryService(stateStore, { embedder }),
 			port,
+			hostname: env.TASK_RUNTIME_BIND_HOST,
 			databaseUrl,
 			specsDir,
 			internalToken,

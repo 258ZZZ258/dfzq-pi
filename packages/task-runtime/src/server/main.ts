@@ -41,6 +41,8 @@ export interface ServeOptions {
 	grants?: GrantVerifier;
 	memory?: MemoryService;
 	port: number;
+	/** Bind loopback by default; containers may explicitly select all interfaces. */
+	hostname?: string;
 	/** audit-ai pipeline PostgreSQL DSN；任务历史唯一持久化位置。 */
 	databaseUrl?: string;
 	/** @deprecated 仅兼容旧测试配置；生产服务不再读取 SQLite。 */
@@ -121,7 +123,10 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 				instance.off("error", onError);
 				resolve(instance);
 			};
-			instance = serve({ fetch: app.fetch, port: options.port, hostname: "127.0.0.1" }, onListening);
+			instance = serve(
+				{ fetch: app.fetch, port: options.port, hostname: options.hostname || "127.0.0.1" },
+				onListening,
+			);
 			instance.once("error", onError);
 		});
 	} catch (error) {

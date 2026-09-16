@@ -74,6 +74,9 @@ PIPELINE_SPARSE_BACKEND=bm25
 QUERY_RERANK_BACKEND=api
 QUERY_LLM_BACKEND=stub
 PG_PASSWORD=rehearsal
+AUTH_ISSUER=rehearsal
+AUTH_AUDIENCE=rehearsal
+AUTH_KEYS_JSON={"r1":"rehearsal-secret-never-used"}
 REHEARSAL_ENV
 chmod 600 deploy/.env
 

@@ -1,10 +1,19 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import { authorize, type Grant, grantScopeHash, type Principal } from "../auth/grant.ts";
+import { GrantLease } from "../auth/lease.ts";
+import type { Conversation, InboxMessage, MessageInput, SessionInbox } from "../interaction/inbox.ts";
+import type { MemoryScope } from "../memory/service.ts";
 // 复用 trajectory.ts 的落盘白名单(与其导出复用的注释同一处道理):两套白名单会漂移。
 import { shouldRecord } from "../observability/trajectory.ts";
+import type { SessionCheckpoint } from "../runtime/checkpoint.ts";
 import type { RunResult, Runtime, RuntimeEvent } from "../runtime/contract.ts";
-import type { RunStore, StoredEvent, StoredRunStatus } from "../store/contract.ts";
+import { sealDelivery } from "../runtime/delivery.ts";
+import { hashState } from "../state/json.ts";
+import type { RunRecord, RunStore, StoredEvent, StoredRunStatus } from "../store/contract.ts";
 // 新 submit() 直接判 admission.kind 三支,不再需要 isRejection(留着会是未使用导入,biome 报错)
-import type { Gate, GateRejection, GateTicket } from "./gate.ts";
+import { type Gate, GateCancelledError, type GateRejection, type GateTicket } from "./gate.ts";
+import type { ResultValidator } from "./output-delivery.ts";
 // 终态判据只应有一份定义(见 routes.ts 的 isTerminal 注释);这里不再自己维护第二份
 // TERMINAL 白名单,避免两处未来各自漏改、方向还相反。
 import { isTerminal } from "./routes.ts";
@@ -30,13 +39,37 @@ function toStoredEvent(event: RuntimeEvent): StoredEvent {
 		typeof raw === "object" && raw !== null && typeof (raw as { isError?: unknown }).isError === "boolean"
 			? (raw as { isError: boolean }).isError
 			: undefined;
-	const sanitized: { type: string; seq: number; ts: number; toolName?: string; isError?: boolean } = {
+	const sanitized: Record<string, string | number | boolean> = {
 		type: event.type,
 		seq: event.seq,
 		ts: event.ts,
 	};
 	if (toolName !== undefined) sanitized.toolName = toolName;
 	if (isError !== undefined) sanitized.isError = isError;
+	if (raw && typeof raw === "object") {
+		const data = raw as Record<string, unknown>;
+		if (typeof data.toolCallId === "string" && data.toolCallId.length <= 256) sanitized.toolCallId = data.toolCallId;
+		for (const key of ["checkpointSeq", "fence"] as const)
+			if (typeof data[key] === "number" && Number.isSafeInteger(data[key]) && data[key] >= 0)
+				sanitized[key] = data[key];
+		if (typeof data.next === "string" && ["pending_tools", "continue", "judge", "repair"].includes(data.next))
+			sanitized.next = data.next;
+		if (
+			typeof data.reason === "string" &&
+			[
+				"worker_cancelled",
+				"worker_timeout",
+				"worker_disposed",
+				"worker_exited",
+				"worker_transport_failed",
+				"worker_protocol_error",
+				"assembly_timeout",
+			].includes(data.reason)
+		)
+			sanitized.reason = data.reason;
+		const result = data.result as { details?: { ledgerReplay?: unknown } } | undefined;
+		if (data.replayed === true || result?.details?.ledgerReplay === true) sanitized.replayed = true;
+	}
 	return { seq: event.seq, ts: event.ts, type: event.type, payload: JSON.stringify(sanitized) };
 }
 
@@ -59,11 +92,27 @@ export interface RunFilters {
 
 /** 查询层选项,透传给下游 audit-ai。刻意不收窄:加字段不该变成一次 HTTP 层改动。 */
 export interface RunOptions {
+	durableSession?: boolean;
+	messageId?: string;
+	interaction?: boolean;
+	conversation?: Conversation;
+	authorization?: Grant;
+	memoryScope?: MemoryScope;
+	/** Host-controlled continuation reference; persisted for audit/replay. */
+	resumeFrom?: string;
 	topK?: number;
 	includeSuperseded?: boolean;
+	reportTaskId?: string;
+	reportType?: "consultation" | "regular" | "turnover";
 }
 
-export type RuntimeFactory = (input: {
+export type RuntimeFactory = ((input: {
+	initialInput?: string;
+	operationRunId?: string;
+	resume?: SessionCheckpoint;
+	onCheckpoint?: (checkpoint: SessionCheckpoint) => Promise<void>;
+	/** Construction cancellation; never serialized into the request record. */
+	signal?: AbortSignal;
 	specId: string;
 	sessionId: string;
 	/**
@@ -75,15 +124,24 @@ export type RuntimeFactory = (input: {
 	options: RunOptions;
 	/** 结构化任务输入,原样透传(不补默认值),见 SubmitRequest.payload 的注释。 */
 	payload?: Record<string, unknown>;
-}) => Promise<Runtime>;
+}) => Promise<Runtime>) & {
+	supportsResume?: true;
+	registerPending?: (runId: string) => Promise<void>;
+	unregisterPending?: (runId: string) => Promise<void>;
+	isRunActive?: (row: RunRecord) => Promise<boolean>;
+	close?: () => Promise<void>;
+};
 
 export interface SubmitRequest {
+	principal?: Principal;
 	taskKind: string;
 	specId: string;
 	input: string;
 	clientRequestId: string;
 	requestId?: string;
 	sessionId: string;
+	/** False only when the HTTP boundary generated a new session ID for an omitted field. */
+	sessionIdExplicit?: boolean;
 	/**
 	 * 授权位。**结构化** —— stringify 归本类做。此前调用方传 filtersJson、本类原样存档,
 	 * 于是 app.ts 与本类各持一份序列化职责;要把 filters 透给工厂就得在两处都解析回来。
@@ -112,6 +170,7 @@ export type SubmitOutcome =
 	 */
 	| { kind: "accepted"; runId: string; completion: Promise<RunResult>; queued: boolean }
 	| { kind: "idempotent"; runId: string; status: StoredRunStatus }
+	| { kind: "idempotency_conflict" }
 	| { kind: "rejected"; rejection: GateRejection };
 
 export type CancelOutcome = "accepted" | "not_found" | "already_terminal";
@@ -132,6 +191,8 @@ export interface RunProgress {
 }
 
 export interface RunManagerOptions {
+	inbox?: SessionInbox;
+	validateResult?: ResultValidator;
 	store: RunStore<boolean>;
 	gate: Gate;
 	runtimeFactory: RuntimeFactory;
@@ -144,9 +205,11 @@ export interface RunManagerOptions {
  * `cancelRequested` 让「排队中被取消」不必依赖 Gate 的取消支持(Gate 没有)。
  */
 interface LiveRun {
+	assemblyAbort: AbortController;
 	completion: Promise<RunResult>;
 	runtime?: Runtime;
 	cancelRequested: boolean;
+	cancelQueued?: () => boolean;
 }
 
 /**
@@ -159,25 +222,44 @@ interface LiveRun {
  * race 它与等待窗口,超时回 202 后**不再碰它** —— 连接断开也不中断 run(设计文档 §6.4.2)。
  */
 export class RunManager {
+	private readonly inbox?: SessionInbox;
+	private readonly dispatcherId = randomUUID();
+	private inboxTimer?: NodeJS.Timeout;
+	private dispatching?: Promise<void>;
+	private inboxCursor = "";
+	private closing = false;
+	private readonly validateResult: ResultValidator;
 	private readonly store: RunStore<boolean>;
 	private readonly gate: Gate;
 	private readonly runtimeFactory: RuntimeFactory;
 	private readonly now: () => number;
 	private readonly newRunId: () => string;
 	private readonly live = new Map<string, LiveRun>();
+	// Serialize only admission/rollback, not execution. This is process-local;
+	// multi-replica admission still requires a shared transactional coordinator.
+	private readonly submissions = new Map<string, Promise<SubmitOutcome>>();
 	/** 见 RunProgress 的注释:只对在飞的 run 有意义,清理时机与 live 表同处。 */
 	private readonly progress = new Map<string, RunProgress>();
 
 	constructor(options: RunManagerOptions) {
+		this.inbox = options.inbox;
+		this.validateResult = options.validateResult ?? ((result) => sealDelivery(result, "not_checked"));
 		this.store = options.store;
 		this.gate = options.gate;
 		this.runtimeFactory = options.runtimeFactory;
 		this.now = options.now ?? (() => Date.now());
 		this.newRunId = options.newRunId ?? (() => randomUUID());
+		if (this.inbox)
+			this.inboxTimer = setInterval(() => {
+				void this.dispatchFollowUps().catch((error) => console.error("[RunManager] inbox dispatch failed", error));
+			}, 500);
 	}
 
 	get activeRuns(): number {
 		return this.gate.activeCount;
+	}
+	get supportsMessages(): boolean {
+		return Boolean(this.inbox);
 	}
 
 	get queueDepth(): number {
@@ -191,25 +273,19 @@ export class RunManager {
 		return this.progress.get(runId);
 	}
 
-	/**
-	 * serve 侧事件落库(task-18b):A6 要求 pi 侧的工具调用事件流与 MCP 侧审计日志逐条
-	 * 对得上,而这条链路此前从未接线 —— `appendEvents` 声明了、实现了,零调用点。
-	 *
-	 * 逐条写(不缓冲到 finish 批量写):每条白名单事件到达就立即调一次
-	 * `store.appendEvents(runId, [...])`。取舍见任务报告,要点是——进程真崩溃(kill -9 /
-	 * OOM)时,这个选择丢的只是"崩溃那一刻正在处理、还没来得及跑进这个回调"的那一条事件之前
-	 * 的部分永远不丢;换成缓冲到 finish 才写,会让整个 run 的事件史随崩溃一次性清零,而 run
-	 * 本身的终态行本来就可能因为同一次崩溃留在 running/queued(重启由 recoverStaleRuns 收尾)
-	 * ——那种情况下逐条写至少留得下"崩溃前已经发生过什么"这份对账线索,批量写则什么都留不下。
-	 *
-	 * 落库失败(store 已 close / 磁盘满等)只记日志、不重新抛出 —— `Runtime.subscribe` 的
-	 * fan-out(session-runtime.ts 对应位置)本身已经给每个监听器包了 try/catch、抛了也会继续
-	 * 派发给其余监听器,所以这里不重新抛不是在补那一层的洞。这里的理由是本地的:不依赖上游
-	 * fan-out 的保护、就近处理并打一条带 runId 的日志 —— 一条事件落库失败不该有牵连同一个
-	 * run 上其余监听器、或者让调用方多一层要处理的异常这么大的影响面。
+	/** Persist sanitized events as they arrive, with at most 1024 in-flight writes.
+	 * Stop the run on storage failure; drain before publishing a terminal result.
+	 * Process death can still lose unacknowledged events, so these are not checkpoints.
 	 */
-	private subscribeEvents(runId: string, runtime: Runtime): () => void {
-		return runtime.subscribe((event) => {
+	private subscribeEvents(runId: string, runtime: Runtime): () => Promise<void> {
+		const pending = new Set<Promise<void>>();
+		let failure: Error | undefined;
+		const fail = (cause: unknown) => {
+			if (failure) return;
+			failure = new Error("event_persistence_failed", { cause });
+			void runtime.abort().catch(() => {});
+		};
+		const unsubscribe = runtime.subscribe((event) => {
 			// 进度捕获与落库白名单分开判断:`compare_stage` 不在 shouldRecord 的 RECORDED_TYPES
 			// 里(它是进度展示位,不是要审计的事件),必须在下面的 shouldRecord 短路之前处理,
 			// 否则永远走不到这里。只记最后一条,不落库——RunProgress 的注释已经写清楚原因。
@@ -217,21 +293,58 @@ export class RunManager {
 				this.progress.set(runId, event.payload as RunProgress);
 			}
 			if (!shouldRecord(event.type)) return;
+			if (failure) return;
+			if (pending.size >= 1024) {
+				fail(new Error("event_queue_full"));
+				return;
+			}
 			try {
-				void Promise.resolve(this.store.appendEvents(runId, [toStoredEvent(event)])).catch((error) => {
-					console.error(`[RunManager] failed to persist event for run "${runId}"; this event is dropped`, error);
-				});
+				const write = Promise.resolve(this.store.appendEvents(runId, [toStoredEvent(event)])).catch(fail);
+				pending.add(write);
+				void write.finally(() => pending.delete(write));
 			} catch (error) {
-				console.error(`[RunManager] failed to persist event for run "${runId}"; this event is dropped`, error);
+				fail(error);
 			}
 		});
+		return async () => {
+			unsubscribe();
+			await Promise.all(pending);
+			if (failure) throw failure;
+		};
 	}
 
 	async submit(req: SubmitRequest): Promise<SubmitOutcome> {
+		if (this.closing) return { kind: "rejected", rejection: { kind: "queue_full", retryAfterSeconds: 5 } };
+		const submissionKey = req.principal
+			? hashState([req.principal.tenantId, req.principal.userId, req.clientRequestId])
+			: req.clientRequestId;
+		const previous = this.submissions.get(submissionKey);
+		if (previous) {
+			await previous.catch(() => {});
+			return this.submit(req);
+		}
+		const pending = this.submitOnce(req);
+		this.submissions.set(submissionKey, pending);
+		try {
+			return await pending;
+		} finally {
+			if (this.submissions.get(submissionKey) === pending) this.submissions.delete(submissionKey);
+		}
+	}
+	private comparableOptions(options: RunOptions): unknown {
+		const { authorization, ...rest } = options;
+		return { ...rest, ...(authorization ? { authorizationScope: grantScopeHash(authorization) } : {}) };
+	}
+
+	private async submitOnce(req: SubmitRequest): Promise<SubmitOutcome> {
 		const runId = this.newRunId();
 		const created = await this.store.insertQueued({
+			principalJson: req.principal ? JSON.stringify(req.principal) : undefined,
 			runId,
-			clientRequestId: req.clientRequestId,
+			sessionIdExplicit: req.sessionIdExplicit !== false,
+			clientRequestId: req.principal
+				? hashState([req.principal.tenantId, req.principal.userId, req.clientRequestId])
+				: req.clientRequestId,
 			requestId: req.requestId,
 			specId: req.specId,
 			taskKind: req.taskKind,
@@ -243,6 +356,23 @@ export class RunManager {
 			createdAt: this.now(),
 		});
 		if (!created.inserted) {
+			const row = created.run;
+			if (
+				!isDeepStrictEqual(row.principalJson ? JSON.parse(row.principalJson) : undefined, req.principal) ||
+				row.taskKind !== req.taskKind ||
+				row.specId !== req.specId ||
+				row.input !== req.input ||
+				(row.sessionIdExplicit ?? true) !== (req.sessionIdExplicit !== false) ||
+				(req.sessionIdExplicit !== false && row.sessionId !== req.sessionId) ||
+				!isDeepStrictEqual(JSON.parse(row.filtersJson), JSON.parse(JSON.stringify(req.filters))) ||
+				!isDeepStrictEqual(
+					this.comparableOptions(JSON.parse(row.optionsJson ?? "{}") as RunOptions),
+					this.comparableOptions(req.options ?? {}),
+				) ||
+				!isDeepStrictEqual(row.payloadJson === undefined ? undefined : JSON.parse(row.payloadJson), req.payload)
+			) {
+				return { kind: "idempotency_conflict" };
+			}
 			const existing = this.live.get(created.run.runId);
 			// 同键并发:既有 run 还在跑就把同一个 promise 交出去,别让调用方以为已终态。
 			if (existing) {
@@ -271,27 +401,61 @@ export class RunManager {
 		// 按 §4.1 写的话,排在全局闸门后的请求会卡在 submit() 内、到不了 202 竞速点,客户端
 		// 既拿不到 200 也拿不到 202 —— 与 §6.4.2「窗口超时即回 202」的承诺直接矛盾,且会造出
 		// 「Java 读超时了但 run 还在跑」的孤儿(§10-2 警告的那个场景)。
-		const admission = this.gate.tryAcquire(req.sessionId);
+		const admission = this.gate.tryAcquire(
+			req.principal ? hashState([req.principal.tenantId, req.principal.userId, req.sessionId]) : req.sessionId,
+		);
 		if (admission.kind === "session_busy" || admission.kind === "queue_full") {
 			// 拒绝时把 insertQueued 刚原子占下的幂等键还回去,而不是 markError 把行钉成终态。
 			// 钉成终态会让"同一 clientRequestId 重试"命中 insertQueued 的 ON CONFLICT DO
 			// NOTHING、拿到这行已死的 error 行,而不是真的重新尝试准入——瞬时限流因此变成
 			// 永久任务丢失(设计裁定,见 finding #1)。
 			//
-			// 安全性依赖一个前提:insertQueued 与这里的 deleteRun 之间(以及中间的
-			// tryAcquire)全程同步、没有 await——已核实 insertQueued(node:sqlite 的
-			// DatabaseSync,同步 API)、tryAcquire(Gate 的同步准入判定)、deleteRun(同样是
-			// DatabaseSync 同步 API)三者之间这段代码不含任何 await,Node 单线程不会在这里
-			// 让出控制权,所以不存在"另一个同键请求在这行即将被删之间读到它"的窗口。
+			// submit() keeps same-key retries outside this asynchronous rollback
+			// window. Do not assume PostgreSQL operations are synchronous.
 			await this.store.deleteRun(runId);
 			return { kind: "rejected", rejection: admission };
 		}
 		const ticketPromise = admission.kind === "admitted" ? Promise.resolve(admission.ticket) : admission.ticket;
+		try {
+			await this.runtimeFactory.registerPending?.(runId);
+			if (this.inbox && req.options?.authorization && req.options.interaction) {
+				const prior = (await this.inbox.state(req.options.authorization))?.active;
+				const previous = prior ? await this.findRun(prior.runId) : undefined;
+				await this.inbox.begin(
+					req.options.authorization,
+					runId,
+					req.options.resumeFrom ?? runId,
+					previous && isTerminal(previous.status) ? previous.runId : undefined,
+				);
+			}
+		} catch (error) {
+			if (admission.kind === "admitted") admission.ticket.release();
+			else {
+				void admission.ticket.catch(() => {});
+				admission.cancel();
+			}
+			await this.runtimeFactory.unregisterPending?.(runId).catch(() => {});
+			await this.store.deleteRun(runId);
+			throw error;
+		}
 
 		const queued = admission.kind === "queued";
-		const entry: LiveRun = { completion: undefined as unknown as Promise<RunResult>, cancelRequested: false };
+		const entry: LiveRun = {
+			assemblyAbort: new AbortController(),
+			completion: undefined as unknown as Promise<RunResult>,
+			cancelRequested: false,
+			cancelQueued: admission.kind === "queued" ? admission.cancel : undefined,
+		};
 		this.live.set(runId, entry);
 		entry.completion = this.admitAndDrive(runId, req, ticketPromise, entry);
+		entry.completion = entry.completion.finally(async () => {
+			await this.runtimeFactory.unregisterPending?.(runId);
+			if (this.inbox && req.options?.authorization && req.options.interaction) {
+				const row = await this.store.findByRunId(runId);
+				await this.inbox.finish(req.options.authorization, runId, row?.status ?? "error");
+			}
+		});
+		void entry.completion.catch(() => {});
 		return { kind: "accepted", runId, completion: entry.completion, queued };
 	}
 
@@ -302,7 +466,14 @@ export class RunManager {
 		ticketPromise: Promise<GateTicket>,
 		entry: LiveRun,
 	): Promise<RunResult> {
-		const ticket = await ticketPromise;
+		let ticket: GateTicket;
+		try {
+			ticket = await ticketPromise;
+		} catch (error) {
+			if (error instanceof GateCancelledError) return this.finishAsAborted(runId, req.specId);
+			throw error;
+		}
+		entry.cancelQueued = undefined;
 
 		// 排队期间被 cancel:此时还没有 runtime 可 abort,直接放弃入场。
 		// 不装配、不起 MCP 子进程 —— 省掉一次纯浪费的装配。
@@ -311,6 +482,8 @@ export class RunManager {
 		let runtime: Runtime;
 		try {
 			runtime = await this.runtimeFactory({
+				initialInput: req.input,
+				signal: entry.assemblyAbort.signal,
 				specId: req.specId,
 				sessionId: req.sessionId,
 				runId,
@@ -323,6 +496,7 @@ export class RunManager {
 			});
 		} catch (error) {
 			// 装配期失败要早、要响亮,且必须还回令牌 —— 否则一次装配失败永久占额。
+			if (entry.cancelRequested) return this.finishAsAborted(runId, req.specId, ticket);
 			const message = error instanceof Error ? error.message : String(error);
 			try {
 				await this.store.markError(runId, message, this.now());
@@ -357,7 +531,7 @@ export class RunManager {
 		// 若这里仍然继续走 drive()/run(),就会把一个「已取消」的 run 又启动一遍,对 stub
 		// 而言直接挂死(自审时用 debug log 复现过这个 race:cancel() 恰好夹在「装配完成」
 		// 和「markRunning 前」之间)。因此必须像排队分支一样,直接按已取消收尾、绝不调用 run()。
-		if (entry.cancelRequested) {
+		const finishCancelledBeforeRun = async (): Promise<RunResult> => {
 			await runtime.abort().catch(() => {});
 			// try/finally(task-18b 复审 Important-1):finishAsAborted() 在 store.finish()
 			// 落库失败时会重抛(见该函数内部注释),重抛此前这里是三条顺序语句,一抛就会跳过
@@ -367,10 +541,11 @@ export class RunManager {
 			try {
 				return await this.finishAsAborted(runId, req.specId, ticket);
 			} finally {
-				unsubscribeEvents();
+				await unsubscribeEvents().catch(() => {});
 				await runtime.dispose().catch(() => {});
 			}
-		}
+		};
+		if (entry.cancelRequested) return finishCancelledBeforeRun();
 
 		try {
 			await this.store.markRunning(runId, this.now());
@@ -387,24 +562,38 @@ export class RunManager {
 			this.live.delete(runId);
 			this.progress.delete(runId);
 			ticket.release();
-			unsubscribeEvents();
+			await unsubscribeEvents().catch(() => {});
 			await runtime.dispose().catch(() => {});
 			throw error;
 		}
-		return this.drive(runId, runtime, req.input, ticket, unsubscribeEvents);
+		// markRunning is an async store operation. Cancellation can arrive after
+		// the first check but before it resolves; do not start a fresh runtime then.
+		if (entry.cancelRequested) return finishCancelledBeforeRun();
+		return this.drive(
+			runId,
+			runtime,
+			req.input,
+			ticket,
+			unsubscribeEvents,
+			req.specId,
+			req.options?.interaction ? req.options.authorization : undefined,
+		);
 	}
 
 	/** 排队中 / 装配后 run() 尚未起步即被取消的共同收尾:直接落库为 aborted,不调用 run()。 */
-	private async finishAsAborted(runId: string, specId: string, ticket: GateTicket): Promise<RunResult> {
-		const result: RunResult = {
-			runId,
-			specId,
-			status: "aborted",
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
-			turns: 0,
-			durationMs: 0,
-			judgeAttempts: {},
-		};
+	private async finishAsAborted(runId: string, specId: string, ticket?: GateTicket): Promise<RunResult> {
+		const result: RunResult = sealDelivery(
+			{
+				runId,
+				specId,
+				status: "aborted",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+				turns: 0,
+				durationMs: 0,
+				judgeAttempts: {},
+			},
+			"not_checked",
+		);
 		try {
 			await this.store.finish(runId, result, this.now());
 		} catch (error) {
@@ -419,7 +608,7 @@ export class RunManager {
 		} finally {
 			this.live.delete(runId);
 			this.progress.delete(runId);
-			ticket.release();
+			ticket?.release();
 		}
 		return result;
 	}
@@ -429,13 +618,22 @@ export class RunManager {
 		runtime: Runtime,
 		input: string,
 		ticket: GateTicket,
-		unsubscribeEvents: () => void,
+		unsubscribeEvents: () => Promise<void>,
+		specId: string,
+		authorization?: Grant,
 	): Promise<RunResult> {
 		try {
-			const result = await runtime.run(input, { runId });
+			const result = this.validateResult(await runtime.run(input, { runId }), { runId, specId });
+			if (authorization && this.inbox && result.status === "completed") {
+				if (!runtime.getConversation) throw new Error("conversation_not_supported");
+				await this.inbox.stageConversation(authorization, runId, await runtime.getConversation());
+			}
+			await unsubscribeEvents();
 			await this.store.finish(runId, result, this.now());
+			await runtime.confirmResultStored?.(result);
 			return result;
 		} catch (error) {
+			await unsubscribeEvents().catch(() => {});
 			const message = error instanceof Error ? error.message : String(error);
 			try {
 				await this.store.markError(runId, message, this.now());
@@ -462,9 +660,184 @@ export class RunManager {
 			this.live.delete(runId);
 			this.progress.delete(runId);
 			ticket.release();
-			unsubscribeEvents();
+			await unsubscribeEvents().catch(() => {});
 			await runtime.dispose().catch(() => {});
 		}
+	}
+
+	async findRun(runId: string): Promise<RunRecord | undefined> {
+		const row = await this.store.findByRunId(runId);
+		if (
+			row &&
+			!isTerminal(row.status) &&
+			!this.live.has(runId) &&
+			this.runtimeFactory.isRunActive &&
+			!(await this.runtimeFactory.isRunActive(row))
+		) {
+			await this.store.markStale?.(runId, "process_interrupted", this.now());
+			return this.store.findByRunId(runId);
+		}
+		return row;
+	}
+	async shutdown(): Promise<void> {
+		this.closing = true;
+		if (this.inboxTimer) clearInterval(this.inboxTimer);
+		await this.dispatching?.catch(() => {});
+		await Promise.allSettled([...this.submissions.values()]);
+		const entries = [...this.live.entries()];
+		await Promise.allSettled(entries.map(([id]) => this.cancel(id)));
+		await Promise.allSettled(entries.map(([, entry]) => entry.completion));
+		await this.runtimeFactory.close?.();
+	}
+	async enqueueMessage(grant: Grant, input: MessageInput): Promise<InboxMessage> {
+		if (!this.inbox) throw new Error("messages_not_configured");
+		const row = await this.findRun(input.targetRunId ?? input.afterRunId ?? "");
+		if (!row?.principalJson) throw new Error("run_not_found");
+		authorize(grant, input.kind === "steer" ? "run:steer" : "run:follow_up", {
+			sessionId: row.sessionId,
+			taskKind: row.taskKind,
+			principal: JSON.parse(row.principalJson) as Principal,
+		});
+		const options = JSON.parse(row.optionsJson ?? "{}") as RunOptions;
+		if (
+			!options.interaction ||
+			!options.authorization ||
+			grantScopeHash(options.authorization) !== grantScopeHash(grant)
+		)
+			throw new Error("message_scope_incompatible");
+		return this.inbox.enqueue(grant, input);
+	}
+	async updateAuthorization(runId: string, grant: Grant, revoke = false): Promise<void> {
+		if (!this.inbox) throw new Error("authorization_lease_not_configured");
+		const row = await this.findRun(runId);
+		if (!row?.principalJson) throw new Error("run_not_found");
+		authorize(grant, revoke ? "run:cancel" : "run:renew", {
+			sessionId: row.sessionId,
+			taskKind: row.taskKind,
+			principal: JSON.parse(row.principalJson) as Principal,
+		});
+		const options = JSON.parse(row.optionsJson ?? "{}") as RunOptions;
+		if (!options.authorization) throw new Error("authorization_lease_missing");
+		const lease = new GrantLease(this.inbox.store),
+			root = options.resumeFrom ?? runId;
+		if (revoke) {
+			await lease.revoke(root, options.authorization);
+			await this.cancel(runId);
+		} else {
+			if (grantScopeHash(options.authorization) !== grantScopeHash(grant))
+				throw new Error("authorization_scope_changed");
+			await lease.renew(root, grant);
+		}
+	}
+	async listMessages(grant: Grant): Promise<InboxMessage[]> {
+		if (!this.inbox) throw new Error("messages_not_configured");
+		authorize(grant, "run:read", { sessionId: grant.sessionId });
+		return this.inbox.messages(grant);
+	}
+	private dispatchFollowUps(): Promise<void> {
+		if (this.dispatching) return this.dispatching;
+		this.dispatching = this.dispatchBatch().finally(() => {
+			this.dispatching = undefined;
+		});
+		return this.dispatching;
+	}
+	private async dispatchBatch(): Promise<void> {
+		if (!this.inbox || this.closing) return;
+		const sessions = await this.inbox.scan(this.inboxCursor);
+		this.inboxCursor = sessions.length === 100 ? sessions[sessions.length - 1].key : "";
+		for (const session of sessions) {
+			if (this.closing) break;
+			const state = await this.inbox.state(session.grant);
+			if (state?.active && !this.live.has(state.active.runId)) {
+				const row = await this.findRun(state.active.runId);
+				if (row && isTerminal(row.status)) await this.inbox.finish(session.grant, row.runId, row.status);
+			}
+			const message = await this.inbox.claimFollowUp(session.grant, this.dispatcherId);
+			if (!message) continue;
+			try {
+				const parent = await this.findRun(message.afterRunId!);
+				if (!parent?.principalJson) throw new Error("run_not_found");
+				authorize(message.grant, "run:follow_up", {
+					sessionId: parent.sessionId,
+					taskKind: parent.taskKind,
+					principal: JSON.parse(parent.principalJson) as Principal,
+				});
+				const {
+					resumeFrom: _resumeFrom,
+					conversation: _conversation,
+					messageId: _messageId,
+					...options
+				} = JSON.parse(parent.optionsJson ?? "{}") as RunOptions;
+				const outcome = await this.submit({
+					taskKind: parent.taskKind,
+					specId: parent.specId,
+					input: message.text,
+					clientRequestId: `follow-up:${message.messageId}`,
+					sessionId: parent.sessionId,
+					sessionIdExplicit: true,
+					principal: JSON.parse(parent.principalJson) as Principal,
+					filters: JSON.parse(parent.filtersJson) as RunFilters,
+					options: {
+						...options,
+						authorization: message.grant,
+						interaction: true,
+						conversation: message.conversation,
+						messageId: message.messageId,
+					},
+				});
+				if (outcome.kind === "accepted" || outcome.kind === "idempotent")
+					await this.inbox.dispatched(message.grant, message.messageId, this.dispatcherId, outcome.runId);
+				else
+					await this.inbox.dispatched(
+						message.grant,
+						message.messageId,
+						this.dispatcherId,
+						undefined,
+						outcome.kind === "rejected" ? outcome.rejection.kind : outcome.kind,
+					);
+			} catch (error) {
+				await this.inbox.dispatched(
+					message.grant,
+					message.messageId,
+					this.dispatcherId,
+					undefined,
+					error instanceof Error ? error.message : "dispatch_failed",
+				);
+			}
+		}
+	}
+	async resume(
+		runId: string,
+		clientRequestId: string,
+		authorization?: Grant,
+	): Promise<SubmitOutcome | { kind: "not_found" } | { kind: "not_resumable" }> {
+		if (!this.runtimeFactory.supportsResume) return { kind: "not_resumable" };
+		const row = await this.findRun(runId);
+		if (!row) return { kind: "not_found" };
+		if (row.status === "completed") return { kind: "not_resumable" };
+		const options = JSON.parse(row.optionsJson ?? "{}") as RunOptions;
+		if (options.durableSession === false) return { kind: "not_resumable" };
+		if (
+			options.authorization &&
+			(!authorization || grantScopeHash(options.authorization) !== grantScopeHash(authorization))
+		)
+			return { kind: "not_resumable" };
+		return this.submit({
+			principal: row.principalJson ? (JSON.parse(row.principalJson) as Principal) : undefined,
+			taskKind: row.taskKind,
+			specId: row.specId,
+			sessionId: row.sessionId,
+			sessionIdExplicit: true,
+			clientRequestId,
+			input: row.input,
+			filters: JSON.parse(row.filtersJson) as RunFilters,
+			options: {
+				...options,
+				...(authorization ? { authorization } : {}),
+				resumeFrom: options.resumeFrom ?? row.runId,
+			},
+			payload: row.payloadJson ? (JSON.parse(row.payloadJson) as Record<string, unknown>) : undefined,
+		});
 	}
 
 	async cancel(runId: string): Promise<CancelOutcome> {
@@ -473,6 +846,13 @@ export class RunManager {
 			// 置标志再 abort:排队中的 run 还没有 runtime,标志让 admitAndDrive 在拿到票后
 			// 直接放弃入场。已在跑的 run 两条都生效(abort 立即起作用)。
 			entry.cancelRequested = true;
+			entry.assemblyAbort.abort(new Error("assembly_cancelled"));
+			if (entry.cancelQueued?.()) {
+				await entry.completion.catch((error: unknown) => {
+					console.error(`[RunManager] queued cancellation could not be persisted for "${runId}"`, error);
+				});
+				return "accepted";
+			}
 			if (entry.runtime) {
 				// cancelRequested 在 abort() 之前已经置位 —— 取消意图已经记下了。真实的
 				// SessionRuntime.abort() 可能抛(stub 不会),抛错不能让 cancel() 返回的

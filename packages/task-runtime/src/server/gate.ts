@@ -20,6 +20,10 @@ export interface GateTicket {
 	release: () => void;
 }
 
+export class GateCancelledError extends Error {
+	name = "GateCancelledError";
+}
+
 export interface GateOptions {
 	maxConcurrent?: number;
 	maxQueueDepth?: number;
@@ -33,7 +37,7 @@ export interface GateOptions {
  */
 export type GateAdmission =
 	| { kind: "admitted"; ticket: GateTicket }
-	| { kind: "queued"; ticket: Promise<GateTicket> }
+	| { kind: "queued"; ticket: Promise<GateTicket>; cancel: () => boolean }
 	| GateRejection;
 
 export function isRejection(x: GateTicket | GateRejection): x is GateRejection {
@@ -50,13 +54,23 @@ export class Gate {
 	private readonly maxQueueDepth: number;
 	private readonly retryAfterSeconds: number;
 	private readonly busySessions = new Set<string>();
-	private readonly waiting: Array<{ sessionId: string; resolve: (ticket: GateTicket) => void }> = [];
+	private readonly waiting: Array<{
+		sessionId: string;
+		resolve: (ticket: GateTicket) => void;
+		reject: (error: Error) => void;
+	}> = [];
 	private active = 0;
 
 	constructor(options: GateOptions = {}) {
 		this.maxConcurrent = options.maxConcurrent ?? 4;
 		this.maxQueueDepth = options.maxQueueDepth ?? 16;
 		this.retryAfterSeconds = options.retryAfterSeconds ?? 5;
+		if (!Number.isInteger(this.maxConcurrent) || this.maxConcurrent < 1)
+			throw new Error("maxConcurrent must be a positive integer");
+		if (!Number.isInteger(this.maxQueueDepth) || this.maxQueueDepth < 0)
+			throw new Error("maxQueueDepth must be a non-negative integer");
+		if (!Number.isInteger(this.retryAfterSeconds) || this.retryAfterSeconds < 0)
+			throw new Error("retryAfterSeconds must be a non-negative integer");
 	}
 
 	get activeCount(): number {
@@ -85,14 +99,23 @@ export class Gate {
 			this.busySessions.delete(sessionId);
 			return { kind: "queue_full", retryAfterSeconds: this.retryAfterSeconds };
 		}
-		// ⚠ 这个 promise 没有取消机制:调用方一旦放弃等待,就会永久泄漏一个队列位与
-		// 会话位,Gate 层无法自愈。当前唯一的合法调用方(RunManager)保证会把这条链
-		// 驱动到底、不放弃,所以该泄漏当前不可达;若将来出现会放弃等待的调用方,必须
-		// 先给 Gate 加取消支持。
-		const ticket = new Promise<GateTicket>((resolve) => {
-			this.waiting.push({ sessionId, resolve });
+		let waiter!: (typeof this.waiting)[number];
+		const ticket = new Promise<GateTicket>((resolve, reject) => {
+			waiter = { sessionId, resolve, reject };
+			this.waiting.push(waiter);
 		});
-		return { kind: "queued", ticket };
+		return {
+			kind: "queued",
+			ticket,
+			cancel: () => {
+				const index = this.waiting.indexOf(waiter);
+				if (index < 0) return false;
+				this.waiting.splice(index, 1);
+				this.busySessions.delete(sessionId);
+				waiter.reject(new GateCancelledError("queued admission cancelled"));
+				return true;
+			},
+		};
 	}
 
 	/** acquire 是 tryAcquire 的薄包装:admitted 直接拆出 ticket,queued 就 await 那个 promise。 */

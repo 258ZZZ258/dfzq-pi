@@ -116,7 +116,14 @@ export function deriveFastSpec(spec: RuntimeSpec): RuntimeSpec {
 		systemPrompt: fp.systemPrompt,
 		appendSystemPrompt: undefined,
 		thinkingLevel: fp.thinkingLevel ?? spec.thinkingLevel,
-		limits: fp.limits,
+		limits: {
+			...fp.limits,
+			...(spec.limits.maxTurns === undefined
+				? {}
+				: {
+						maxTurns: Math.min(spec.limits.maxTurns, fp.limits.maxTurns ?? spec.limits.maxTurns),
+					}),
+		},
 		stopPolicy: undefined,
 		outputContract: undefined,
 		resultPolicy,
@@ -125,6 +132,8 @@ export function deriveFastSpec(spec: RuntimeSpec): RuntimeSpec {
 }
 
 export interface FastPathRuntimeOptions {
+	signal?: AbortSignal;
+	assemblyTimeoutMs?: number;
 	/** 主 spec(含 fastPath)。内部自己 deriveFastSpec,调用方不必先派生。 */
 	spec: RuntimeSpec;
 	profile: ProviderProfile;
@@ -191,8 +200,6 @@ function hasFetchedText(item: unknown): item is DetailItem {
  *  不代表期望它触发。 */
 function describeTripped(kind: LimitKind, limits: RuntimeLimits): string {
 	if (kind === "runTimeout") return `阶段 1 超时(${limits.runTimeoutMs}ms)`;
-	if (kind === "maxCostUsd") return `阶段 1 撞到费用上限(maxCostUsd=${limits.maxCostUsd})`;
-	if (kind === "maxTotalTokens") return `阶段 1 撞到 token 上限(maxTotalTokens=${limits.maxTotalTokens})`;
 	return `阶段 1 撞到限额:${kind}`;
 }
 
@@ -281,6 +288,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 
 	let currentRunId = "";
 	let currentInput = "";
+	let toolAbortController: AbortController | undefined;
 	let seq = 0;
 	const listeners = new Set<(event: RuntimeEvent) => void>();
 
@@ -352,9 +360,12 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 			);
 		},
 		getRunInput: () => currentInput,
+		getAbortSignal: () => toolAbortController?.signal,
 	};
 
 	assembled = await assemble({
+		signal: options.signal,
+		assemblyTimeoutMs: options.assemblyTimeoutMs,
 		spec: fastSpec,
 		profile: options.profile,
 		registry: options.registry,
@@ -373,6 +384,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	// 这是尽力而为的清理路径,不是公开的 Runtime.abort() 契约(下面 return 里那个),所以
 	// 失败在这里打日志后吞掉,而不是往上传播。
 	abortFn = () => {
+		toolAbortController?.abort(new Error("run interrupted"));
 		void assembled.session.abort().catch((error: unknown) => {
 			console.error(
 				`[FastPathRuntime] abort() triggered by a limit/timeout failed for spec "${options.spec.id}"`,
@@ -480,7 +492,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	}
 
 	/**
-	 * 挂钟超时与限额插件(maxCostUsd/maxTotalTokens,由 assemble() 从 fastSpec.limits 无条件
+	 * 挂钟超时与限额插件(maxTurns,由 assemble() 从 fastSpec.limits 无条件
 	 * 挂载的 limits 插件负责计数)必须在两次模型调用之间也查一次,不能只在模型②返回之后查:
 	 * runTimeoutMs 的 timer 一次性、limits 插件的 turn_end 钩子命中后 `if (state.tripped)
 	 * return` 永久停手(final-judge.ts 的 runFinalJudges 注释详述过这个组合),而 abort 本身
@@ -489,6 +501,13 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 	 * 的模型调用,快路径存在的意义(落进 Java 的 30s 窗口)反而被它自己吃掉。
 	 */
 	function checkPreempted(runId: string, startedAt: number, output: string): FastPathRun | undefined {
+		if (stopRequested) {
+			const reason = "任务已取消";
+			return {
+				verdict: { accept: false, reason },
+				result: normalize(runId, startedAt, output, { status: "aborted", errorMessage: reason }),
+			};
+		}
 		const tripped = limitState.tripped;
 		if (!tripped) return undefined;
 		const reason = describeTripped(tripped, fp.limits);
@@ -502,7 +521,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 			// (finishAsAborted),把挂钟超时也映射成 "aborted" 会让 Java 侧以为是用户撤销了
 			// 请求,排障方向被带偏;而 `limit` 字段一旦被 status !== "limit_exceeded" 的结果
 			// 带出去,正是 session-runtime.ts 那段注释点名过的"下游按 status==='limit_exceeded'
-			// 记预算超支会直接漏记"那种自相矛盾组合。
+			// 记录轮数或超时中止会直接漏记"那种自相矛盾组合。
 			result: normalize(runId, startedAt, output, {
 				status: "limit_exceeded",
 				errorMessage: reason,
@@ -538,6 +557,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		// N-4:`stopRequested` 与下面这两行一样是 per-run 状态,同一条纪律一起重置——理由见上面
 		// `stopRequested` 声明处的注释。
 		stopRequested = false;
+		toolAbortController = new AbortController();
 		// 每次 run() 开头重置:不重置的话,同一个 runtime 上的第二次 run() 会继承上一次已经
 		// tripped 的 limitState,一进来就被 checkPreempted() 判掉(与 session-runtime.ts 的
 		// run() 开头重置 state.turns/state.tripped 同一条纪律)。
@@ -583,6 +603,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 			});
 		} finally {
 			if (timer) clearTimeout(timer);
+			toolAbortController.abort(new Error("run finished"));
 		}
 	}
 
@@ -743,6 +764,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		// 成功。
 		abort: () => {
 			stopRequested = true;
+			toolAbortController?.abort(new Error("run cancelled"));
 			return session.abort();
 		},
 		waitForIdle: () => session.waitForIdle(),
@@ -758,6 +780,7 @@ export async function createFastPathRuntime(options: FastPathRuntimeOptions): Pr
 		},
 		snapshot: () => ({ sessionId: session.sessionId, sessionFile: session.sessionFile ?? undefined }),
 		dispose: async () => {
+			toolAbortController?.abort(new Error("runtime disposed"));
 			unsubscribeSession();
 			listeners.clear();
 			await assembled.dispose();

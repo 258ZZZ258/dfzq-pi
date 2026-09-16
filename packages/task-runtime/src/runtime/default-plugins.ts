@@ -1,3 +1,4 @@
+import { auditReportReadinessDescriptor } from "../audit-report/report-readiness-gate.ts";
 import { PluginRegistry } from "./plugin-registry.ts";
 import { limitsDescriptor } from "./plugins/limits.ts";
 import { pathGuardDescriptor } from "./plugins/path-guard.ts";
@@ -25,5 +26,6 @@ export function createDefaultPluginRegistry(deps: DefaultPluginDeps = {}): Plugi
 	registry.register(resultBudgetDescriptor);
 	registry.register(pathGuardDescriptor);
 	registry.register(createSufficiencyGateDescriptor(deps.assess));
+	registry.register(auditReportReadinessDescriptor);
 	return registry;
 }

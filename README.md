@@ -111,3 +111,7 @@ MIT
   <br /><br />
   <a href="https://exe.dev"><img src="packages/coding-agent/docs/images/exy.png" alt="Exy mascot" width="48" /><br />exe.dev</a>
 </p>
+
+## DFZQ runtime and Python service
+
+The task runtime is in `packages/task-runtime`; the embedded Python retrieval/document service is in [`services/audit-ai`](services/audit-ai/README.md). This integration excludes optimization/evidence-proposal commands and their feedback subsystem. See the service README for repository-relative commands and the migration boundary.

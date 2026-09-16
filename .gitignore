@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 .artifacts/
 *.log
@@ -32,6 +32,7 @@ packages/ai/src/providers/.model-generation-*/
 .npm/
 coverage/
 .nyc_output/
+__pycache__/
 .pi_config/
 tui-debug.log
 compaction-results/
@@ -40,6 +41,7 @@ syntax.jsonl
 out.jsonl
 pi-*.html
 out.html
+packages/task-runtime/output/audit-report-*/
 packages/coding-agent/binaries/
 todo.md
 plans/

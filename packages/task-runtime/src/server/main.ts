@@ -1,9 +1,19 @@
-import { readdir, readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { mkdir, readdir, readFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { type ServerType, serve } from "@hono/node-server";
+import { createDisclosureLinkTools, disclosureLinkDelivery } from "../audit-report/disclosure-link.ts";
+import { parseReportInput } from "../audit-report/report-input.ts";
+import type { ReportNarrativeProcessor } from "../audit-report/report-narrative-processing.ts";
+import { createAuditReportRuntime } from "../audit-report/report-runtime.ts";
+import { createBoundAuditReportTools } from "../audit-report/report-tools.ts";
+import { AuthorizationError, type GrantVerifier } from "../auth/grant.ts";
+import type { GrantLease } from "../auth/lease.ts";
 import type { ProviderProfile } from "../env/provider-profile.ts";
+import type { SessionInbox } from "../interaction/inbox.ts";
+import type { MemoryService } from "../memory/service.ts";
 import { loadSpecRouter } from "../router/router.ts";
 import { createDefaultPluginRegistry } from "../runtime/default-plugins.ts";
+import { hashSchema } from "../runtime/delivery.ts";
 import { createEscalatingRuntime } from "../runtime/escalating-runtime.ts";
 import { createFastPathRuntime } from "../runtime/fast-path-runtime.ts";
 import { createArtifactStore, createMinioObjectGetter } from "../runtime/policy-compare/artifact-store.ts";
@@ -14,17 +24,28 @@ import { createVersionDiffRuntime } from "../runtime/policy-compare/version-diff
 import { createSessionRuntime } from "../runtime/session-runtime.ts";
 import { resolveSpecPromptPaths } from "../spec/resolve-prompt-paths.ts";
 import type { RuntimeSpec } from "../spec/types.ts";
+import type { ToolLedger } from "../state/tool-ledger.ts";
 import { createPostgresRunStore } from "../store/postgres.ts";
 import { createSqliteRunStore } from "../store/sqlite.ts";
+import { createAuditReportToolset } from "../toolsets/audit-report.ts";
+import { authorizedToolset } from "../toolsets/authorized.ts";
 import { createMcpToolset, type McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { ToolsetRegistry } from "../toolsets/registry.ts";
+import { createSupervisionAnalysisToolset } from "../toolsets/supervision-analysis.ts";
 import { createApp } from "./app.ts";
 import { Gate } from "./gate.ts";
+import { localAuditEnvironment, localAuditServers } from "./local-services.ts";
+import { loadResultValidator } from "./output-delivery.ts";
 import type { RuntimeFactory } from "./run-manager.ts";
 import { RunManager } from "./run-manager.ts";
 
 export interface ServeOptions {
+	inbox?: SessionInbox;
+	grants?: GrantVerifier;
+	memory?: MemoryService;
 	port: number;
+	/** Bind loopback by default; containers may explicitly select all interfaces. */
+	hostname?: string;
 	/** audit-ai pipeline PostgreSQL DSN；任务历史唯一持久化位置。 */
 	databaseUrl?: string;
 	/** @deprecated 仅兼容旧测试配置；生产服务不再读取 SQLite。 */
@@ -38,19 +59,12 @@ export interface ServeOptions {
 	maxConcurrent?: number;
 	maxQueueDepth?: number;
 	documents?: DocumentsClient;
-	/**
-	 * 监听地址。缺省 `127.0.0.1` —— 本服务**不做鉴权之外的网络边界**,绑回环是
-	 * 宿主部署时的纵深防御(禁止把 18080 暴露到办公网段)。
-	 *
-	 * 🔴 容器化部署必须显式传 `0.0.0.0`:容器内绑回环 = Docker 的端口转发够不着,
-	 * 症状是宿主 curl 报 `Empty reply from server`,而容器日志里明明已经 "listening"。
-	 * 在容器里放宽到 0.0.0.0 不降低边界:容器网络命名空间本身是隔离的,且 compose
-	 * 只把宿主端口发布到 `127.0.0.1:`,对外可达性与宿主部署时一致。
-	 */
-	hostname?: string;
 }
 
 export async function startServer(options: ServeOptions): Promise<{ port: number; close: () => Promise<void> }> {
+	if (options.databaseUrl && !options.grants) throw new Error("grant_verifier_required");
+	const router = await loadSpecRouter(options.specsDir);
+	const validateResult = await loadResultValidator(router, options.specsDir);
 	// `dbPath` 仅供已有单测注入同步 fake-store 行为；CLI 生产路径只传 databaseUrl，缺失即拒绝启动。
 	const store = options.databaseUrl
 		? await createPostgresRunStore(options.databaseUrl)
@@ -60,16 +74,24 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 					throw new Error("PIPELINE_DB_DSN is required; SQLite task storage has been removed");
 				})();
 	// 必须在开始接请求之前跑:否则 Java 会永远等一个不会完成的 run(设计文档 §5.7)。
-	const recovered = await store.recoverStaleRuns(Date.now());
+	// Durable hosts use lease/fence recovery; a new replica must not fail another live replica's rows.
+	const recovered = options.runtimeFactory.supportsResume ? 0 : await store.recoverStaleRuns(Date.now());
 	if (recovered > 0) {
 		console.error(`[task-runtime] startup recovery marked ${recovered} stale run(s) as error`);
 	}
 
-	const router = await loadSpecRouter(options.specsDir);
 	const gate = new Gate({ maxConcurrent: options.maxConcurrent, maxQueueDepth: options.maxQueueDepth });
-	const manager = new RunManager({ store, gate, runtimeFactory: options.runtimeFactory });
+	const manager = new RunManager({
+		inbox: options.inbox,
+		store,
+		gate,
+		runtimeFactory: options.runtimeFactory,
+		validateResult,
+	});
 
 	const app = createApp({
+		grants: options.grants,
+		memory: options.memory,
 		manager,
 		router,
 		store,
@@ -105,7 +127,7 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 				resolve(instance);
 			};
 			instance = serve(
-				{ fetch: app.fetch, port: options.port, hostname: options.hostname ?? "127.0.0.1" },
+				{ fetch: app.fetch, port: options.port, hostname: options.hostname || "127.0.0.1" },
 				onListening,
 			);
 			instance.once("error", onError);
@@ -132,31 +154,44 @@ export async function startServer(options: ServeOptions): Promise<{ port: number
 	// close() 必须能安全重入,与 store.close()(见 store/sqlite.ts)同一条纪律 ——
 	// 调用方(以及测试的 afterEach)可能在已经 close 过一次之后再 close 一次;不设防的话
 	// 第二次调用会在 server 上撞 ERR_SERVER_NOT_RUNNING。
-	let closed = false;
+	let closePromise: Promise<void> | undefined;
 	return {
 		port,
-		close: async () => {
-			if (closed) return;
-			closed = true;
-			// 优雅下线(非重启)时仍有在途 run:没有排空协议(不在 S1a 判据内,见 brief),
-			// 这些 run 会随进程一起消失。默认行为是完全静默 —— 调用方看到的只是 close()
-			// resolve 了,run 的结果再也不会出现,直到下次启动 recoverStaleRuns() 才会把
-			// 它们标成 error。把这一步变响亮,好让运维在日志里能看到"为什么"。
-			if (manager.activeRuns > 0) {
-				console.error(
-					`[task-runtime] closing with ${manager.activeRuns} run(s) still in flight; their results will be ` +
-						"lost and the rows will be marked as error by recoverStaleRuns() on next startup",
-				);
-			}
-			await new Promise<void>((resolve, reject) => {
-				server.close((error) => (error ? reject(error) : resolve()));
-			});
-			await store.close();
+		close: () => {
+			closePromise ??= (async () => {
+				// 优雅下线(非重启)时仍有在途 run:没有排空协议(不在 S1a 判据内,见 brief),
+				// 这些 run 会随进程一起消失。默认行为是完全静默 —— 调用方看到的只是 close()
+				// resolve 了,run 的结果再也不会出现,直到下次启动 recoverStaleRuns() 才会把
+				// 它们标成 error。把这一步变响亮,好让运维在日志里能看到"为什么"。
+				if (manager.activeRuns > 0 && !options.runtimeFactory.supportsResume) {
+					console.error(
+						`[task-runtime] closing with ${manager.activeRuns} run(s) still in flight; their results will be ` +
+							"lost and the rows will be marked as error by recoverStaleRuns() on next startup",
+					);
+				}
+				const listenerClosed = new Promise<void>((resolve, reject) => {
+					server.close((error) => (error ? reject(error) : resolve()));
+				});
+				const settled = await Promise.allSettled([
+					listenerClosed,
+					...(options.runtimeFactory.supportsResume ? [manager.shutdown()] : []),
+				]);
+				await store.close();
+				const errors = settled.flatMap((item) => (item.status === "rejected" ? [item.reason] : []));
+				if (errors.length) throw new AggregateError(errors, "server shutdown failed");
+			})();
+			return closePromise;
 		},
 	};
 }
 
 export interface DefaultFactoryOptions {
+	grantLeases?: GrantLease;
+	inbox?: SessionInbox;
+	memory?: MemoryService;
+	toolLedger?: ToolLedger;
+	/** Per-runtime cooperative assembly deadline; server-owned, not a Java option. */
+	assemblyTimeoutMs?: number;
 	/** ProviderProfile 的 JSON 路径。 */
 	profilePath: string;
 	/** 每个 session 的工作目录根。 */
@@ -167,6 +202,10 @@ export interface DefaultFactoryOptions {
 	 * router 只会是死参数。
 	 */
 	specsDir: string;
+	auditReportSources?: {
+		apiBaseUrl: string;
+		operatingWorkbookPath: string;
+	};
 }
 
 /** spec 文件在 RuntimeSpec 之外多带一个 mcpServers,与 cli/main.ts 的 SpecFile 同一形状。 */
@@ -175,6 +214,8 @@ interface SpecFile extends RuntimeSpec {
 }
 
 export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions): Promise<RuntimeFactory> {
+	const auditEnv = localAuditEnvironment(process.env);
+	await mkdir(dirname(auditEnv.POLICY_MCP_AUDIT_LOG!), { recursive: true });
 	const profile = JSON.parse(await readFile(options.profilePath, "utf8")) as ProviderProfile;
 	// spec 文件重读一次:SpecRouter 只持有 RuntimeSpec,mcpServers 不在该类型上。
 	const specFiles = new Map<string, SpecFile>();
@@ -222,9 +263,40 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 
 	// ⚠ run 的 options 必须改名:外层 `options` 是 DefaultFactoryOptions(含 workRoot),
 	// 同名解构会把它遮蔽掉,下面的 join(options.workRoot, ...) 会解析到错的目录。
-	return async ({ specId, sessionId, runId, filters, options: runOptions, payload }) => {
-		const spec = specFiles.get(specId);
-		if (!spec) throw new Error(`Spec "${specId}" is not registered`);
+	return async ({
+		specId,
+		sessionId,
+		runId,
+		filters,
+		options: runOptions,
+		payload,
+		signal,
+		resume,
+		onCheckpoint,
+		operationRunId,
+	}) => {
+		const baseSpec = specFiles.get(specId);
+		if (!baseSpec) throw new Error(`Spec "${specId}" is not registered`);
+		const grant = runOptions.authorization;
+		const checkExecution = async () => {
+			if (!grant) return;
+			if (options.grantLeases)
+				Object.assign(grant, await options.grantLeases.current(operationRunId ?? runId, grant));
+			if (grant.exp * 1000 <= Date.now()) throw new AuthorizationError("unauthorized");
+		};
+		await checkExecution();
+		const spec = grant
+			? { ...baseSpec, tools: baseSpec.tools.filter((name) => grant.tools.includes(name)) }
+			: baseSpec;
+		if (resume && spec.durableSession === false) throw new Error("task_session_recovery_unsupported");
+		const checkNativeTool = async (name?: string) => {
+			await checkExecution();
+			const internal =
+				spec.toolset === "audit-report"
+					? ["begin_report_run", "resolve_report_document", "validate_report_document"].includes(name ?? "")
+					: spec.toolset === "audit-disclosure" && name === "validate_disclosure_result";
+			if (name && !internal && grant && !grant.tools.includes(name)) throw new AuthorizationError("forbidden");
+		};
 
 		// 🔴 每次调用都新建一个 ToolsetRegistry。ToolsetRegistry **必须按 run 新建**
 		// (toolsets/registry.ts 的类注释)。两阶段各调一次这个闭包 —— 不共用 MCP 会话正是
@@ -234,23 +306,95 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 		// 无害);真正会炸的是**这个闭包自己**如果被改成复用同一个 registry 实例、却仍然在
 		// 每次调用里执行 `register(...)`——那样第二次调用会在一个已经登记过 `spec.toolset`
 		// 的实例上再登记一次,直接抛 `Toolset "policy-query" is already registered`。
-		const buildToolsets = (): ToolsetRegistry => {
+		const buildToolsets = (narrativeProcessor?: ReportNarrativeProcessor): ToolsetRegistry => {
 			const registry = new ToolsetRegistry();
-			registry.register(
-				spec.toolset,
-				createMcpToolset(spec.mcpServers ?? [], {
-					runId,
-					// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
-					// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
-					permTags: filters.permTags ?? [],
-					corpusTypes: filters.corpusTypes,
-					options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
-				}),
-			);
+			if (spec.toolset === "audit-disclosure") {
+				registry.register(
+					spec.toolset,
+					authorizedToolset(
+						async () => createDisclosureLinkTools(payload, runOptions.reportTaskId),
+						checkNativeTool,
+					),
+				);
+			} else if (spec.toolset === "supervision-analysis") {
+				registry.register(
+					spec.toolset,
+					authorizedToolset(createSupervisionAnalysisToolset(payload), checkNativeTool),
+				);
+			} else if (spec.toolset === "audit-report") {
+				if (!runOptions.reportTaskId || !runOptions.reportType) {
+					throw new Error("audit-report requires options.reportTaskId and options.reportType");
+				}
+				if (payload !== undefined) {
+					const dataset = parseReportInput(payload, runOptions.reportTaskId, runOptions.reportType);
+					registry.register(
+						spec.toolset,
+						authorizedToolset(
+							async () =>
+								createBoundAuditReportTools(
+									dataset,
+									resolve(options.specsDir, "audit-report/skills"),
+									narrativeProcessor,
+								),
+							checkNativeTool,
+						),
+					);
+					return registry;
+				}
+				if (!options.auditReportSources)
+					throw new Error("audit-report requires Java input payload or server source configuration");
+				registry.register(
+					spec.toolset,
+					authorizedToolset(
+						createAuditReportToolset({
+							taskId: runOptions.reportTaskId,
+							reportType: runOptions.reportType,
+							apiBaseUrl: options.auditReportSources.apiBaseUrl,
+							operatingWorkbookPath: options.auditReportSources.operatingWorkbookPath,
+							skillRoot: resolve(options.specsDir, "audit-report/skills"),
+							narrativeProcessor,
+						}),
+						checkNativeTool,
+					),
+				);
+			} else {
+				registry.register(
+					spec.toolset,
+					createMcpToolset(
+						localAuditServers(spec.mcpServers ?? [], auditEnv),
+						{
+							runId,
+							...(grant
+								? {
+										tenantId: grant.tenantId,
+										userId: grant.sub,
+										projectId: filters.projectId,
+										owner: filters.owner,
+									}
+								: {}),
+							// 默认值在**消费端**给,不在存档层(见 Task 4:filters_json 必须原样存档)。
+							// 空数组 = 无额外限制,是边界契约明文非 fail-open(routes_boundary.py:39-40)。
+							permTags: filters.permTags ?? [],
+							corpusTypes: filters.corpusTypes,
+							options: { topK: runOptions.topK, includeSuperseded: runOptions.includeSuperseded },
+						},
+						options.toolLedger
+							? { ledger: options.toolLedger, version: hashSchema(spec), operationRunId }
+							: undefined,
+						grant
+							? async (tool) => {
+									await checkExecution();
+									if (!grant.tools.includes(tool)) throw new AuthorizationError("forbidden");
+								}
+							: undefined,
+					),
+				);
+			}
 			return registry;
 		};
 
-		const workdir = join(options.workRoot, sessionId);
+		// Session IDs are opaque input, never filesystem paths.
+		const workdir = join(options.workRoot, hashSchema(grant ? [grant.tenantId, grant.sub, sessionId] : sessionId));
 
 		// 🔴 分派顺序:`workflow` 排在 `fastPath` 之前。前者整条换掉 Runtime 实现(连
 		// SessionRuntime 都不经过),后者是 SessionRuntime 内部把模型调用压成固定 2 次 ——
@@ -314,9 +458,50 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			});
 		}
 
-		const buildFull = () =>
-			createSessionRuntime({
+		if (spec.toolset === "audit-report") {
+			const narrativeDir = resolve(options.specsDir, "audit-report");
+			const rewrite = JSON.parse(
+				await readFile(join(narrativeDir, "narrative-rewrite.runtime.json"), "utf8"),
+			) as RuntimeSpec;
+			const review = JSON.parse(
+				await readFile(join(narrativeDir, "narrative-review.runtime.json"), "utf8"),
+			) as RuntimeSpec;
+			await resolveSpecPromptPaths(rewrite, narrativeDir);
+			await resolveSpecPromptPaths(review, narrativeDir);
+			return createAuditReportRuntime({
+				authorizeExecution: checkExecution,
+				signal,
+				assemblyTimeoutMs: options.assemblyTimeoutMs,
 				spec,
+				profile,
+				registry: plugins,
+				buildToolsets,
+				narrativeSpecs: { rewrite, review },
+				cwd: join(workdir, "workspace"),
+				agentDir: join(workdir, "agent"),
+				outputContractSchema: outputContractSchemas.get(specId),
+				skillPaths: skillPaths.get(specId),
+			});
+		}
+
+		const buildFull = (maxTurns = spec.limits.maxTurns) =>
+			createSessionRuntime({
+				...(spec.toolset === "audit-disclosure" ? disclosureLinkDelivery : {}),
+				authorizeExecution: checkExecution,
+				interaction:
+					runOptions.interaction && grant && options.inbox
+						? { inbox: options.inbox, grant, rootRunId: operationRunId ?? runId, messageId: runOptions.messageId }
+						: undefined,
+				conversation: runOptions.conversation,
+				memory:
+					options.memory && runOptions.memoryScope
+						? { service: options.memory, scope: { ...runOptions.memoryScope, sessionId } }
+						: undefined,
+				resume,
+				onCheckpoint: spec.durableSession === false ? undefined : onCheckpoint,
+				signal,
+				assemblyTimeoutMs: options.assemblyTimeoutMs,
+				spec: { ...spec, limits: { ...spec.limits, maxTurns } },
 				profile,
 				registry: plugins,
 				toolsets: buildToolsets(),
@@ -326,9 +511,16 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 				skillPaths: skillPaths.get(specId),
 			});
 
-		if (!spec.fastPath?.enabled) return buildFull();
+		// Durable execution uses the full Session path so every tool boundary is checkpointed.
+		if (!spec.fastPath?.enabled || resume || onCheckpoint) return buildFull();
+		const maxTurns = spec.limits.maxTurns;
+		if (maxTurns === undefined || !Number.isInteger(maxTurns) || maxTurns < 1) {
+			throw new Error(`Spec "${spec.id}": enabled fastPath requires a positive integer limits.maxTurns`);
+		}
 
 		const fast = await createFastPathRuntime({
+			signal,
+			assemblyTimeoutMs: options.assemblyTimeoutMs,
 			spec,
 			profile,
 			registry: plugins,
@@ -354,7 +546,7 @@ export async function createDefaultRuntimeFactory(options: DefaultFactoryOptions
 			// buildFull)照旧传 skillPaths,行为不变。
 		});
 		// createFull 惰性 —— 不升级就一次都不调,不起第二个 MCP 子进程。
-		return createEscalatingRuntime({ fast, createFull: buildFull });
+		return createEscalatingRuntime({ fast, maxTurns, createFull: buildFull });
 	};
 }
 

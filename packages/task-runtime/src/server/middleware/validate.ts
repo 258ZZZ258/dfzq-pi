@@ -30,9 +30,9 @@ const SubmitBodySchema = Type.Object({
 	// 装配期校验,HTTP 这层只保证「是个对象」。**不允许把结构化输入塞进 input 的 JSON 字符串**:
 	// 那会绕过本文件上面的四档 fail-closed 校验,错误全部退化成运行期。
 	payload: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-	clientRequestId: Type.String({ minLength: 1 }),
+	clientRequestId: Type.String({ minLength: 1, maxLength: 256 }),
 	requestId: Type.Optional(Type.String()),
-	sessionId: Type.Optional(Type.String()),
+	sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
 	filters: FiltersSchema,
 	options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 	waitMs: Type.Optional(Type.Number()),

@@ -1,9 +1,14 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { disposeOnce } from "../../lifecycle/dispose.ts";
+import { hashState } from "../../state/json.ts";
+import type { ToolEffect, ToolLedger } from "../../state/tool-ledger.ts";
 import type { ToolsetHandle, ToolsetProvider } from "../registry.ts";
 import { McpClient, type McpToolInfo } from "./client.ts";
 
 export interface McpServerSpec {
+	/** Trusted policy; required per called tool when a durable ledger is enabled. */
+	toolEffects?: Record<string, ToolEffect>;
 	id: string;
 	command: string;
 	args: string[];
@@ -26,6 +31,10 @@ const NAME_SEPARATOR = "__";
  * server 的声明,见 `toToolDefinition`),模型既看不见也填不了。
  */
 export interface McpRunScope {
+	tenantId?: string;
+	userId?: string;
+	projectId?: string | null;
+	owner?: string | null;
 	runId: string;
 	permTags: string[];
 	corpusTypes: string[];
@@ -34,7 +43,20 @@ export interface McpRunScope {
 
 /** camelCase → snake_case。**只在这一处转**,C1 侧按 snake_case 收,不再转第二次。 */
 function scopeParams(scope: McpRunScope): Record<string, unknown> {
-	return { perm_tags: scope.permTags, corpus_types: scope.corpusTypes, run_id: scope.runId };
+	return {
+		perm_tags: scope.permTags,
+		corpus_types: scope.corpusTypes,
+		run_id: scope.runId,
+		...(scope.tenantId
+			? {
+					tenant_id: scope.tenantId,
+					user_id: scope.userId,
+					project_id: scope.projectId ?? null,
+					owner: scope.owner ?? null,
+					include_superseded: scope.options.includeSuperseded === true,
+				}
+			: {}),
+	};
 }
 
 function assertScope(scope: McpRunScope): void {
@@ -111,8 +133,14 @@ export function expandEnvRefs(spec: McpServerSpec, env: NodeJS.ProcessEnv): McpS
  * 把它们的工具合并成一份 `ToolDefinition[]`,并返回一个统一的 `dispose()` 收尾所有子进程。
  * 若中途某个 server 起不来,已经 spawn 成功的必须先被 dispose 掉再把错误抛出去 —— 不留孤儿进程。
  */
-export function createMcpToolset(servers: McpServerSpec[], scope: McpRunScope | null): ToolsetProvider {
-	return async (): Promise<ToolsetHandle> => {
+export function createMcpToolset(
+	servers: McpServerSpec[],
+	scope: McpRunScope | null,
+	execution?: { ledger: ToolLedger; version: string; operationRunId?: string },
+	authorizeTool?: (name: string) => void | Promise<void>,
+): ToolsetProvider {
+	return async (signal?: AbortSignal): Promise<ToolsetHandle> => {
+		signal?.throwIfAborted();
 		// fail-closed 第 2 处(规格 §2.4):scope 不完整就不该起子进程。
 		// scope 为 null 是**显式声明**「这不是权限场景」(eval / CLI 路径);参数不可省略,
 		// 于是生产路径漏传是编译错误,不会静默降级成非权限场景。
@@ -122,38 +150,50 @@ export function createMcpToolset(servers: McpServerSpec[], scope: McpRunScope | 
 		const clients: McpClient[] = [];
 		try {
 			for (const server of resolved) {
-				clients.push(await McpClient.spawn(server));
+				clients.push(await McpClient.spawn({ ...server, signal }));
+				signal?.throwIfAborted();
 			}
+
+			// 同名工具计数:只有真的撞名的工具才加前缀,单一 server 提供的工具保持原名,
+			// 对模型更好用(工具名越短、语义越直接,选择正确工具的准确率越高)。
+			const counts = new Map<string, number>();
+			for (const client of clients) {
+				for (const tool of client.listTools()) {
+					counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
+				}
+			}
+
+			const tools: ToolDefinition[] = [];
+			clients.forEach((client, index) => {
+				const serverId = resolved[index].id;
+				for (const info of client.listTools()) {
+					const exposedName =
+						(counts.get(info.name) ?? 0) > 1 ? `${serverId}${NAME_SEPARATOR}${info.name}` : info.name;
+					tools.push(
+						toToolDefinition(
+							client,
+							info,
+							exposedName,
+							scope,
+							execution ? { ...execution, effect: resolved[index].toolEffects?.[info.name] } : undefined,
+							authorizeTool,
+						),
+					);
+				}
+			});
+
+			return {
+				tools,
+				dispose: disposeOnce(clients.map((client) => () => client.dispose())),
+			};
 		} catch (error) {
-			for (const client of clients) await client.dispose();
+			try {
+				await disposeOnce(clients.map((client) => () => client.dispose()))();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "MCP startup and cleanup failed");
+			}
 			throw error;
 		}
-
-		// 同名工具计数:只有真的撞名的工具才加前缀,单一 server 提供的工具保持原名,
-		// 对模型更好用(工具名越短、语义越直接,选择正确工具的准确率越高)。
-		const counts = new Map<string, number>();
-		for (const client of clients) {
-			for (const tool of client.listTools()) {
-				counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
-			}
-		}
-
-		const tools: ToolDefinition[] = [];
-		clients.forEach((client, index) => {
-			const serverId = resolved[index].id;
-			for (const info of client.listTools()) {
-				const exposedName =
-					(counts.get(info.name) ?? 0) > 1 ? `${serverId}${NAME_SEPARATOR}${info.name}` : info.name;
-				tools.push(toToolDefinition(client, info, exposedName, scope));
-			}
-		});
-
-		return {
-			tools,
-			dispose: async () => {
-				for (const client of clients.reverse()) await client.dispose();
-			},
-		};
 	};
 }
 
@@ -162,6 +202,8 @@ function toToolDefinition(
 	info: McpToolInfo,
 	exposedName: string,
 	scope: McpRunScope | null,
+	execution?: { ledger: ToolLedger; version: string; effect?: ToolEffect; operationRunId?: string },
+	authorizeTool?: (name: string) => void | Promise<void>,
 ): ToolDefinition {
 	return {
 		name: exposedName,
@@ -170,6 +212,7 @@ function toToolDefinition(
 		// MCP 的 inputSchema 已是 JSON Schema,Type.Unsafe 零转换包住即可,不需要 schema 转换器。
 		parameters: Type.Unsafe(info.inputSchema),
 		execute: async (_toolCallId: string, params: unknown, signal: AbortSignal | undefined) => {
+			await authorizeTool?.(exposedName);
 			// fail-closed 第 3 处(规格 §2.4):每次 call 前复查。只有 spawn 期检查的话,
 			// scope 对象在 spawn 之后被改空这个向量完全打不到。
 			if (scope) assertScope(scope);
@@ -179,7 +222,62 @@ function toToolDefinition(
 				...((params ?? {}) as Record<string, unknown>),
 				...(scope ? scopeParams(scope) : {}),
 			};
-			const result = await client.callTool(info.name, merged, signal);
+			if (execution?.operationRunId) merged.run_id = execution.operationRunId;
+			let replayed = false;
+			const result = execution
+				? await (async () => {
+						if (!scope || !execution.effect) throw new Error("tool_effect_and_scope_required");
+						const cached = await execution.ledger.execute(
+							{
+								scope: hashState(
+									JSON.parse(
+										JSON.stringify({
+											permTags: scope.permTags,
+											tenantId: scope.tenantId,
+											userId: scope.userId,
+											projectId: scope.projectId,
+											owner: scope.owner,
+											corpusTypes: scope.corpusTypes,
+											options: scope.options,
+										}),
+									),
+								),
+								runId: execution.operationRunId ?? scope.runId,
+								callId: _toolCallId,
+								tool: exposedName,
+								toolVersion: execution.version,
+								effect: execution.effect,
+								onReplay: () => {
+									replayed = true;
+								},
+								args: { ...merged, run_id: execution.operationRunId ?? scope.runId },
+								signal,
+							},
+							async ({ idempotencyKey }) => {
+								await authorizeTool?.(exposedName);
+								const reply = await client.callTool(
+									info.name,
+									{
+										...merged,
+										...(execution.effect === "idempotent_write" ? { idempotency_key: idempotencyKey } : {}),
+									},
+									signal,
+								);
+								if (reply.isError) throw new Error(reply.text);
+								return reply;
+							},
+						);
+						if (
+							!cached ||
+							typeof cached !== "object" ||
+							typeof (cached as { text?: unknown }).text !== "string" ||
+							typeof (cached as { isError?: unknown }).isError !== "boolean"
+						)
+							throw new Error("tool_ledger_result_invalid");
+						return cached as { text: string; isError: boolean };
+					})()
+				: await client.callTool(info.name, merged, signal);
+			await authorizeTool?.(exposedName);
 			if (result.isError) {
 				// throw 是向 pi 表达"这次工具调用失败了"的唯一方式:agent-loop 的 executePreparedToolCall
 				// 自己 catch 异常并生成 wire 层 isError:true 的结果(不会中断 batch/循环,见
@@ -193,7 +291,13 @@ function toToolDefinition(
 			}
 			return {
 				content: [{ type: "text", text: result.text }],
-				details: info.name === "get_clause_detail" ? { source_details: sourceDetails(result.text) } : undefined,
+				details:
+					info.name === "get_clause_detail" || replayed
+						? {
+								...(info.name === "get_clause_detail" ? { source_details: sourceDetails(result.text) } : {}),
+								...(replayed ? { ledgerReplay: true } : {}),
+							}
+						: undefined,
 			};
 		},
 	};

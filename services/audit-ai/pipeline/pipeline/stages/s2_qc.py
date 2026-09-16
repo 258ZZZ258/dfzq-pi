@@ -1,0 +1,43 @@
+"""S2 质检硬关卡:载 IR → 按 profile 选指标集跑 gate → 通过则 STRUCTURING,否则 QC_FAILED + evidence。
+
+边缘通过带(qc_marginal)仅标记入 doc_version,不拦截。失败带 evidence(失败指标 + 定位)入队。
+"""
+
+from __future__ import annotations
+
+from common.pg_models import Document, DocVersion
+from pipeline.qc.gate import evaluate
+from pipeline.stage_base import QueueItem, QueueType, StageContext, StageResult
+from pipeline.states import ErrorCode, PipelineState
+
+
+def run(ctx: StageContext, doc_version_id: str) -> StageResult:
+    ir = ctx.object_store.load_ir(doc_version_id)
+    dv = ctx.db.get(DocVersion, doc_version_id)
+    doc = ctx.db.get(Document, dv.logical_id) if dv else None
+    corpus_type = (doc.corpus_type if doc else "") or "P-INT"  # 按 profile 选 QC 指标集
+    # 档案键:preseg 通道用 P-PRESEG(哨兵化子集,D10);corpus_type 保留检索分区语义(口径钉子)
+    profile_key = "P-PRESEG" if (dv and dv.source_format == "preseg") else corpus_type
+    profile = ctx.config.profiles.get(profile_key)  # 配置缝:启用集/阈值覆盖(CP-010 T1)
+    report = evaluate(ir, ctx.config.qc, corpus_type, profile)
+    _set_marginal(ctx, doc_version_id, report.marginal)
+
+    if report.failed:
+        evidence = report.to_evidence()
+        return StageResult(
+            next_state=PipelineState.QC_FAILED,
+            error_code=ErrorCode.QC_GATE_FAILED.value,
+            evidence=evidence,
+            queue=QueueItem(QueueType.QC_FIX, doc_version_id, "质检未通过", evidence),
+            marginal=report.marginal,
+        )
+    return StageResult(next_state=PipelineState.STRUCTURING, marginal=report.marginal)
+
+
+def _set_marginal(ctx: StageContext, dvid: str, marginal: bool) -> None:
+    if not marginal:
+        return
+    with ctx.db.session() as s:
+        dv = s.get(DocVersion, dvid)
+        if dv is not None:
+            dv.qc_marginal = True

@@ -35,6 +35,8 @@ export interface PluginContext {
 	registerFinalJudge: (judge: FinalJudge) => void;
 	/** 本 run 的输入正文。matters:"auto" 从这里抽。run() 未开始时返回空串。 */
 	getRunInput: () => string;
+	/** Run-owned cooperative cancellation for tools called outside the model loop. */
+	getAbortSignal?: () => AbortSignal | undefined;
 	/**
 	 * 调用本 run 已解析的某个工具。**这是插件够得着 per-run MCP 会话的唯一通路。**
 	 *

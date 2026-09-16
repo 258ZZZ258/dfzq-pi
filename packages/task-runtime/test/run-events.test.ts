@@ -565,8 +565,11 @@ describe("Task 18c: 插件驱动的工具调用进事件流(A6 此前漏记判�
 		const { start, end } = rawToolEvents(rawEvents, "assess_sufficiency");
 		expect(start).toBeDefined();
 		expect(end).toBeDefined();
-		expect(Object.keys(start?.payload as object).sort()).toEqual(["toolName", "type"]);
-		expect(Object.keys(end?.payload as object).sort()).toEqual(["isError", "toolName", "type"]);
+		expect(Object.keys(start?.payload as object).sort()).toEqual(["toolCallId", "toolName", "type"]);
+		expect(Object.keys(end?.payload as object).sort()).toEqual(["isError", "toolCallId", "toolName", "type"]);
+		expect((start?.payload as { toolCallId: string }).toolCallId).toBe(
+			(end?.payload as { toolCallId: string }).toolCallId,
+		);
 		expect((end?.payload as { isError?: boolean }).isError).toBe(false);
 	});
 

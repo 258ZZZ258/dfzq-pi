@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
 	type AgentSession,
@@ -7,8 +8,10 @@ import {
 	ModelRuntime,
 	SessionManager,
 	SettingsManager,
+	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { type ProviderProfile, profileRoles, requireApiKey, resolveRole } from "../env/provider-profile.ts";
+import { disposeOnce } from "../lifecycle/dispose.ts";
 import { type PluginRef, pluginName, type RuntimeSpec } from "../spec/types.ts";
 import { validateSpec } from "../spec/validate.ts";
 import type { ToolsetRegistry } from "../toolsets/registry.ts";
@@ -25,10 +28,19 @@ import { LIMITS_PLUGIN_NAME, type LimitsOptions } from "./plugins/limits.ts";
  * 那条规矩对合成事件同样成立,不能指望下游落库时再帮它脱一次敏。
  */
 export type PluginToolCallEvent =
-	| { type: "tool_execution_start"; toolName: string }
-	| { type: "tool_execution_end"; toolName: string; isError: boolean };
+	| { type: "tool_execution_start"; toolName: string; toolCallId?: string }
+	| { type: "tool_execution_end"; toolName: string; isError: boolean; toolCallId?: string; replayed?: boolean };
 
 export interface AssembleOptions {
+	sessionJsonl?: string;
+	checkpointHooks?: {
+		beforeTool: () => Promise<void>;
+		afterTurn: () => Promise<void>;
+		beforeModel?: () => Promise<void>;
+	};
+	/** Cooperative construction cancellation, distinct from a run's tool signal. */
+	signal?: AbortSignal;
+	assemblyTimeoutMs?: number;
 	spec: RuntimeSpec;
 	profile: ProviderProfile;
 	registry: PluginRegistry;
@@ -72,6 +84,7 @@ export interface AssembleOptions {
 }
 
 export interface Assembled {
+	tools: readonly ToolDefinition[];
 	session: AgentSession;
 	specId: string;
 	/**
@@ -121,7 +134,24 @@ function formatNames(names: readonly string[]): string {
 }
 
 export async function assemble(options: AssembleOptions): Promise<Assembled> {
+	const timeout = options.assemblyTimeoutMs ?? 60000;
+	if (!Number.isFinite(timeout) || timeout <= 0) throw new Error("assemblyTimeoutMs must be positive and finite");
+	const deadline = new AbortController();
+	const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+	const timer = setTimeout(() => deadline.abort(new Error("assembly_timeout")), timeout);
+	try {
+		return await assembleInner({ ...options, signal });
+	} catch (error) {
+		if (deadline.signal.aborted && !options.signal?.aborted) throw new Error("assembly_timeout", { cause: error });
+		throw error;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function assembleInner(options: AssembleOptions): Promise<Assembled> {
 	const { spec, profile, registry, toolsets, cwd, agentDir } = options;
+	options.signal?.throwIfAborted();
 
 	validateSpec(spec, {
 		knownToolsets: toolsets.ids(),
@@ -146,9 +176,16 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 	// toolsets/registry.ts 的改动说明。这条不变量覆盖 resolve() 成功之后到 return 之前
 	// 的*所有*代码,所以下面的工具名交叉校验也必须在 try 块里——它和 createAgentSession
 	// 一样是"resolve() 之后才可能失败的东西",挪出 try 块就是又复现一次 handle 泄漏。
-	const { tools, dispose: disposeToolset } = await toolsets.resolve(spec.toolset);
+	options.signal?.throwIfAborted();
+	const { tools, dispose: disposeToolset } = await toolsets.resolve(spec.toolset, options.signal);
+	let createdSession: AgentSession | undefined;
+	let resumeFile: string | undefined;
+	const disposeResumeFile = async () => {
+		if (resumeFile) await rm(resumeFile, { force: true });
+	};
 
 	try {
+		options.signal?.throwIfAborted();
 		// 装配期失败要早:pi 的 setActiveToolsByName 对不认识的工具名是静默丢弃,不抛错
 		// (agent-session.ts),所以这里必须自己做交叉校验,不能指望 createAgentSession 帮忙。
 		const availableToolNames = new Set(tools.map((tool) => tool.name));
@@ -201,10 +238,19 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 		// callTool 在这里补上而不是让调用方给:只有 assemble() 同时握着「已解析的工具」
 		// 与「要实例化的插件」。tools 来自上面的 toolsets.resolve()(:70),插件在 :122
 		// 才实例化 —— 时序成立。
-		const byName = new Map(tools.map((tool) => [tool.name, tool]));
+		const allowedTools = tools.filter(
+			(tool) => spec.tools.includes(tool.name) && !spec.excludeTools?.includes(tool.name),
+		);
+		// Trusted plugins may use private tools from their registered toolset;
+		// model/restore execution still uses allowedTools. Explicit exclusions apply to both.
+		const byName = new Map(
+			tools.filter((tool) => !spec.excludeTools?.includes(tool.name)).map((tool) => [tool.name, tool]),
+		);
 		const pluginContext: PluginContext = {
 			...options.pluginContext,
 			callTool: async (name, args) => {
+				const signal = options.pluginContext.getAbortSignal?.();
+				signal?.throwIfAborted();
 				const tool = byName.get(name);
 				if (!tool) {
 					// 装配错误要响要早:插件声明了依赖某工具,而 spec 的 toolset 没提供它。
@@ -218,15 +264,16 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 				// 直接调、绕过 pi 的 agent loop,不会自己产生 tool_execution_* 事件 —— 这里手动
 				// 补一对,前后各发一次,失败路径(catch 分支)也要发,否则一次失败的探针会在
 				// pi 侧凭空消失、A6 又对不上。
-				options.emitPluginToolEvent?.({ type: "tool_execution_start", toolName: name });
+				const toolCallId = `plugin-${randomUUID()}`;
+				options.emitPluginToolEvent?.({ type: "tool_execution_start", toolName: name, toolCallId });
 				let result: Awaited<ReturnType<typeof tool.execute>>;
 				try {
-					result = await tool.execute("plugin", args as never, undefined, undefined, {} as never);
+					result = await tool.execute(toolCallId, args as never, signal, undefined, {} as never);
 				} catch (error) {
-					options.emitPluginToolEvent?.({ type: "tool_execution_end", toolName: name, isError: true });
+					options.emitPluginToolEvent?.({ type: "tool_execution_end", toolName: name, toolCallId, isError: true });
 					throw error;
 				}
-				options.emitPluginToolEvent?.({ type: "tool_execution_end", toolName: name, isError: false });
+				options.emitPluginToolEvent?.({ type: "tool_execution_end", toolName: name, toolCallId, isError: false });
 				const text = extractText(result.content);
 				try {
 					return JSON.parse(text);
@@ -237,6 +284,29 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			},
 		};
 		const extensionFactories = instantiatePlugins(pluginEntries, pluginContext);
+		if (options.checkpointHooks)
+			extensionFactories.push({
+				name: "durable-checkpoint",
+				factory: (pi) => {
+					pi.on("context", async () => {
+						await options.checkpointHooks?.beforeModel?.();
+					});
+					pi.on("tool_call", async () => {
+						try {
+							await options.checkpointHooks?.beforeTool();
+						} catch {
+							return { block: true, reason: "checkpoint_persistence_failed" };
+						}
+					});
+					pi.on("turn_end", async () => {
+						try {
+							await options.checkpointHooks?.afterTurn();
+						} catch {
+							/* runtime owns the failure and cancellation */
+						}
+					});
+				},
+			});
 
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,
@@ -260,7 +330,14 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			extensionFactories,
 		});
 		await resourceLoader.reload();
+		options.signal?.throwIfAborted();
 
+		let sessionManager = SessionManager.inMemory(cwd);
+		if (options.sessionJsonl) {
+			resumeFile = join(agentDir, `resume-${randomUUID()}.jsonl`);
+			await writeFile(resumeFile, options.sessionJsonl, { mode: 0o600 });
+			sessionManager = SessionManager.open(resumeFile, agentDir, cwd);
+		}
 		const { session } = await createAgentSession({
 			cwd,
 			agentDir,
@@ -273,25 +350,25 @@ export async function assemble(options: AssembleOptions): Promise<Assembled> {
 			excludeTools: spec.excludeTools,
 			resourceLoader,
 			settingsManager,
-			sessionManager: SessionManager.inMemory(cwd),
+			sessionManager,
 		});
+		createdSession = session;
+		options.signal?.throwIfAborted();
 
 		return {
+			tools: allowedTools,
 			session,
 			specId: spec.id,
 			resources: resourceLoader,
 			callTool: pluginContext.callTool,
-			dispose: async () => {
-				session.dispose();
-				await disposeToolset();
-			},
+			dispose: disposeOnce([() => session.dispose(), disposeToolset, disposeResumeFile]),
 		};
 	} catch (error) {
 		// createAgentSession (or anything above it in this block) threw before the caller
 		// ever got an Assembled.dispose() to call -- release the toolset handle ourselves
 		// so a mid-assembly failure can't leak it (e.g. an MCP child process).
 		try {
-			await disposeToolset();
+			await disposeOnce([() => createdSession?.dispose(), disposeToolset, disposeResumeFile])();
 		} catch (cleanupError) {
 			throw new AggregateError([error, cleanupError], "Assembly failed and toolset disposal also failed");
 		}
@@ -320,7 +397,7 @@ async function resolveModel(spec: RuntimeSpec, profile: ProviderProfile, agentDi
 				// reasoning/cost come from RoleBinding, not a hardcoded default: pi's
 				// getSupportedThinkingLevels() collapses to ["off"] when reasoning is false
 				// (silently clamping RuntimeSpec.thinkingLevel), and session cost stats stay
-				// at 0 when cost is 0 (silently defeating RuntimeLimits.maxCostUsd). Both are
+				// at 0 when cost is 0. Cost is telemetry only; both are
 				// environment facts the ProviderProfile author must declare explicitly.
 				reasoning: binding.reasoning,
 				// 本层暂不支持多模态角色绑定,也没有对应的 RuntimeSpec 字段声明这项能力,

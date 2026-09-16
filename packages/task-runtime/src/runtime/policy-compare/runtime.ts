@@ -23,7 +23,7 @@ export const MAX_EXTERNAL_CHUNKS = 800;
  * 阶段 4 产出的待判定条款对上限(规格 §3.5)。
  *
  * 🔴 决定阶段 5 扇出的是每条外规返回的内规候选总数。没有这道护栏时，一份大外规与大量
- * 候选内规会产生数千对待判定条款，先撞 `maxCostUsd` 或 `maxTurns`，最后零产出。
+ * 候选内规会产生数千对待判定条款，先撞 `maxTurns`，最后零产出。
  *
  * 定值 500：同时 `ceil(500 / batchSize 下界 1) = 500 < maxTurns=600`，spec 的不等式仍成立。
  */
@@ -309,8 +309,6 @@ function toBatchCandidates(
 function describeTripped(kind: LimitKind, limits: RuntimeLimits): string {
 	if (kind === "runTimeout") return `run 整体超时(runTimeoutMs=${limits.runTimeoutMs}ms)`;
 	if (kind === "maxTurns") return `模型调用次数撞到上限(maxTurns=${limits.maxTurns})`;
-	if (kind === "maxCostUsd") return `撞到费用上限(maxCostUsd=${limits.maxCostUsd})`;
-	if (kind === "maxTotalTokens") return `撞到 token 上限(maxTotalTokens=${limits.maxTotalTokens})`;
 	return `撞到限额:${kind}`;
 }
 
@@ -369,8 +367,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 
 	/**
 	 * 每个阶段边界都调它,合并检查两件独立的事(评审 Finding 1):
-	 * - `limitState.tripped`:由无条件挂载的 limits 插件在 `turn_end` 钩子里写(`maxTurns`/
-	 *   `maxTotalTokens`/`maxCostUsd`),或由下面 `run()` 里的 `runTimeoutMs` 定时器写。此前这里
+	 * - `limitState.tripped`:由无条件挂载的 limits 插件在 `turn_end` 钩子里写(`maxTurns`),或由下面 `run()` 里的 `runTimeoutMs` 定时器写。此前这里
 	 *   只查 `aborted`,`tripped` 被写了也没人读 —— 插件确实调了 `ctx.abort()`(即
 	 *   `abortFn()`,会打断当前 `session.prompt()`),但下一次阶段边界检查查的是本地 `aborted`
 	 *   标志,从未被置位,于是管线在撞限之后照样继续跑完整个 run。
@@ -642,7 +639,7 @@ export async function createPolicyCompareRuntime(options: PolicyCompareRuntimeOp
 		checkPreempted();
 		stage("matching", 45, 0, coverageDoc.clauses.length, "正在匹配候选内部制度条款");
 		const alignment = alignBatchCandidates(coverageDoc, candidateItems);
-		// 🔴 扇出护栏(规格 §3.5)。候选总对数决定模型批数；超限就在这里停下，避免烧完预算后零产出。
+		// 🔴 扇出护栏(规格 §3.5)。候选总对数决定模型批数；超限就在这里停下，避免耗尽轮数后零产出。
 		if (alignment.pairs.length > MAX_PAIRS) {
 			throw new Error(
 				`阶段 4 产出 ${alignment.pairs.length} 对待判定条款,超过上限 ${MAX_PAIRS}` +

@@ -1,5 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { createInterface, type Interface } from "node:readline";
+import { type LineReader, readBoundedLines } from "./lines.ts";
 
 export interface McpToolInfo {
 	name: string;
@@ -26,12 +26,15 @@ export interface McpSpawnOptions {
 	 * SIGTERM 后做清理(关连接、flush 日志),比测试用的 node fixture 慢得多。
 	 */
 	disposeTimeoutMs?: number;
+	/** Cancels startup/handshake only; callTool has its own per-call signal. */
+	signal?: AbortSignal;
 }
 
 interface Pending {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
 	timer: NodeJS.Timeout;
+	cleanup: () => void;
 }
 
 const BASE_ENV_KEYS = ["PATH", "HOME", "LANG", "LC_ALL", "SystemRoot", "TMPDIR"] as const;
@@ -59,20 +62,21 @@ export class McpClient {
 	private readonly pending = new Map<number, Pending>();
 	private tools: McpToolInfo[] = [];
 	private disposed = false;
+	private disposal: Promise<void> | undefined;
 	private readonly stderrTail: string[] = [];
 
 	private readonly id: string;
 	private readonly child: ChildProcessWithoutNullStreams;
-	private readonly reader: Interface;
-	private readonly stderrReader: Interface;
+	private readonly reader: LineReader;
+	private readonly stderrReader: LineReader;
 	private readonly requestTimeoutMs: number;
 	private readonly disposeTimeoutMs: number;
 
 	private constructor(
 		id: string,
 		child: ChildProcessWithoutNullStreams,
-		reader: Interface,
-		stderrReader: Interface,
+		reader: LineReader,
+		stderrReader: LineReader,
 		requestTimeoutMs: number,
 		disposeTimeoutMs: number,
 	) {
@@ -90,6 +94,7 @@ export class McpClient {
 	}
 
 	static async spawn(options: McpSpawnOptions): Promise<McpClient> {
+		options.signal?.throwIfAborted();
 		const env: Record<string, string> = {};
 		for (const key of BASE_ENV_KEYS) {
 			const value = process.env[key];
@@ -103,12 +108,24 @@ export class McpClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		}) as ChildProcessWithoutNullStreams;
 
-		const reader = createInterface({ input: child.stdout });
+		let client!: McpClient;
+		const reader = readBoundedLines(child.stdout, {
+			maxBytes: 8 * 1024 * 1024,
+			onLine: (line) => client.onLine(line),
+			onOverflow: () => {
+				client.failAll(new Error("MCP response exceeds 8MiB"));
+				void client.dispose().catch(() => {});
+			},
+		});
 		// 必须主动消费 child.stderr:管道缓冲通常只有 ~64KB,MCP server(尤其是用阻塞式 stdio
 		// 写法的 Python 实现)往 stderr 打日志一旦超过这个量,写入就会卡住,现象是"MCP 调用超时"
 		// 而不是报错,排查成本很高。这里不关心内容对不对,只关心"读走"这个动作本身。
-		const stderrReader = createInterface({ input: child.stderr });
-		const client = new McpClient(
+		const stderrReader = readBoundedLines(child.stderr, {
+			maxBytes: 4096,
+			truncate: true,
+			onLine: (line) => client.onStderrLine(line),
+		});
+		client = new McpClient(
 			options.id,
 			child,
 			reader,
@@ -117,22 +134,30 @@ export class McpClient {
 			options.disposeTimeoutMs ?? DEFAULT_DISPOSE_TIMEOUT_MS,
 		);
 
-		reader.on("line", (line) => client.onLine(line));
-		stderrReader.on("line", (line) => client.onStderrLine(line));
 		child.on("exit", (code) => client.failAll(new Error(`MCP server "${options.id}" exited with code ${code}`)));
 		child.on("error", (error) => client.failAll(error));
+		child.stdin.on("error", (error) => client.failAll(error));
 
 		try {
-			await client.request("initialize", {
-				protocolVersion: "2024-11-05",
-				capabilities: {},
-				clientInfo: { name: "@dfzq/task-runtime", version: "0.0.1" },
-			});
+			await client.request(
+				"initialize",
+				{
+					protocolVersion: "2024-11-05",
+					capabilities: {},
+					clientInfo: { name: "@dfzq/task-runtime", version: "0.0.1" },
+				},
+				options.signal,
+			);
 			client.notify("notifications/initialized", {});
-			const listed = (await client.request("tools/list", {})) as { tools?: McpToolInfo[] };
+			const listed = (await client.request("tools/list", {}, options.signal)) as { tools?: McpToolInfo[] };
+			options.signal?.throwIfAborted();
 			client.tools = listed.tools ?? [];
 		} catch (error) {
-			await client.dispose();
+			try {
+				await client.dispose();
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "MCP initialization and disposal failed");
+			}
 			// 这里保留 stderrSummary() 全量 —— 与 callTool() 不同,这条路径不经过模型:它是
 			// assemble() 装配期的 throw,最终落到 CLI/运维手里,由人来判断"这个 Python server
 			// 为什么起不来",stderr 的 traceback 正是他需要的诊断信息。
@@ -177,14 +202,17 @@ export class McpClient {
 		}
 	}
 
-	async dispose(): Promise<void> {
-		if (this.disposed) return;
+	dispose(): Promise<void> {
+		if (this.disposal) return this.disposal;
 		this.disposed = true;
-		this.failAll(new Error(`MCP client "${this.id}" is disposed`));
-		this.reader.close();
-		this.stderrReader.close();
-		this.child.stdin.end();
-		await this.terminateChild();
+		this.disposal = Promise.resolve().then(async () => {
+			this.failAll(new Error(`MCP client "${this.id}" is disposed`));
+			this.reader.close();
+			this.stderrReader.close();
+			this.child.stdin.end();
+			await this.terminateChild();
+		});
+		return this.disposal;
 	}
 
 	/**
@@ -219,26 +247,37 @@ export class McpClient {
 	}
 
 	private request(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
+		if (signal?.aborted) return Promise.reject(new Error("aborted"));
+		if (this.disposed || this.child.stdin.destroyed) return Promise.reject(new Error("MCP transport is closed"));
 		const id = this.nextId++;
 		return new Promise((resolve, reject) => {
+			const onAbort = () => {
+				const entry = this.pending.get(id);
+				if (!entry) return;
+				this.pending.delete(id);
+				entry.cleanup();
+				this.notify("notifications/cancelled", { requestId: id });
+				entry.reject(new Error("aborted"));
+			};
 			const timer = setTimeout(() => {
 				this.pending.delete(id);
+				cleanup();
+				this.notify("notifications/cancelled", { requestId: id });
 				reject(new Error(`timeout after ${this.requestTimeoutMs}ms`));
 			}, this.requestTimeoutMs);
-			this.pending.set(id, { resolve, reject, timer });
-			signal?.addEventListener(
-				"abort",
-				() => {
-					const entry = this.pending.get(id);
-					if (!entry) return;
-					this.pending.delete(id);
-					clearTimeout(entry.timer);
-					this.notify("notifications/cancelled", { requestId: id });
-					entry.reject(new Error("aborted"));
-				},
-				{ once: true },
-			);
-			this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+			const cleanup = () => {
+				clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+			};
+			this.pending.set(id, { resolve, reject, timer, cleanup });
+			signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+			} catch (error) {
+				this.pending.delete(id);
+				cleanup();
+				reject(error);
+			}
 		});
 	}
 
@@ -259,7 +298,7 @@ export class McpClient {
 		const entry = this.pending.get(message.id);
 		if (!entry) return;
 		this.pending.delete(message.id);
-		clearTimeout(entry.timer);
+		entry.cleanup();
 		if (message.error) {
 			entry.reject(new Error(`[${message.error.code}] ${message.error.message}`));
 			return;
@@ -284,7 +323,7 @@ export class McpClient {
 
 	private failAll(error: Error): void {
 		for (const [, entry] of this.pending) {
-			clearTimeout(entry.timer);
+			entry.cleanup();
 			entry.reject(error);
 		}
 		this.pending.clear();

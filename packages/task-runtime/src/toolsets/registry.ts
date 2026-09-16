@@ -5,7 +5,7 @@ export interface ToolsetHandle {
 	dispose?: () => Promise<void>;
 }
 
-export type ToolsetProvider = () => Promise<ToolDefinition[] | ToolsetHandle>;
+export type ToolsetProvider = (signal?: AbortSignal) => Promise<ToolDefinition[] | ToolsetHandle>;
 
 /**
  * One `resolve()` call's worth of tools plus the cleanup for whatever it opened
@@ -46,10 +46,11 @@ export class ToolsetRegistry {
 		return new Set(this.providers.keys());
 	}
 
-	async resolve(id: string): Promise<ResolvedToolset> {
+	async resolve(id: string, signal?: AbortSignal): Promise<ResolvedToolset> {
+		signal?.throwIfAborted();
 		const provider = this.providers.get(id);
 		if (!provider) throw new Error(`Toolset "${id}" is not registered`);
-		const result = await provider();
+		const result = await provider(signal);
 		if (Array.isArray(result)) return { tools: result, dispose: NOOP_DISPOSE };
 		return { tools: result.tools, dispose: result.dispose ?? NOOP_DISPOSE };
 	}

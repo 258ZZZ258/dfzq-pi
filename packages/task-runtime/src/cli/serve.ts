@@ -1,5 +1,15 @@
+import { readFile } from "node:fs/promises";
+import { createGrantVerifier, type GrantConfig } from "../auth/grant.ts";
+import { SessionInbox } from "../interaction/inbox.ts";
+import { createHttpEmbedder } from "../memory/embedding.ts";
+import { MemoryService } from "../memory/service.ts";
 import { createDocumentsClient } from "../runtime/policy-compare/documents-client.ts";
-import { createDefaultRuntimeFactory, startServer } from "../server/main.ts";
+import { startServer } from "../server/main.ts";
+import { CheckpointCoordinator } from "../state/checkpoints.ts";
+import { configurationFingerprint } from "../state/config-fingerprint.ts";
+import { withDurableExecution } from "../state/durable-factory.ts";
+import { createPostgresStateStore } from "../state/postgres.ts";
+import { createWorkerFactory } from "../worker/factory.ts";
 
 function requireEnv(env: NodeJS.ProcessEnv, name: string): string {
 	const value = env[name];
@@ -34,27 +44,85 @@ export async function runServe(env: NodeJS.ProcessEnv): Promise<{ port: number; 
 	const specsDir = requireEnv(env, "TASK_RUNTIME_SPECS_DIR");
 	const profilePath = requireEnv(env, "TASK_RUNTIME_PROFILE");
 	const workRoot = requireEnv(env, "TASK_RUNTIME_WORK_ROOT");
+	const grants = createGrantVerifier(
+		JSON.parse(await readFile(requireEnv(env, "TASK_RUNTIME_AUTH_CONFIG"), "utf8")) as GrantConfig,
+	);
+	const auditApiBaseUrl = env.AUDIT_REPORT_API_BASE_URL;
+	const operatingWorkbookPath = env.AUDIT_REPORT_OPERATING_WORKBOOK;
+	if ((auditApiBaseUrl === undefined) !== (operatingWorkbookPath === undefined)) {
+		throw new Error("AUDIT_REPORT_API_BASE_URL and AUDIT_REPORT_OPERATING_WORKBOOK must be configured together");
+	}
 
-	const runtimeFactory = await createDefaultRuntimeFactory({ profilePath, workRoot, specsDir });
-	const auditBaseUrl = env.AUDIT_AI_BASE_URL;
-	const auditToken = env.AUDIT_AI_INTERNAL_TOKEN;
-	return startServer({
-		port,
-		databaseUrl,
-		specsDir,
-		internalToken,
-		runtimeFactory,
-		documents:
-			auditBaseUrl && auditToken
-				? createDocumentsClient({ baseUrl: auditBaseUrl, internalToken: auditToken })
-				: undefined,
-		maxConcurrent: optionalNumber(env, "TASK_RUNTIME_MAX_CONCURRENT"),
-		maxQueueDepth: optionalNumber(env, "TASK_RUNTIME_MAX_QUEUE_DEPTH"),
-		// 缺省 127.0.0.1(宿主部署的既有行为,不变)。容器化部署必须设成 0.0.0.0,
-		// 否则 Docker 的端口转发到不了 —— 见 ServeOptions.hostname 的说明。
-		// 空串与未设置同等对待,与本文件其余 env 读取口径一致。
-		hostname: env.TASK_RUNTIME_BIND_HOST || undefined,
-	});
+	const stateStore = createPostgresStateStore(databaseUrl);
+	try {
+		if (Boolean(env.TASK_RUNTIME_MEMORY_EMBEDDING_URL) !== Boolean(env.TASK_RUNTIME_MEMORY_EMBEDDING_MODEL))
+			throw new Error("memory embedding URL and model must be configured together");
+		const embedding =
+			env.TASK_RUNTIME_MEMORY_EMBEDDING_URL && env.TASK_RUNTIME_MEMORY_EMBEDDING_MODEL
+				? {
+						baseUrl: env.TASK_RUNTIME_MEMORY_EMBEDDING_URL,
+						model: env.TASK_RUNTIME_MEMORY_EMBEDDING_MODEL,
+						apiKeyEnv: env.TASK_RUNTIME_MEMORY_EMBEDDING_KEY_ENV,
+					}
+				: undefined;
+		const embedder = embedding
+			? createHttpEmbedder({
+					baseUrl: embedding.baseUrl,
+					model: embedding.model,
+					apiKey: embedding.apiKeyEnv ? requireEnv(env, embedding.apiKeyEnv) : undefined,
+				})
+			: undefined;
+		const baseFactory = await createWorkerFactory(
+			{
+				profilePath,
+				workRoot,
+				specsDir,
+				embedding,
+				...(auditApiBaseUrl && operatingWorkbookPath
+					? { auditReportSources: { apiBaseUrl: auditApiBaseUrl, operatingWorkbookPath } }
+					: {}),
+				state: { kind: "postgres", dsnEnv: "PIPELINE_DB_DSN" },
+			},
+			env,
+		);
+		const runtimeFactory = withDurableExecution(
+			baseFactory,
+			new CheckpointCoordinator(stateStore),
+			await configurationFingerprint(profilePath, specsDir),
+		);
+		const auditBaseUrl = env.AUDIT_AI_BASE_URL;
+		const auditToken = env.AUDIT_AI_INTERNAL_TOKEN;
+		const server = await startServer({
+			inbox: new SessionInbox(stateStore),
+			grants,
+			memory: new MemoryService(stateStore, { embedder }),
+			port,
+			hostname: env.TASK_RUNTIME_BIND_HOST,
+			databaseUrl,
+			specsDir,
+			internalToken,
+			runtimeFactory,
+			documents:
+				auditBaseUrl && auditToken
+					? createDocumentsClient({ baseUrl: auditBaseUrl, internalToken: auditToken })
+					: undefined,
+			maxConcurrent: optionalNumber(env, "TASK_RUNTIME_MAX_CONCURRENT"),
+			maxQueueDepth: optionalNumber(env, "TASK_RUNTIME_MAX_QUEUE_DEPTH"),
+		});
+		return {
+			port: server.port,
+			close: async () => {
+				try {
+					await server.close();
+				} finally {
+					await stateStore.close();
+				}
+			},
+		};
+	} catch (error) {
+		await stateStore.close();
+		throw error;
+	}
 }
 
 /** CLI 分支用:起服务、报端口、接信号。 */

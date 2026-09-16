@@ -572,6 +572,34 @@ describe("assemble - resolveModel (no modelOverride)", () => {
 });
 
 describe("assemble - toolset handle ownership", () => {
+	it("releases tools even if session disposal throws, and never repeats cleanup", async () => {
+		const harness = await createFauxHarness();
+		cleanups.push(harness.cleanup);
+		const disposeTools = vi.fn(async () => {});
+		const assembled = await assemble({
+			pluginContext: pluginContext(),
+			spec: spec(),
+			profile,
+			registry: createDefaultPluginRegistry(),
+			toolsets: toolsetsWithDispose(disposeTools),
+			cwd: harness.cwd,
+			agentDir: harness.agentDir,
+			modelOverride: { modelRuntime: harness.modelRuntime, model: harness.model },
+		});
+		const original = assembled.session.dispose.bind(assembled.session);
+		const disposal = vi.spyOn(assembled.session, "dispose").mockImplementation(() => {
+			original();
+			throw new Error("session cleanup failed");
+		});
+		try {
+			await expect(assembled.dispose()).rejects.toThrow("session cleanup failed");
+			await expect(assembled.dispose()).rejects.toThrow("session cleanup failed");
+			expect(disposeTools).toHaveBeenCalledTimes(1);
+			expect(disposal).toHaveBeenCalledTimes(1);
+		} finally {
+			disposal.mockRestore();
+		}
+	});
 	// ToolsetRegistry.resolve() handles are per-call, not per-registry (see
 	// src/toolsets/registry.ts): two Assembled built from the same registry must be
 	// able to dispose independently without tearing down each other's resources.

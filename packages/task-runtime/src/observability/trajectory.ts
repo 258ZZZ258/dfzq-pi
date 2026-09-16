@@ -16,6 +16,8 @@ import type { Runtime, RuntimeEvent } from "../runtime/contract.ts";
  * `message_update` 之类的高频类型,会变成 serve 路径每个 token 一次同步 DB 事务。
  */
 export const RECORDED_TYPES: ReadonlySet<string> = new Set([
+	"checkpoint_saved",
+	"worker_terminated",
 	"turn_start",
 	"turn_end",
 	"tool_execution_start",

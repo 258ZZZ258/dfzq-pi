@@ -1,0 +1,26 @@
+# per-profile 档案:P-INT(内规)/ P-EXT(外规)/ P-QA(监管问答)/ P-CASE(案例)。
+# CP-010 T1 配置缝起,档案承载:
+#   qc_indicators           S2 启用指标集(名单见 qc/indicators.INDICATOR_REGISTRY);
+#                           **缺省(不写)= 回退代码内硬编码默认**——下列四 profile 显式写出的
+#                           即改造前硬编码行为快照,对拍测试 test_preseg_profiles_seam 证零变更。
+#   qc_threshold_overrides  对 qc_thresholds.yaml 全局阈值的 per-profile 覆盖(副本生效)。
+#   case_ref_source         案例引用外规来源:structured(预切块直装,P-PRESEG)| 其它值=自建通道
+#                           规则抽取(零 LLM;case_l2 LLM 通道已移除)。
+P-INT:
+  qc_indicators: [clause_coverage, clause_continuity, hierarchy_legality,
+                  page_anchor_complete, table_consistency, text_quality,
+                  extraction_sufficiency]
+P-EXT:
+  qc_indicators: [clause_coverage, clause_continuity, hierarchy_legality,
+                  page_anchor_complete, table_consistency, text_quality,
+                  extraction_sufficiency]
+P-QA:
+  qc_indicators: [qa_pair_completeness, page_anchor_complete, text_quality]
+P-CASE:
+  qc_indicators: [page_anchor_complete, text_quality]
+# P-PRESEG:预切块源通道档案(CP-010;档案键,非 corpus_type 取值——分区仍 P-INT/P-EXT/P-CASE)。
+# QC 哨兵化(D10):门仅留⑥文本质量(跨库 charset 损坏);页码/条款树类指标随 D2/预切块前提禁用;
+# 元数据完整率为批次报告 warning(S0),不作门。case_ref_source=structured:案例引用走源结构化直装。
+P-PRESEG:
+  qc_indicators: [text_quality]
+  case_ref_source: structured

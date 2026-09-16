@@ -56,9 +56,48 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 1000, stepMs = 1)
 }
 
 describe("EscalatingRuntime", () => {
+	it("reports aborted when cancellation makes full assembly reject", async () => {
+		let rejectAssembly!: (error: Error) => void;
+		const assembling = new Promise<Runtime>((_resolve, reject) => {
+			rejectAssembly = reject;
+		});
+		const createFull = vi.fn(() => assembling);
+		const rt = createEscalatingRuntime({
+			maxTurns: 5,
+			fast: fastStub({ verdict: { accept: false, reason: "x" }, result: result({ turns: 1 }) }),
+			createFull,
+		});
+		const completion = rt.run("q");
+		await waitUntil(() => createFull.mock.calls.length === 1);
+		await rt.abort();
+		rejectAssembly(new Error("handshake aborted"));
+		expect(await completion).toMatchObject({ status: "aborted", turns: 1 });
+		await rt.dispose();
+	});
+	it("does not assemble full when the shared turn limit is exhausted", async () => {
+		const createFull = vi.fn(async () => fullStub(result({})));
+		const rt = createEscalatingRuntime({
+			maxTurns: 2,
+			fast: fastStub({ verdict: { accept: false, reason: "repair needed" }, result: result({ turns: 2 }) }),
+			createFull,
+		});
+		expect(await rt.run("q")).toMatchObject({ status: "limit_exceeded", limit: "maxTurns", turns: 2 });
+		expect(createFull).not.toHaveBeenCalled();
+	});
+	it("passes only remaining turns to the full runtime factory", async () => {
+		const createFull = vi.fn(async (_remaining: number) => fullStub(result({ turns: 3 })));
+		const rt = createEscalatingRuntime({
+			maxTurns: 5,
+			fast: fastStub({ verdict: { accept: false, reason: "repair needed" }, result: result({ turns: 2 }) }),
+			createFull,
+		});
+		expect((await rt.run("q")).turns).toBe(5);
+		expect(createFull).toHaveBeenCalledWith(3);
+	});
 	it("returns the fast result and NEVER builds stage 2 when the verdict accepts", async () => {
 		const createFull = vi.fn(async () => fullStub(result({ output: "full" })));
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: fastStub({ verdict: { accept: true }, result: result({ output: "fast" }) }),
 			createFull,
 		});
@@ -74,6 +113,7 @@ describe("EscalatingRuntime", () => {
 		// stopReason/limit 这几个键(可选字段、未传就不存在),spread 不会覆盖掉它们,
 		// 阶段 1 的取值会原样透出。四个字段缺一都测不出这类"部分字段泄漏"。
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: fastStub({
 				verdict: { accept: false, reason: "confidence low" },
 				result: result({
@@ -81,7 +121,7 @@ describe("EscalatingRuntime", () => {
 					status: "error",
 					errorMessage: "阶段 1 判负原因",
 					stopReason: "x",
-					limit: "maxCostUsd",
+					limit: "maxTurns",
 				}),
 			}),
 			createFull: async () => fullStub(result({ output: "full" })),
@@ -97,6 +137,7 @@ describe("EscalatingRuntime", () => {
 
 	it("sums usage and turns across both stages", async () => {
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: fastStub({ verdict: { accept: false, reason: "x" }, result: result({ turns: 2, usage: usage(0.01) }) }),
 			createFull: async () => fullStub(result({ turns: 9, usage: usage(0.05) })),
 		});
@@ -110,6 +151,7 @@ describe("EscalatingRuntime", () => {
 	it("disposes stage 2 as well when it was built", async () => {
 		const dispose = vi.fn(async () => {});
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: fastStub({ verdict: { accept: false, reason: "x" }, result: result({}) }),
 			createFull: async () => ({ ...fullStub(result({})), dispose }),
 		});
@@ -126,6 +168,7 @@ describe("EscalatingRuntime", () => {
 	it("still disposes stage 1 when stage 2's dispose throws", async () => {
 		const fastDispose = vi.fn(async () => {});
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: { ...fastStub({ verdict: { accept: false, reason: "x" }, result: result({}) }), dispose: fastDispose },
 			createFull: async () => ({
 				...fullStub(result({})),
@@ -142,6 +185,7 @@ describe("EscalatingRuntime", () => {
 	it("forwards abort to the stage that is currently active", async () => {
 		const fastAbort = vi.fn(async () => {});
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: { ...fastStub({ verdict: { accept: true }, result: result({}) }), abort: fastAbort },
 			createFull: async () => fullStub(result({})),
 		});
@@ -156,6 +200,7 @@ describe("EscalatingRuntime", () => {
 		const fastAbort = vi.fn(async () => {});
 		const fullAbort = vi.fn(async () => {});
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: { ...fastStub({ verdict: { accept: false, reason: "x" }, result: result({}) }), abort: fastAbort },
 			createFull: async () => ({ ...fullStub(result({})), abort: fullAbort }),
 		});
@@ -189,7 +234,7 @@ describe("EscalatingRuntime", () => {
 			abort: fastAbort,
 			runFast: async () => pendingRunFast,
 		};
-		const rt = createEscalatingRuntime({ fast, createFull });
+		const rt = createEscalatingRuntime({ maxTurns: 100, fast, createFull });
 
 		const runPromise = rt.run("q");
 		await rt.abort(); // cancel arrives while stage 1 is still in flight
@@ -206,7 +251,7 @@ describe("EscalatingRuntime", () => {
 				// 跟着 status:"aborted" 一起带出去,形成 escalating-runtime.ts 里
 				// checkPreempted 注释点名过的"自相矛盾组合"——不带这个字段,删掉
 				// `limit: undefined` 那半行不会有任何用例翻红(该值本来就是 undefined)。
-				limit: "maxCostUsd",
+				limit: "maxTurns",
 				turns: 2,
 				usage: usage(0.02),
 			}),
@@ -237,6 +282,7 @@ describe("EscalatingRuntime", () => {
 		});
 		const createFull = vi.fn(() => pendingFull);
 		const rt = createEscalatingRuntime({
+			maxTurns: 100,
 			fast: fastStub({
 				verdict: { accept: false, reason: "x" },
 				// N-3:同上一条用例,刻意带一个非 undefined 的 limit,验证这个检查点也清得掉它
@@ -290,7 +336,7 @@ describe("EscalatingRuntime", () => {
 				return () => {};
 			},
 		};
-		const rt = createEscalatingRuntime({ fast, createFull: async () => full });
+		const rt = createEscalatingRuntime({ maxTurns: 100, fast, createFull: async () => full });
 		const seen: RuntimeEvent[] = [];
 		rt.subscribe((event) => seen.push(event));
 

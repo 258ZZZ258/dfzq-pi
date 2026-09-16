@@ -597,7 +597,7 @@ describe("SessionRuntime final-judge rejudging", () => {
 	// state.tripped 同时置位。classify() 自己确立的优先级是 limit 压倒 error,所以 status
 	// 必须是 limit_exceeded;写成 `judgeError ? "error" : classify(...)` 会产出
 	// status:"error" 配 limit:"runTimeout" 这种自相矛盾的结果,下游按 status==="limit_exceeded"
-	// 记预算超支的会直接漏记。C6 明确用 onExhausted:"error",这个分歧必然会遇上。
+	// 记录轮数或超时中止的会直接漏记。C6 明确用 onExhausted:"error",这个分歧必然会遇上。
 	it("lets a tripped limit outrank a judge error in the RunResult status", async () => {
 		const runtime = await buildWithRegistry(
 			registryWithCustomJudge("slow-throwing-judge", async () => {

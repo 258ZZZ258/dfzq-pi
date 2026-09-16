@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "summaryFindingThreshold": 8,
+  "maxAttempts": 2
+}

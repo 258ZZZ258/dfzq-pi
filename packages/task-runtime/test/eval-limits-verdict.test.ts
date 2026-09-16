@@ -2,10 +2,8 @@ import { describe, expect, it } from "vitest";
 import { judgeProbes, PROBES, type ProbeOutcome, renderProbeSummary } from "../src/eval/limits-probe.ts";
 
 describe("probe set", () => {
-	it("covers all four limit kinds exactly once", () => {
-		expect(PROBES.map((p) => p.expect).sort()).toEqual(
-			["maxCostUsd", "maxTotalTokens", "maxTurns", "runTimeout"].sort(),
-		);
+	it("covers both limit kinds exactly once", () => {
+		expect(PROBES.map((p) => p.expect).sort()).toEqual(["maxTurns", "runTimeout"].sort());
 	});
 
 	it("uses L3-001 as the multi-turn payload", () => {
@@ -26,8 +24,8 @@ describe("judgeProbes", () => {
 		};
 	}
 
-	it("passes when all four trip with the right kind", () => {
-		expect(judgeProbes([outcome("P1"), outcome("P2"), outcome("P3"), outcome("P4")]).pass).toBe(true);
+	it("passes when both trip with the right kind", () => {
+		expect(judgeProbes([outcome("P1"), outcome("P2")]).pass).toBe(true);
 	});
 
 	it("fails when a probe did not trip at all", () => {

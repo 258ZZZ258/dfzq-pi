@@ -35,6 +35,19 @@ afterEach(async () => {
 });
 
 describe("cli", () => {
+	it.each([{ args: ["--input", "hi", "--input-file", "unused.txt"] }, { args: [] as string[] }])(
+		"requires exactly one input source: %j",
+		{ timeout: CASE_TIMEOUT_MS },
+		async ({ args }) => {
+			const error = (await run(
+				process.execPath,
+				[CLI, "run", "--spec", "/nope.json", "--profile", "/nope.json", "--workdir", tmpdir(), ...args],
+				{ timeout: EXEC_TIMEOUT_MS },
+			).catch((cause: unknown) => cause)) as { code?: number; stderr?: string };
+			expect(error.code).toBe(1);
+			expect(error.stderr).toContain(args.length ? "mutually exclusive" : "--input or --input-file is required");
+		},
+	);
 	it("exits non-zero with a readable error when the spec file is missing", { timeout: CASE_TIMEOUT_MS }, async () => {
 		await expect(
 			run(process.execPath, [CLI, "run", "--spec", "/nope.json", "--input", "hi"], { timeout: EXEC_TIMEOUT_MS }),

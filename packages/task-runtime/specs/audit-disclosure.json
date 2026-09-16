@@ -1,0 +1,21 @@
+{
+  "id": "audit-disclosure",
+  "description": "生成前检查说明与本次审计问题的语义关联",
+  "model": {
+    "role": "main"
+  },
+  "thinkingLevel": "medium",
+  "toolset": "audit-disclosure",
+  "tools": [
+    "read_disclosure_source"
+  ],
+  "systemPrompt": "audit-disclosure/system.md",
+  "limits": {
+    "maxTurns": 5,
+    "runTimeoutMs": 180000
+  },
+  "observability": {
+    "contextSnapshot": "hash"
+  },
+  "durableSession": false
+}

@@ -80,10 +80,9 @@ describe("run manager", () => {
 		const rm = manager(stub);
 		const [a, b] = await Promise.all([rm.submit(request()), rm.submit(request())]);
 
-		// 新 submit() 在 tryAcquire 前没有 await,首个 submit 同步跑完并写入 live 注册表;
-		// 同键的第二个 submit 命中 live,拿到**同一个 completion**(kind 也是 accepted)。
-		// 语义要点是「只起一个任务、两个调用方拿到同一个 run 的句柄」,不是 kind 的分布。
-		if (a.kind === "rejected" || b.kind === "rejected") throw new Error("unexpected rejection");
+		// 同键准入串行化后应拿到同一个 run;不依赖重试发生在运行中还是终态。
+		if (a.kind !== "accepted" && a.kind !== "idempotent") throw new Error("unexpected rejection");
+		if (b.kind !== "accepted" && b.kind !== "idempotent") throw new Error("unexpected rejection");
 		expect(a.runId).toBe(b.runId);
 		if (a.kind === "accepted") await a.completion;
 		expect(stub.runCalls).toBe(1);
@@ -185,14 +184,14 @@ describe("run manager", () => {
 	});
 
 	it("records limit_exceeded with its limit kind", async () => {
-		const rm = manager(createStubRuntime({ result: { status: "limit_exceeded", limit: "maxTotalTokens" } }));
+		const rm = manager(createStubRuntime({ result: { status: "limit_exceeded", limit: "maxTurns" } }));
 		const outcome = await rm.submit(request());
 		if (outcome.kind !== "accepted") throw new Error("expected accepted");
 		await outcome.completion;
 
 		expect(store.findByRunId(outcome.runId)).toMatchObject({
 			status: "limit_exceeded",
-			limitHit: "maxTotalTokens",
+			limitHit: "maxTurns",
 		});
 	});
 
@@ -543,6 +542,7 @@ describe("run manager", () => {
 		await a.completion;
 		const resultB = await b.completion;
 		expect(resultB.status).toBe("aborted");
+		expect(resultB.delivery).toMatchObject({ validation: "not_checked", error: { code: "cancelled" } });
 		expect(store.findByRunId(b.runId)?.status).toBe("aborted");
 		// ★ 核心断言:B 从未装配 —— 排队中被取消不该起 MCP 子进程白费一次装配
 		expect(stubs).toHaveLength(1);

@@ -72,19 +72,18 @@ describe("limits plugin", () => {
 		expect(state.turns).toBe(2);
 	});
 
-	it("aborts when maxTotalTokens is exceeded", async () => {
+	it("does not consult token or cost statistics to stop a run", async () => {
 		const state: LimitState = { turns: 0 };
 		const abort = vi.fn();
-		await instantiate({ maxTotalTokens: 100 }, state, { totalTokens: 101, cost: 0 }, abort)();
-		expect(state.tripped).toBe("maxTotalTokens");
-		expect(abort).toHaveBeenCalledTimes(1);
-	});
-
-	it("aborts when maxCostUsd is exceeded", async () => {
-		const state: LimitState = { turns: 0 };
-		const abort = vi.fn();
-		await instantiate({ maxCostUsd: 1 }, state, { totalTokens: 0, cost: 1.5 }, abort)();
-		expect(state.tripped).toBe("maxCostUsd");
+		const stats = {
+			get totalTokens(): number {
+				throw new Error("usage must not control execution");
+			},
+			cost: 999999,
+		};
+		await instantiate({ maxTurns: 2 }, state, stats, abort)();
+		expect(state.tripped).toBeUndefined();
+		expect(abort).not.toHaveBeenCalled();
 	});
 
 	it("aborts only once even if more turns arrive", async () => {

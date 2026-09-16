@@ -4,13 +4,24 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test": "vitest --run"
+		"test": "vitest --run",
+		"test:audit-report": "vitest --run test/audit-report-agent.test.ts && python scripts/audit-report/test_render_report_docx.py",
+		"render:audit-report": "python scripts/audit-report/render_report_docx.py",
+		"test:supervision-report": "python scripts/supervision-analysis/test_render_supervision_analysis_docx.py",
+		"render:supervision-report": "python scripts/supervision-analysis/render_supervision_analysis_docx.py",
+		"generate:supervision-narrative": "tsx scripts/supervision-analysis/generate_deepseek_narrative.ts",
+		"export:supervision-document": "tsx scripts/supervision-analysis/export_report_document.ts",
+		"test:supervision-narrative-report": "python scripts/supervision-analysis/test_render_supervision_narrative_docx.py",
+		"render:supervision-narrative-report": "python scripts/supervision-analysis/render_supervision_narrative_docx.py",
+		"check:production": "node scripts/check-runtime-dependencies.mjs && tsc -p tsconfig.production.json",
+		"test:production": "vitest --config vitest.production.config.ts --run"
 	},
 	"bin": {
 		"task-runtime": "./src/cli/main.ts"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "^0.82.1",
+		"@e965/xlsx": "0.20.3",
+		"@earendil-works/pi-coding-agent": "0.82.1",
 		"@hono/node-server": "2.0.12",
 		"hono": "4.12.32",
 		"minio": "8.0.7",
@@ -18,7 +29,7 @@
 		"typebox": "1.1.38"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "^0.82.1",
+		"@earendil-works/pi-ai": "0.82.1",
 		"@types/node": "24.12.4",
 		"typescript": "5.9.3",
 		"vitest": "4.1.9"

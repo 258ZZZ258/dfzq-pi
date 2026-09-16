@@ -23,6 +23,7 @@ describe("VersionDiffRuntime", () => {
 					documentId: "NEW",
 					logicalId: "L1",
 					title: "测试内规",
+					issueDate: "2026-08-01",
 					clauses: [{ seq: 1, clausePath: "第二条", text: "第二条 新正文" }],
 				},
 				oldDocument: {
@@ -41,6 +42,8 @@ describe("VersionDiffRuntime", () => {
 			compareType: "version_diff",
 			corpusType: "internal",
 			metrics: { changed: 1 },
+			newVersion: { issueDate: "2026-08-01", versionLabel: "发布日期：2026-08-01" },
+			oldVersion: { issueDate: null, versionLabel: "发布日期未维护" },
 		});
 		expect(result.turns).toBe(0);
 	});

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { McpServerSpec } from "../toolsets/mcp/adapter.ts";
 import { buildPrompt, loadPromptParts } from "./build-prompt.ts";
@@ -27,7 +28,7 @@ interface RunProbesArgs {
 }
 
 /**
- * 判据③:四类限额各触发一次且归类正确。
+ * 判据③:轮数与超时两类限制各触发一次且归类正确。
  *
  * 每个探针写一份独立临时 spec —— `limits` 字段用 probe.limits **整体替换**,不是合并进
  * 基线的 `{ maxTurns: 16, runTimeoutMs: 900000 }`。合并的话基线限额会跟探针限额一起生效,
@@ -92,8 +93,12 @@ async function main(): Promise<void> {
 
 	if (!values["eval-root"]) throw new Error("--eval-root is required");
 	const evalRoot = resolve(values["eval-root"] as string);
-	const specSource = resolve(values.spec ?? "packages/task-runtime/specs/blackbox-eval.json");
-	const profilePath = resolve(values.profile ?? "packages/task-runtime/profiles/deepseek-cloud.json");
+	const specSource = resolve(
+		values.spec ?? join(dirname(fileURLToPath(import.meta.url)), "../../specs/blackbox-eval.json"),
+	);
+	const profilePath = resolve(
+		values.profile ?? join(dirname(fileURLToPath(import.meta.url)), "../../profiles/deepseek-cloud.json"),
+	);
 
 	// spec 里的 mcpServers.args 存的是相对 eval-root 的片段(提交进版本库的文件不能带本机绝对路径),
 	// 这里解析成绝对路径后写一份临时 spec 给 CLI。--discover / --probes 也共用这份解析结果。

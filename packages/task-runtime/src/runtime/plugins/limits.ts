@@ -1,6 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { RuntimeLimits } from "../../spec/types.ts";
-import type { LimitKind, LimitState } from "../contract.ts";
 import type { PluginContext, PluginDescriptor } from "../plugin-registry.ts";
 
 export const LIMITS_PLUGIN_NAME = "limits";
@@ -39,20 +38,11 @@ export const limitsDescriptor: PluginDescriptor = {
 				pi.on("turn_end", async () => {
 					if (state.tripped) return; // 已触发过,不重复 abort
 					state.turns += 1;
-					const tripped = evaluate(state, limits, ctx);
-					if (!tripped) return;
-					state.tripped = tripped;
+					if (limits.maxTurns === undefined || state.turns < limits.maxTurns) return;
+					state.tripped = "maxTurns";
 					ctx.abort();
 				});
 			},
 		};
 	},
 };
-
-function evaluate(state: LimitState, limits: RuntimeLimits, ctx: PluginContext): LimitKind | undefined {
-	if (limits.maxTurns !== undefined && state.turns >= limits.maxTurns) return "maxTurns";
-	const stats = ctx.getSession().getSessionStats();
-	if (limits.maxTotalTokens !== undefined && stats.tokens.total > limits.maxTotalTokens) return "maxTotalTokens";
-	if (limits.maxCostUsd !== undefined && stats.cost > limits.maxCostUsd) return "maxCostUsd";
-	return undefined;
-}

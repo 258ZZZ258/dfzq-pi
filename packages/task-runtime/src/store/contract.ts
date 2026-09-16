@@ -8,12 +8,16 @@ import type { LimitKind, RunResult, SourceDetail } from "../runtime/contract.ts"
 export type StoredRunStatus = "queued" | "running" | "completed" | "aborted" | "limit_exceeded" | "error";
 
 export interface RunRecord {
+	/** Verified actor ownership, independent of optional memory configuration. */
+	principalJson?: string;
 	runId: string;
 	clientRequestId: string;
 	requestId?: string;
 	specId: string;
 	taskKind: string;
 	sessionId: string;
+	/** Persist whether the caller supplied the session. Undefined means a legacy record. */
+	sessionIdExplicit?: boolean;
 	/** ★ Java jCasbin 预计算的授权位,原样存档,不解析后再存(设计文档 §5.7)。 */
 	filtersJson: string;
 	optionsJson?: string;
@@ -30,6 +34,7 @@ export interface RunRecord {
 	stopReason?: string;
 	limitHit?: LimitKind;
 	usageJson?: string;
+	deliveryJson?: string;
 	turns?: number;
 	/** 已取回的权威条款正文，供终态 HTTP 响应与下游详情展示复用。 */
 	sourceDetails?: SourceDetail[];
@@ -46,6 +51,7 @@ export type NewRun = Omit<
 	| "stopReason"
 	| "limitHit"
 	| "usageJson"
+	| "deliveryJson"
 	| "turns"
 	| "sourceDetails"
 	| "startedAt"
@@ -76,9 +82,12 @@ export interface RunStore<Async extends boolean = false> {
 	 */
 	insertQueued(rec: NewRun): MaybePromise<{ inserted: boolean; run: RunRecord }, Async>;
 	findByRunId(runId: string): MaybePromise<RunRecord | undefined, Async>;
+	findByClientRequestId(clientRequestId: string): MaybePromise<RunRecord | undefined, Async>;
 	markRunning(runId: string, startedAt: number): MaybePromise<void, Async>;
 	finish(runId: string, result: RunResult, finishedAt: number): MaybePromise<void, Async>;
 	markError(runId: string, message: string, finishedAt: number): MaybePromise<void, Async>;
+	/** Conditional orphan recovery; never overwrite an already-terminal result. */
+	markStale?(runId: string, message: string, finishedAt: number): MaybePromise<boolean, Async>;
 	/**
 	 * 按主键删除该行。语义是「撤销 insertQueued 的原子占用」——目前唯一调用方是
 	 * RunManager.submit() 的闸门拒绝分支:insertQueued 原子占了 clientRequestId 唯一索引,

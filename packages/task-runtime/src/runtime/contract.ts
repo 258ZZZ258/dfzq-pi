@@ -3,9 +3,11 @@
  * 不得 import 任何 pi 类型 —— 否则实现细节会泄漏成公共契约。
  */
 
+import type { Conversation } from "../interaction/inbox.ts";
+
 export type RunStatus = "completed" | "aborted" | "limit_exceeded" | "error";
 
-export type LimitKind = "maxTurns" | "runTimeout" | "maxTotalTokens" | "maxCostUsd";
+export type LimitKind = "maxTurns" | "runTimeout";
 
 /**
  * 本 run 的限额状态。SessionRuntime 拥有它(run() 开头重置、runTimeoutMs 的 timer 写
@@ -27,6 +29,30 @@ export interface RunUsage {
 	cost: number;
 }
 
+export interface DeliveryReceipt {
+	judgeAttempts?: Record<string, number>;
+	memoryObservation?: { status: "used" | "empty" | "unavailable"; ids: string[] };
+	telemetryIncomplete?: boolean;
+	version: 1;
+	validation: "schema_passed" | "schema_failed" | "not_requested" | "not_checked" | "legacy_unverified";
+	schemaHash?: string;
+	outputHash?: string;
+	partial: "none" | "diagnostic_only";
+	error?: {
+		code:
+			| "cancelled"
+			| "max_turns"
+			| "run_timeout"
+			| "assembly_timeout"
+			| "output_contract_invalid"
+			| "output_contract_validation_error"
+			| "result_identity_mismatch"
+			| "output_integrity_mismatch"
+			| "runtime_error";
+		retryable: false;
+	};
+}
+
 /**
  * 任务执行期间已从权威检索源取回的正文。它不是模型生成的 `answer.basis`，
  * 只供受信下游在展示「查看原文」时复用，避免为同一批结果再发起一次回查。
@@ -38,6 +64,10 @@ export interface SourceDetail {
 }
 
 export interface RunResult {
+	memoryObservation?: { status: "used" | "empty" | "unavailable"; ids: string[] };
+	/** A hard-killed worker may lose in-flight turn/usage observations. */
+	telemetryIncomplete?: boolean;
+	delivery?: DeliveryReceipt;
 	runId: string;
 	/** 产生本次 run 的 RuntimeSpec.id。与 RuntimeEvent.specId 同源,让结果与事件流对得上;
 	 *  设计文档的 runs 表和 S3 池的 get(specId, sessionId?) 都靠它关联。 */
@@ -105,6 +135,9 @@ export interface RunOptions {
 }
 
 export interface Runtime {
+	getConversation?(): Promise<Conversation>;
+	/** Called by the host only after durable terminal-result persistence succeeds. */
+	confirmResultStored?: (result: RunResult) => Promise<void>;
 	readonly id: string;
 	readonly specId: string;
 	readonly sessionId: string;

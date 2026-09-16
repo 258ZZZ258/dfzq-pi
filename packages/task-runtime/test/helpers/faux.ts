@@ -23,7 +23,40 @@ export interface FauxHarness {
 }
 
 export async function createFauxHarness(): Promise<FauxHarness> {
-	const faux = registerFauxProvider();
+	// npm can install pi-coding-agent's pi-ai dependency as a second physical copy,
+	// while monorepo test resolution may still load ModelRuntime against the root copy.
+	// Register the same faux API in both registries and mirror response queues so the
+	// harness works in both installed-package and workspace-source resolution modes.
+	const nestedCompatUrl = new URL(
+		"../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/compat.js",
+		import.meta.url,
+	);
+	const runtimeCompat = (await import(nestedCompatUrl.href).catch(() => undefined)) as
+		| { registerFauxProvider: typeof registerFauxProvider }
+		| undefined;
+	const primaryFaux = registerFauxProvider();
+	const runtimeFaux =
+		runtimeCompat && runtimeCompat.registerFauxProvider !== registerFauxProvider
+			? runtimeCompat.registerFauxProvider({ api: primaryFaux.api })
+			: undefined;
+	const faux: ReturnType<typeof registerFauxProvider> = {
+		...primaryFaux,
+		setResponses(responses) {
+			primaryFaux.setResponses(responses);
+			runtimeFaux?.setResponses(responses);
+		},
+		appendResponses(responses) {
+			primaryFaux.appendResponses(responses);
+			runtimeFaux?.appendResponses(responses);
+		},
+		getPendingResponseCount() {
+			return Math.min(primaryFaux.getPendingResponseCount(), runtimeFaux?.getPendingResponseCount() ?? Infinity);
+		},
+		unregister() {
+			primaryFaux.unregister();
+			runtimeFaux?.unregister();
+		},
+	};
 	const root = await mkdtemp(join(tmpdir(), "dfzq-rt-"));
 	const cwd = join(root, "workspace");
 	const agentDir = join(root, "agent");

@@ -13,7 +13,7 @@ ARG RUNTIME_BASE_TAG=node22-r1
 FROM ${REGISTRY}/dfzq-runtime-base:${RUNTIME_BASE_TAG}
 
 # audit-ai 源码。只带运行与初始化必需的目录 —— 不带 .venv / tests / docs / .git
-COPY services/audit-ai/pyproject.toml  audit-ai/alembic.ini  /opt/audit-ai/
+COPY services/audit-ai/pyproject.toml  services/audit-ai/alembic.ini  /opt/audit-ai/
 COPY services/audit-ai/libs/     /opt/audit-ai/libs/
 COPY services/audit-ai/pipeline/ /opt/audit-ai/pipeline/
 COPY services/audit-ai/eval/     /opt/audit-ai/eval/

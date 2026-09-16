@@ -25,6 +25,10 @@ COPY packages/ ./packages/
 #    漏了它 test 阶段第一条就 `Cannot find module '/app/scripts/check-pinned-deps.mjs'`(实测)。
 #    runtime 阶段不 COPY 它 —— 交付镜像不跑 check,保持精简。
 COPY scripts/ ./scripts/
+# 🔴 main 重构后 audit-ai 内嵌于 services/。测试契约(local-services.ts)按仓内相对
+#    路径解析它,且有**无跳过条件**的存在性断言(embedded-audit-service.test 第一条
+#    摸 services/audit-ai/service.py)—— 测试镜像必须带上(源码才几 MB)。
+COPY services/ ./services/
 
 ARG NPM_REGISTRY=
 # 🔴 --ignore-scripts:跳过 husky(prepare)与 canvas 的 node-gyp,两者在 CI 里都会失败
@@ -53,10 +57,17 @@ RUN npm run check:pinned-deps \
 #    createPostgresRunStore 启动即 SELECT 1(store/postgres.ts:68),本阶段**没有活的 PG**。
 #    但同文件另外两条是「没 token / 空 token 拒绝启动」的安全断言,不能跟着丢。
 #    ⚠ 后续项:排练栈里有活 PG,可把这条整包跑起来并删掉本特例。
+# 🔴 env -u 清掉底座 ENV 再跑测试:这四个变量是给**运行期**用的,泄进单测会改变行为
+#    —— venv 存在让"本该 skip/走 stub"的用例走真嵌入路径(报告文案吃到真实 config)、
+#    插件表多注册一个,9 个用例翻红(2026-09-16 实测;product 树与 main 逐字相同,
+#    失败全是环境差)。把测试环境对齐 main 的干净 CI;嵌入服务的真联通不靠单测兜,
+#    排练(ci/05)里的 MCP 真握手覆盖。
 RUN mkdir -p /out && cd packages/task-runtime \
- && npx vitest --run --exclude 'test/serve-cli.test.ts' \
+ && env -u DFZQ_AUDIT_AI_PYTHON -u DFZQ_AUDIT_AI_ROOT -u PIPELINE_CONFIG_DIR -u HF_HUB_OFFLINE \
+    npx vitest --run --exclude 'test/serve-cli.test.ts' \
         --reporter=default --reporter=junit --outputFile=/out/junit-main.xml \
- && npx vitest --run test/serve-cli.test.ts -t 'refuses to start' \
+ && env -u DFZQ_AUDIT_AI_PYTHON -u DFZQ_AUDIT_AI_ROOT -u PIPELINE_CONFIG_DIR -u HF_HUB_OFFLINE \
+    npx vitest --run test/serve-cli.test.ts -t 'refuses to start' \
         --reporter=default --reporter=junit --outputFile=/out/junit-serve-cli.xml
 
 # ============================================================

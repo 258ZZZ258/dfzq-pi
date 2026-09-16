@@ -1,0 +1,17 @@
+# 根上下文构建(deploy/Dockerfile.base 与薄层)共用。
+# 🔴 base 层改用仓库根做上下文(audit-ai 内嵌)后,本文件必须存在 ——
+#    否则本地构建会把 node_modules(数百 MB)整个送进 daemon。
+**/node_modules
+**/.git
+.claude
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+**/.pytest_cache
+**/.ruff_cache
+**/dist
+**/coverage
+.ci
+dfzq-pi开发任务
+services/audit-ai/.venv
+services/audit-ai/tests

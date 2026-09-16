@@ -1,27 +1,26 @@
 # dfzq-pi-base(L1)—— audit-ai 源码 + Python venv。FROM dfzq-runtime-base(L0)。
 #
-# 🔴 三层改造(2026-08-28)后本层**可以在内网 Jenkins 构建**:pip 走内网 Artifactory
-#    (PIP_INDEX_URL),源码由 ci/00-ensure-base.sh 从内网 Git checkout。
-#    tag = audit-ai 的 git sha 前 7 位(确定性,流水线据此判断"这个底座造过没有")。
-#    外网也能造(build.sh --base,AUDIT_AI_ROOT 指向本地工作树),作为内网 pypi
-#    缺 wheel 时的退路。
+# 🔴 2026-09-16 起 audit-ai **内嵌在本仓 services/audit-ai/**(随 main 重构而来),
+#    本层构建上下文 = 仓库根,不再需要独立 audit-ai 仓与 DFZQ_AUDIT_AI_GIT。
+#    tag = `git log -1 --format=%h -- services/audit-ai`(该目录最后一次变动的 sha,
+#    确定性;ci/00-ensure-base.sh 据此判断"这个底座造过没有")。
+#    /opt/audit-ai 布局刻意不变 —— entrypoint/init/specs 里的路径全部照旧。
 #
-# ⚠ MCP 只有 stdio 传输(toolsets/mcp/client.ts spawn + stdio pipe),不跨容器,
-#   所以 audit-ai 的 query.mcp.server 必须与 pi 在同一个镜像里 —— 这是本层存在的理由。
+# ⚠ MCP 只有 stdio 传输,audit-ai 的 query.mcp.server 必须与 pi 同镜像 —— 本层存在的理由。
 
 ARG REGISTRY=jfrog.orientsec.com.cn/dev7-docker-release-local
 ARG RUNTIME_BASE_TAG=node22-r1
 FROM ${REGISTRY}/dfzq-runtime-base:${RUNTIME_BASE_TAG}
 
 # audit-ai 源码。只带运行与初始化必需的目录 —— 不带 .venv / tests / docs / .git
-COPY audit-ai/pyproject.toml  audit-ai/alembic.ini  /opt/audit-ai/
-COPY audit-ai/libs/     /opt/audit-ai/libs/
-COPY audit-ai/pipeline/ /opt/audit-ai/pipeline/
-COPY audit-ai/eval/     /opt/audit-ai/eval/
-COPY audit-ai/query/    /opt/audit-ai/query/
-COPY audit-ai/alembic/  /opt/audit-ai/alembic/
-COPY audit-ai/config/   /opt/audit-ai/config/
-COPY audit-ai/seeds/    /opt/audit-ai/seeds/
+COPY services/audit-ai/pyproject.toml  audit-ai/alembic.ini  /opt/audit-ai/
+COPY services/audit-ai/libs/     /opt/audit-ai/libs/
+COPY services/audit-ai/pipeline/ /opt/audit-ai/pipeline/
+COPY services/audit-ai/eval/     /opt/audit-ai/eval/
+COPY services/audit-ai/query/    /opt/audit-ai/query/
+COPY services/audit-ai/alembic/  /opt/audit-ai/alembic/
+COPY services/audit-ai/config/   /opt/audit-ai/config/
+COPY services/audit-ai/seeds/    /opt/audit-ai/seeds/
 
 ARG PIP_INDEX_URL=
 ARG PIP_TRUSTED_HOST=

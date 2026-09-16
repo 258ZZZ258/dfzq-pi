@@ -73,8 +73,7 @@ fi
 
 # ---- L1 底座(audit-ai 源码 + venv)-----------------------------------------
 if [ "$MODE" = "base" ]; then
-  [ -n "$AUDIT_AI_ROOT" ] && [ -d "$AUDIT_AI_ROOT" ] \
-    || { echo "✗ 找不到 audit-ai 工作树:${AUDIT_AI_ROOT:-<空>};用 --audit-ai <路径> 指定" >&2; exit 1; }
+  # 🔴 2026-09-16:audit-ai 已内嵌 services/audit-ai,不再需要外部工作树。
 
   # 🔴 架构守卫:交付目标是 amd64(Kylin V10 / x86_64)。在 arm64 机器(Apple Silicon)
   #    上不指定 --platform 就 build,产出的是 arm64 镜像 —— 推到内网后 pull 得下来、
@@ -91,32 +90,22 @@ if [ "$MODE" = "base" ]; then
 
   # ⚠ 不用 `git -C`:那是 git 1.8.5 才有的参数,Jenkins 主节点(RHEL 7.4)是
   #   1.8.3.1,直接报 `Unknown option: -C`(2026-08-26 stage 3 实测)。子 shell cd 全版本通吃。
-  AUDIT_SHA="$( (cd "$AUDIT_AI_ROOT" && git rev-parse --short=7 HEAD) 2>/dev/null || echo nogit)"
+  # tag 取 services/audit-ai 目录最后一次变动的提交 —— 内容不变则 tag 不变,判重幂等
+  AUDIT_SHA="$( (cd "$REPO_ROOT" && git log -1 --format=%h -- services/audit-ai) )"
+  [ -n "$AUDIT_SHA" ] || { echo "✗ services/audit-ai 无提交记录?" >&2; exit 1; }
   # tag = audit-ai 的 sha7(不带日期):确定性 tag,ci/00-ensure-base.sh 靠它判断
   # "这个 audit-ai 版本的底座造过没有"。同内容重造得到同 tag,幂等。
   TAG="${BASE_TAG:-$AUDIT_SHA}"
   IMAGE="${REGISTRY}/dfzq-pi-base:${TAG}"
 
-  STAGING="$(mktemp -d)"
-  trap 'rm -rf "$STAGING"' EXIT
-  log "组装构建上下文:$STAGING"
-  # 🔴 .dockerignore 必须在上下文根,deploy/ 里那份对 staging 不生效,复制过去
-  cp "$HERE/.dockerignore" "$STAGING/.dockerignore"
-  cp "$HERE/Dockerfile.base" "$STAGING/Dockerfile.base"
-  mkdir -p "$STAGING/audit-ai"
-  run rsync -a --delete \
-      --exclude '.git' --exclude '.venv' --exclude 'tests' --exclude '__pycache__' \
-      --exclude '*.egg-info' --exclude 'docs' \
-      "$AUDIT_AI_ROOT/" "$STAGING/audit-ai/"
-
-  log "构建底座:$IMAGE  (audit-ai@${AUDIT_SHA}${PLATFORM:+, $PLATFORM})"
+  log "构建底座:$IMAGE  (services/audit-ai@${AUDIT_SHA}${PLATFORM:+, $PLATFORM})"
   run docker build ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} \
-      -f "$STAGING/Dockerfile.base" \
+      -f "$HERE/Dockerfile.base" \
       --build-arg "PIP_INDEX_URL=${PIP_INDEX_URL:-}" \
       --build-arg "PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-}" \
       --build-arg "REGISTRY=${REGISTRY}" \
       --build-arg "RUNTIME_BASE_TAG=${RUNTIME_BASE_TAG}" \
-      -t "$IMAGE" "$STAGING"
+      -t "$IMAGE" "$REPO_ROOT"
 
   [ "$PUSH" = 1 ] && run docker push "$IMAGE"
   log "完成:$IMAGE"

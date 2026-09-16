@@ -19,7 +19,7 @@ WORKDIR /app
 #    `packages/coding-agent/examples/extensions/` 下 5 个 —— npm ci 需要它们**全部**在场。
 #    ⇒ 整树 COPY 后再装。代价:改一行 TS 会让 npm ci 层失效、重装一次 node_modules。
 #    缓解:重的东西(venv、系统包、apt)都在底座里,这里重装的只是 node_modules。
-COPY package.json package-lock.json tsconfig.base.json tsconfig.json biome.json vitest.base.ts ./
+COPY package.json package-lock.json .npmrc tsconfig.base.json tsconfig.json biome.json vitest.base.ts ./
 COPY packages/ ./packages/
 # 🔴 scripts/ 是六条 check 的实现所在(check:pinned-deps → scripts/check-pinned-deps.mjs 等)。
 #    漏了它 test 阶段第一条就 `Cannot find module '/app/scripts/check-pinned-deps.mjs'`(实测)。
@@ -65,7 +65,7 @@ RUN mkdir -p /out && cd packages/task-runtime \
 FROM ${REGISTRY}/dfzq-pi-base:${BASE_TAG} AS runtime
 WORKDIR /app
 
-COPY package.json package-lock.json tsconfig.base.json tsconfig.json ./
+COPY package.json package-lock.json .npmrc tsconfig.base.json tsconfig.json ./
 COPY packages/ ./packages/
 
 ARG NPM_REGISTRY=

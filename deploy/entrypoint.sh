@@ -130,6 +130,9 @@ fi
 # 第一次真实提问才炸。
 log_info "1/5 校验必填环境变量…"
 require_env \
+  AUTH_ISSUER \
+  AUTH_AUDIENCE \
+  AUTH_KEYS_JSON \
   TASK_RUNTIME_INTERNAL_TOKEN \
   TASK_RUNTIME_PORT \
   PIPELINE_DB_DSN \
@@ -408,6 +411,20 @@ _spec_policy_query="${TASK_RUNTIME_SPECS_DIR}/policy-query.json"
 if [ -f "$_spec_policy_query" ] && ! grep -q 'QUERY_CONFIG_DIR' "$_spec_policy_query"; then
   log_warn "${_spec_policy_query} 的 mcpServers[0].env 没有转发 QUERY_CONFIG_DIR —— query.mcp.server 会去读镜像层里未渲染的 ${SRC_CONFIG_DIR}/settings.toml,本次渲染的 [query] 段(rerank_backend / rerank_endpoint_* / llm_backend 等)对它**不生效**。修法:给该 spec 的 env 补一行 \"QUERY_CONFIG_DIR\": \"\${QUERY_CONFIG_DIR}\""
 fi
+
+# ── 渲染 auth.json(main 2026-09 起 serve 必填 TASK_RUNTIME_AUTH_CONFIG,fail-closed)──
+# GrantConfig = {issuer, audience, keys:{kid:secret}}:Java 调业务路由要带用这些 key
+# 签发的 Bearer grant(x-internal-token 仍是第一道门)。AUTH_KEYS_JSON 整个 JSON 对象
+# 经 env 传入(env_file 单行、无空格),这里落盘并验形状 —— 坏 JSON 启动期就响亮死。
+"$PY" - "$AUTH_ISSUER" "$AUTH_AUDIENCE" "$AUTH_KEYS_JSON" <<'PYAUTH'
+import json,sys
+iss,aud,keys_raw=sys.argv[1],sys.argv[2],sys.argv[3]
+keys=json.loads(keys_raw)
+assert isinstance(keys,dict) and keys and all(isinstance(v,str) and v for v in keys.values()),     "AUTH_KEYS_JSON 必须是非空 {kid: secret} 对象"
+json.dump({"issuer":iss,"audience":aud,"keys":keys},open("/data/config/auth.json","w"))
+PYAUTH
+chmod 600 /data/config/auth.json
+log_info "auth.json 已渲染(issuer=${AUTH_ISSUER})"
 
 # ── 4/5 渲染 gateway.json ──────────────────────────────────────────────────
 # 🔴 用 python 的 json.dump 生成,不用 sed 填模板:模板+sed 那条路要额外做转义与

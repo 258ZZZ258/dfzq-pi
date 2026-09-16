@@ -112,6 +112,7 @@ ENV TASK_RUNTIME_SPECS_DIR=/app/packages/task-runtime/specs \
     TASK_RUNTIME_PROFILE=/data/config/gateway.json \
     TASK_RUNTIME_WORK_ROOT=/data/work \
     POLICY_MCP_AUDIT_LOG=/data/logs/policy-mcp-audit.jsonl \
+    TASK_RUNTIME_AUTH_CONFIG=/data/config/auth.json \
     TASK_RUNTIME_PORT=18080
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=4 \
